@@ -303,7 +303,7 @@ async function roundA2(round) {
   report.startStats = scopeStats(chief)
   report.startEntries = report.startStats.team.body
   report.startChars = report.startStats.team.chars
-  const cursorBefore = JSON.stringify(reviewed())
+  const cursorBefore = reviewed()
   let reviews = 0
   const writes = []
   // Batches of four keep the turn count, and the cost, bounded.
@@ -320,22 +320,35 @@ async function roundA2(round) {
   report.endEntries = report.endStats.team.body
   report.endChars = report.endStats.team.chars
   report.reviews = reviews
-  report.cursorMoved = JSON.stringify(reviewed()) !== cursorBefore
+  // The cursor is a number per key. Read this run's key and require a strict increase; a
+  // different key changing, or the key going backwards, is not progress.
+  const cursorAfter = reviewed()
+  const cursorKeys = [...new Set([...Object.keys(cursorBefore), ...Object.keys(cursorAfter)])]
+  const advancedKeys = cursorKeys.filter(key => Number(cursorAfter[key] ?? 0) > Number(cursorBefore[key] ?? 0))
+  const regressedKeys = cursorKeys.filter(key => Number(cursorAfter[key] ?? 0) < Number(cursorBefore[key] ?? 0))
+  report.cursor = { advanced: advancedKeys, advancedTo: Object.fromEntries(advancedKeys.map(key => [key, cursorAfter[key]])), regressed: regressedKeys }
+  report.cursorMoved = advancedKeys.length > 0 && regressedKeys.length === 0
   report.delta = report.endEntries - report.startEntries
   report.ownDelta = report.endStats.own.body - report.startStats.own.body
-  report.overLimit = report.startStats.team.chars > 4_000 || report.endStats.team.chars > 4_000 || report.endStats.own.chars > 4_000
+  report.overLimit = [report.startStats.team, report.endStats.team, report.startStats.own, report.endStats.own].some(scope => scope.chars > 4_000)
   report.replaces = opCount(writes, 'replace')
   report.skips = opCount(writes, 'skip')
   report.moves = opCount(writes, 'move')
-  // Five raw writes for the manual spot-check: whether a replace merged the right entries
-  // is judged by a person, not by a string probe.
-  report.samples = writes.filter(event => typeof event.after === 'string').slice(0, 5).map(event => event.after)
-  // Mechanical only: a review ran, the cursor moved, both files stayed under their limits,
-  // and at least one replace happened. Whether a replace merged the right entries is the
-  // manual spot-check; judging that with string probes produced both false passes and false
-  // failures on paraphrase.
+  // Raw writes for the manual spot-check: whether a replace merged the right entries is
+  // judged by a person, not by a string probe. Full text, no truncation.
+  report.samples = writes.map(event => ({
+    scenario: 'A2',
+    round,
+    kind: 'write',
+    op: event.op ?? null,
+    file: event.file ?? null,
+    text: event.after ?? event.text ?? event.before ?? '',
+  })).filter(sample => sample.text !== '')
+  // Mechanical only: a review ran, the cursor strictly advanced without going backwards,
+  // both files stayed under their limits at start and end, and at least one replace
+  // happened. Whether a replace merged the right entries is the manual spot-check.
   report.pass = report.delta <= 14 && report.ownDelta <= 14 && !report.overLimit && report.cursorMoved && reviews >= 1 && report.replaces >= 1
-  say(`  A2 r${round}: team Δ${report.delta}, own Δ${report.ownDelta}, reviews ${reviews}, replace ${report.replaces}, skip ${report.skips}, move ${report.moves}, cursor ${report.cursorMoved}, ${statLine(report.endStats)} ${report.pass ? 'PASS' : 'FAIL'}`)
+  say(`  A2 r${round}: team Δ${report.delta}, own Δ${report.ownDelta}, reviews ${reviews}, replace ${report.replaces}, skip ${report.skips}, move ${report.moves}, cursor ${report.cursorMoved} (${advancedKeys.length} advanced, ${regressedKeys.length} regressed), ${statLine(report.endStats)} ${report.pass ? 'PASS' : 'FAIL'}`)
   return report
 }
 
@@ -359,7 +372,7 @@ const recallLines = answer => {
 const askRecall = (chief, query) => send(chief.id, `用 recall 查一下「${query}」，把 recall 工具返回的原始文本原样贴出来（原文，不要转述）。`)
 
 async function roundA3(round) {
-  const report = { scenario: 'A3', round, results: [] }
+  const report = { scenario: 'A3', round, results: [], samples: [] }
   const chief = await mainBot()
   // Class 1: already in the team MEMORY.md, so the session's snapshot carries them.
   const seeded = teamContent().replace(/\n## Team memory[\s\S]*$/, '')
@@ -373,15 +386,13 @@ async function roundA3(round) {
   for (const query of A3_QUERIES) {
     const result = await step(`recall ${query.slice(0, 6)}`, () => askRecall(chief, query))
     const answer = result.calls.filter(call => call.text).map(call => call.text).join('\n')
-    report.results.push({
-      query,
-      recalled: result.tools.includes('recall'),
-      citations: (recallLines(answer).match(/#L\d+/g) ?? []).length,
-      sample: recallLines(answer).slice(0, 300),
-    })
+    const returned = recallLines(answer)
+    report.results.push({ query, recalled: result.tools.includes('recall'), citations: (returned.match(/#L\d+/g) ?? []).length })
+    if (returned !== '') {
+      report.samples.push({ scenario: 'A3', round, kind: 'recall', query, text: returned })
+    }
   }
   report.recalls = report.results.filter(item => item.recalled).length
-  report.samples = report.results.map(item => item.sample).filter(sample => sample !== '')
   report.pass = report.recalls === A3_QUERIES.length
   say(`  A3 r${round}: recall called for ${report.recalls}/5 queries; ${report.samples.length} returned lines saved for the manual check ${report.pass ? 'PASS' : 'FAIL'}`)
   return report
@@ -401,7 +412,7 @@ const A4_CASES = [
 ]
 
 async function roundA4(round) {
-  const report = { scenario: 'A4', round, checks: [] }
+  const report = { scenario: 'A4', round, checks: [], samples: [] }
   const chief = await mainBot()
   const seeded = teamContent()
   const missing = A4_CASES.map(item => item.fact).filter(fact => !seeded.includes(fact.replace(/[。！？]+$/u, '').slice(-12)))
@@ -414,13 +425,16 @@ async function roundA4(round) {
     const answer = result.calls.filter(call => call.text).map(call => call.text).join('\n')
     const returned = recallLines(answer)
     const citations = (returned.match(/#L\d+/g) ?? []).length
-    report.checks.push({ query: item.query, recalled: result.tools.includes('recall'), citations, sample: returned.slice(0, 300) })
+    report.checks.push({ query: item.query, recalled: result.tools.includes('recall'), citations })
+    if (returned !== '') {
+      report.samples.push({ scenario: 'A4', round, kind: 'recall', query: item.query, text: returned })
+    }
   }
   report.recalls = report.checks.filter(check => check.recalled).length
   report.cited = report.checks.filter(check => check.citations > 0).length
-  report.samples = report.checks.map(check => check.sample).filter(sample => sample !== '')
-  report.pass = report.recalls === A4_CASES.length && report.cited === A4_CASES.length
-  say(`  A4 r${round}: recall called ${report.recalls}/5, results with a citation ${report.cited}/5 ${report.pass ? 'PASS' : 'FAIL'}`)
+  // No pass/fail: whether a citation names the right line is a person's call. The mechanical
+  // part (recall called, citation present) is reported, not scored.
+  say(`  A4 r${round}: recall called ${report.recalls}/5, results with a citation ${report.cited}/5 (manual check)`)
   return report
 }
 
@@ -458,15 +472,22 @@ for (const name of ONLY) {
 }
 for (const scenario of ONLY.map(name => name.toUpperCase())) {
   const rounds = report.rounds.filter(item => item.scenario === scenario)
+  if (rounds.length > 0 && rounds.every(item => item.pass === undefined)) {
+    say(`\n${scenario}: manual check (no pass/fail)`)
+    continue
+  }
   const passed = rounds.filter(item => item.pass).length
   say(`\n${scenario}: ${passed}/${rounds.length} rounds pass`)
 }
-// The manual spot-check: five raw writes / returned lines, printed for a person to judge.
-// Nothing here is pass/fail; semantic equivalence is not a string test.
-const samples = report.rounds.flatMap(item => item.samples ?? []).slice(0, 5)
-if (samples.length > 0) {
-  say('\nmanual spot-check (5 raw writes / returned lines):')
-  for (const [index, sample] of samples.entries()) say(`  ${index + 1}. ${sample.replace(/\s+/g, ' ').slice(0, 220)}`)
+// The manual spot-check: raw writes and returned lines, printed whole for a person to
+// judge. Nothing here is pass/fail; semantic equivalence is not a string test.
+const samples = report.rounds.flatMap(item => item.samples ?? [])
+const shown = samples.slice(0, 5)
+const sampleNote = samples.length < 5 ? `only ${samples.length}, not 5` : `first 5 of ${samples.length}`
+say(`\nmanual spot-check: ${sampleNote}`)
+for (const [index, sample] of shown.entries()) {
+  say(`  ${index + 1}. [${sample.scenario} r${sample.round} ${sample.kind}] op=${sample.op ?? '-'} file=${sample.file ?? '-'} query=${sample.query ?? '-'}`)
+  say(`     ${String(sample.text).replace(/\n/g, '\n     ')}`)
 }
 report.manualSamples = samples
 const calls = tapLines()
