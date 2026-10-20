@@ -1112,15 +1112,15 @@ test('a failed read leaves the entries already in MEMORY.md alone', async (t) =>
       error.code = 'EACCES'
       throw error
     }
+    const before = readFileSync(path, 'utf8')
     let outcome
     try { outcome = await tool('remember', { text: '第三条：日志保留 30 天。' }, 'b2') } catch (error) { outcome = error }
-    // What this proves: a failed read is reported, not mistaken for an empty file, and the
-    // call does not write over what is already there. What it does NOT prove: that the old
-    // entries would have been overwritten without the fix — the write path gives up at the
-    // failed read long before it could rebuild from EMPTY_MAIN.
-    const after = readFileSync(path, 'utf8')
-    assert.ok(outcome !== undefined, 'the call reported the read failure')
-    assert.match(after, /周会/, 'the existing entry is still there')
+    // What this proves: a failed read is reported as a read failure, not mistaken for an
+    // empty file, and nothing is written over what is already there. What it does NOT
+    // prove: that the entries would have been overwritten without the fix — the write path
+    // gives up at the failed read long before it could rebuild from EMPTY_MAIN.
+    assert.match(String(outcome?.message ?? outcome?.error ?? JSON.stringify(outcome)), /EACCES/, 'the call reports the read failure, not a success')
+    assert.equal(readFileSync(path, 'utf8'), before, 'the file is byte for byte what it was')
   } finally {
     readers.readText = real
   }

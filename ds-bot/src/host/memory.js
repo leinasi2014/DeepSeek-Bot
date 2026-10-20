@@ -563,7 +563,13 @@ export function install(rt) {
       let target = topic === undefined ? main : files.find(file => file.topic === topic)
       const fresh = target === undefined
       if (fresh) {
-        if (files.length - 1 >= MEMORY_LIMITS.topics) throw new Error(`${capital(label)} already has ${MEMORY_LIMITS.topics} topics, the most it holds. Add to one of them (recall lists them), or forget one.`)
+        if (files.length - 1 >= MEMORY_LIMITS.topics) {
+          // Tagged like the size limit: hitting the topic cap must not fail the whole
+          // review pass, or the cursor never advances and the lines are reread forever.
+          const error = new Error(`${capital(label)} already has ${MEMORY_LIMITS.topics} topics, the most it holds. Add to one of them (recall lists them), or forget one.`)
+          error.code = 'memory/full'
+          throw error
+        }
         target = { topic, file: `${topic}.md`, path: join(dirOf(scope), `${topic}.md`), content: '', ...parseMemory(`# ${topic}\n`) }
       }
       const base = target.lines.length > 0 ? target.lines : parseMemory(target === main ? EMPTY_MAIN : `# ${topic}\n`).lines
@@ -704,7 +710,14 @@ export function install(rt) {
       try { text = readText(path) } catch (error) { rt.warn('ds-bot: unreadable memory snapshot %s: %s', path, error) }
     }
     if (text === '' || !text.includes(rule)) {
-      text = memorySection(bot)
+      // Reading the memory files themselves can fail too. The hook must still produce a
+      // section: an empty one, with a warning, instead of failing the turn.
+      try {
+        text = memorySection(bot)
+      } catch (error) {
+        rt.warn('ds-bot: memory section for %s could not be built: %s', bot.name, error)
+        return ''
+      }
       if (rt.readOnly() === undefined) {
         try {
           mkdirSync(dirname(path), { recursive: true })
@@ -1216,9 +1229,11 @@ export function install(rt) {
           await journal({
             op: 'skip',
             scope: scopeKey(scope),
-            file: topic === undefined ? MAIN : `${topic}.md`,
+            file: target?.file?.file ?? (topic === undefined ? MAIN : `${topic}.md`),
             ...actorOf(actor),
             after: text,
+            before: target?.text,
+            intendedOp: op,
             reason: 'memory/full',
           })
           continue
