@@ -115,6 +115,48 @@ const opCount = (events, op) => events.filter(event => event.op === op).length
 // A write that saves an entry. `skip` is a refusal, not a save; it must never count as landed.
 const WRITE_OPS = new Set(['add', 'replace', 'move'])
 const isSave = event => WRITE_OPS.has(event.op)
+// A replace only counts as merging when it touches something this round actually said:
+// rewriting an unrelated old entry must not earn the point.
+const probeWords = line => {
+  const latin = (line.match(/[A-Za-z][A-Za-z0-9.+#-]{2,}/g) ?? []).concat(line.match(/\d+(?:\.\d+)?%?/g) ?? [])
+  if (latin.length > 0) return [...new Set(latin)]
+  const han = line.replace(/[，。！？、；：\s"'“”‘’（）()]/gu, '')
+  return han.length >= 6 ? [han.slice(-6)] : []
+}
+const touches = (event, probes) => probes.some(probe => `${event.before ?? ''}\n${event.after ?? ''}`.includes(probe))
+// Compare entry text without punctuation or spacing: a model may rephrase a comma away but
+// still have saved the fact.
+const normalize = text => String(text ?? '').replace(/[\s，。！？、；：,.!?;:（）()"'“”‘’]/gu, '')
+// The probe a landed write must contain: the longest piece of the fact that the memory did
+// not already hold. The seeded fixture repeats most of these facts word for word, so a
+// fixed prefix or suffix would let a moved old entry count as the new fact; when the whole
+// fact is already there, only the whole fact counts.
+const novelWindow = (fact, known) => {
+  const plain = normalize(fact)
+  const held = normalize(known)
+  for (let size = 12; size >= 6; size -= 1) {
+    for (let at = 0; at + size <= plain.length; at += 1) {
+      const probe = plain.slice(at, at + size)
+      if (!held.includes(probe)) return probe
+    }
+  }
+  return plain
+}
+// A save is this fact, not any write: it must contain a stretch of the fact the memory did
+// not hold before this turn. One fixed window would false-fail on a rewrite that drops that
+// exact phrase, so any novel window counts.
+const savedFact = (after, fact, known) => {
+  const text = normalize(after)
+  const plain = normalize(fact)
+  const held = normalize(known)
+  for (let size = 12; size >= 8; size -= 1) {
+    for (let at = 0; at + size <= plain.length; at += 1) {
+      const probe = plain.slice(at, at + size)
+      if (!held.includes(probe) && text.includes(probe)) return true
+    }
+  }
+  return text.includes(plain)
+}
 const snaps = () => (existsSync(SNAPSHOTS) ? readdirSync(SNAPSHOTS).filter(name => name.endsWith('.md')).map(name => ({ name, content: readFileSync(join(SNAPSHOTS, name), 'utf8') })) : [])
 
 const say = line => console.log(line)
@@ -230,15 +272,17 @@ async function roundA1(round) {
   const table = []
   for (const [index, fact] of FACTS.entries()) {
     report.attempted += 1
+    const known = teamContent() + readIf(ownMainPath(chief.id))
+    // Landed means *this* fact reached the journal as a save. The probe is the part of the
+    // fact the memory did not hold before this turn, so a moved or rewritten old entry
+    // cannot pass for the new fact, and `skip` (a refusal) never counts.
+    const seed = novelWindow(fact, known)
     const charsBefore = teamChars()
     const result = await step(`remember ${index + 1}`, () => send(chief.id, `把这条记进长期记忆，很重要：${fact}`))
     const charsAfter = teamChars()
     const answer = result.calls.filter(call => call.text).map(call => call.text).join('\n')
     const refused = /would have \d+ of its \d+ characters/.test(answer)
-    // Landed means *this* fact reached the journal as a save. Any write would let a turn
-    // that only logged `skip` (a refusal) pass, so bind on the fact's seed text.
-    const seed = fact.slice(0, 10)
-    const wrote = result.writes.some(change => isSave(change) && typeof change.after === 'string' && change.after.includes(seed))
+    const wrote = result.writes.some(change => isSave(change) && typeof change.after === 'string' && savedFact(change.after, fact, known))
     const writeCalls = result.tools.filter(name => name === 'remember' || name === 'forget').length
     const ops = result.writes.map(change => change.file ? `${change.op}@${change.file}` : change.op ?? '?')
     for (const op of ops) report.ops[op] = (report.ops[op] ?? 0) + 1
@@ -322,11 +366,15 @@ async function roundA2(round) {
   report.replaces = opCount(writes, 'replace')
   report.skips = opCount(writes, 'skip')
   report.moves = opCount(writes, 'move')
+  const probes = REVIEW_INPUT.flatMap(probeWords)
+  report.replacesRelated = writes.filter(event => event.op === 'replace'
+    && typeof event.before === 'string' && typeof event.after === 'string'
+    && event.before !== event.after && touches(event, probes)).length
   // A round without a single review measured nothing, so it cannot pass. `replace` is the
   // signal the write path merges instead of piling up; ten adds with zero replaces is the
-  // behavior this bench exists to catch.
-  report.pass = report.delta <= 14 && report.ownDelta <= 14 && !report.overLimit && report.cursorMoved && reviews >= 1 && report.replaces >= 1
-  say(`  A2 r${round}: team Δ${report.delta}, own Δ${report.ownDelta}, reviews ${reviews}, replace ${report.replaces}, skip ${report.skips}, move ${report.moves}, cursor ${report.cursorMoved}, ${statLine(report.endStats)} ${report.pass ? 'PASS' : 'FAIL'}`)
+  // behavior this bench exists to catch, and the point is only earned on this round's input.
+  report.pass = report.delta <= 14 && report.ownDelta <= 14 && !report.overLimit && report.cursorMoved && reviews >= 1 && report.replacesRelated >= 1
+  say(`  A2 r${round}: team Δ${report.delta}, own Δ${report.ownDelta}, reviews ${reviews}, replace ${report.replaces} (related ${report.replacesRelated}), skip ${report.skips}, move ${report.moves}, cursor ${report.cursorMoved}, ${statLine(report.endStats)} ${report.pass ? 'PASS' : 'FAIL'}`)
   return report
 }
 
@@ -338,10 +386,22 @@ async function roundA2(round) {
 const INJECTED_FACTS = ['团队的周会在周二上午十点。', '部署窗口是工作日晚上八点到十一点。']
 const ADDED_FACTS = ['我这次记忆基准用的临时标记是 ZQ7。', '我们新换的构建机编号是 B-42。']
 const TOPIC_FACTS = ['旧版接口的兼容层计划在四月下线。']
-const QUERIES = ['周会是什么时候？', '部署窗口是几点？', '临时标记 ZQ7 是什么？', '构建机编号是多少？', '旧版接口的兼容层什么时候下线？']
-// The positive control: queries 3-5 must find their entry. Without it, a recall that
-// returns nothing at all would pass the "nothing injected came back" line.
-const EXPECTED = [null, null, ADDED_FACTS[0], ADDED_FACTS[1], TOPIC_FACTS[0]]
+const A3_CASES = [
+  { query: '周会是什么时候？', forbid: '周二上午十点' },
+  { query: '部署窗口是几点？', forbid: '晚上八点到十一点' },
+  { query: '临时标记 ZQ7 是什么？', expect: 'ZQ7' },
+  { query: '构建机编号是多少？', expect: 'B-42' },
+  { query: '旧版接口的兼容层什么时候下线？', expect: '四月下线' },
+]
+// The recall result, not the model's prose, is what gets measured: the model must paste the
+// tool output verbatim in a fenced block, and only lines shaped like a recall result count.
+const recallLines = answer => {
+  const fenced = [...answer.matchAll(/```[a-zA-Z]*\n([\s\S]*?)```/g)].map(match => match[1]).join('\n')
+  const text = fenced.trim() !== '' ? fenced : answer
+  return text.split('\n').map(line => line.trim()).filter(line => /^\[[^\]]+\]\s/.test(line)).join('\n')
+}
+const askRecall = (chief, query) => send(chief.id, `用 recall 查一下「${query}」，把 recall 工具返回的原始文本原样放进一个 \`\`\` 代码块（不要改字、不要转述、不要解释）。`)
+const has = (text, needle) => needle !== undefined && text.includes(needle)
 
 async function roundA3(round) {
   const report = { scenario: 'A3', round, results: [] }
@@ -356,48 +416,63 @@ async function roundA3(round) {
     for (const fact of ADDED_FACTS) await send(chief.id, `记住：${fact}`)
   })
   const snapshot = snaps().map(file => file.content).join('\n')
-  for (const [index, query] of QUERIES.entries()) {
-    const result = await step(`recall ${query.slice(0, 6)}`, () => send(chief.id, `用 recall 查一下「${query}」，把你的 recall 工具原始输出原样贴出来，不要转述。`))
+  for (const [index, item] of A3_CASES.entries()) {
+    const result = await step(`recall ${item.query.slice(0, 6)}`, () => askRecall(chief, item.query))
     const answer = result.calls.filter(call => call.text).map(call => call.text).join('\n')
-    const expected = EXPECTED[index]
+    // Only the quoted recall result counts; the model's own sentences are not evidence.
+    const returned = recallLines(answer)
     report.results.push({
-      query,
-      recalled: result.tools.includes('recall'),
-      injectedReturned: INJECTED_FACTS.filter(fact => answer.includes(fact.slice(0, 6))).length,
-      expected: expected === null ? null : expected.slice(0, 12),
-      positive: expected !== null && answer.includes(expected.slice(0, 8)),
-      lines: (answer.match(/#L\d+/g) ?? []).length,
-      answer: answer.slice(0, 600),
+      query: item.query,
+      recalled: result.tools.includes('recall') && returned !== '',
+      forbidden: has(returned, item.forbid),
+      positive: has(returned, item.expect),
+      lines: (returned.match(/#L\d+/g) ?? []).length,
+      returned: returned.slice(0, 800),
       inSnapshot: INJECTED_FACTS.filter(fact => snapshot.includes(fact.slice(0, 6))).length,
     })
   }
-  report.injectedReturned = report.results.reduce((sum, item) => sum + item.injectedReturned, 0)
-  report.lineNumbers = report.results.reduce((sum, item) => sum + item.lines, 0)
+  report.injectedReturned = report.results.filter(item => item.forbidden).length
   report.recalls = report.results.filter(item => item.recalled).length
   report.positives = report.results.filter(item => item.positive).length
   report.snapshotHas = report.results[0]?.inSnapshot ?? 0
-  // An empty recall (no result at all) fails the positive control, so it cannot pass here.
-  report.pass = report.recalls === QUERIES.length && report.injectedReturned === 0 && report.positives === 3 && report.snapshotHas === 2
+  // An empty recall (no returned line at all) fails the positive control, so it cannot pass.
+  report.pass = report.recalls === A3_CASES.length && report.injectedReturned === 0 && report.positives === 3 && report.snapshotHas === 2
   say(`  A3 r${round}: recalls ${report.recalls}/5, injected returned ${report.injectedReturned}, positives ${report.positives}/3, snapshot ${report.snapshotHas}/2 ${report.pass ? 'PASS' : 'FAIL'}`)
   return report
 }
 
 // ---------------------------------------------------------------------------
-// Scenario 4 (A4): five recall results, each one checked against the file it names.
-// Stop line: 5/5 point at the line that holds the entry.
+// Scenario 4 (A4): five entries, five recall results, each citation checked against the
+// file it names. The five cases are their own fixtures: reuse of the A3 queries left two
+// of them with nothing to expect, so the scenario could never pass.
+// Stop line: 5/5 point at the line that holds that entry.
+
+const A4_CASES = [
+  { fact: '周会固定在每周二上午十点，地点是小会议室。', query: '周会几点开、在哪？', key: '周二上午十点' },
+  { fact: '部署窗口是工作日晚上八点到十一点。', query: '部署窗口是几点？', key: '晚上八点到十一点' },
+  { fact: '构建机编号是 B-42。', query: '构建机编号是多少？', key: 'B-42' },
+  { fact: '日志保留 30 天。', query: '日志保留多久？', key: '30 天' },
+  { fact: '安全扫描每周五下午跑。', query: '安全扫描什么时候跑？', key: '每周五下午' },
+]
 
 async function roundA4(round) {
   const report = { scenario: 'A4', round, checks: [] }
   const chief = await mainBot()
-  for (const [index, query] of QUERIES.entries()) {
-    const expected = EXPECTED[index]
-    const result = await step(`recall ${query.slice(0, 6)}`, () => send(chief.id, `用 recall 查一下「${query}」，把结果原样贴出来，包括每条后面的出处。`))
+  const seeded = teamContent()
+  const missing = A4_CASES.map(item => item.fact).filter(fact => !seeded.includes(fact.replace(/[。！？]+$/u, '').slice(-12)))
+  if (missing.length > 0) {
+    const tail = `${seeded}${seeded.endsWith('\n') ? '' : '\n'}${missing.map(fact => `- ${fact}`).join('\n')}\n`
+    writeFileSync(writeHere(TEAM_MAIN), tail, 'utf8')
+  }
+  for (const item of A4_CASES) {
+    const result = await step(`recall ${item.query.slice(0, 6)}`, () => askRecall(chief, item.query))
     const answer = result.calls.filter(call => call.text).map(call => call.text).join('\n')
-    const refs = [...answer.matchAll(/([^\s（）()]+MEMORY\.md|\S+\.md)#L(\d+)/g)].map(match => ({ file: match[1], line: Number(match[2]) }))
+    const returned = recallLines(answer)
+    const refs = [...returned.matchAll(/([^\s（）()]+MEMORY\.md|\S+\.md)#L(\d+)/g)].map(match => ({ file: match[1], line: Number(match[2]) }))
     const ref = refs[0]
     if (ref === undefined) {
       // No citation at all is a failed check, never a missing one: the denominator stays 5.
-      report.checks.push({ query, expected: expected?.slice(0, 12) ?? null, ref: null, ok: false, text: '' })
+      report.checks.push({ query: item.query, expected: item.key, ref: null, ok: false, text: '' })
       continue
     }
     const candidates = ref.file.includes('/') || ref.file.includes('\\')
@@ -406,15 +481,15 @@ async function roundA4(round) {
     const path = candidates.find(candidate => existsSync(candidate))
     const lines = path === undefined ? [] : readFileSync(path, 'utf8').split('\n')
     const text = (lines[ref.line - 1] ?? '').trim()
-    // The cited line must hold the entry the query asked about. Any non-empty heading
-    // line used to pass; a citation that points at the wrong line is not a citation.
-    const ok = expected !== undefined && expected !== null && text.includes(expected.slice(0, 8))
-    report.checks.push({ query, expected: expected?.slice(0, 12) ?? null, ref: `${ref.file}#L${ref.line}`, ok, text: text.slice(0, 80) })
+    // The cited line must hold the key value of the entry the query asked about. Any
+    // non-empty heading line used to pass; a citation to the wrong line is not a citation.
+    const ok = text.includes(item.key)
+    report.checks.push({ query: item.query, expected: item.key, ref: `${ref.file}#L${ref.line}`, ok, text: text.slice(0, 80) })
   }
   report.found = report.checks.filter(check => check.ref !== null).length
   report.ok = report.checks.filter(check => check.ok).length
-  report.pass = report.checks.length === QUERIES.length && report.ok === QUERIES.length
-  say(`  A4 r${round}: ${report.ok}/${QUERIES.length} citations hit the entry (${report.found} cited, ${report.checks.length - report.found} missing) ${report.pass ? 'PASS' : 'FAIL'}`)
+  report.pass = report.checks.length === A4_CASES.length && report.ok === A4_CASES.length
+  say(`  A4 r${round}: ${report.ok}/${A4_CASES.length} citations hit the entry (${report.found} cited, ${report.checks.length - report.found} missing) ${report.pass ? 'PASS' : 'FAIL'}`)
   return report
 }
 
