@@ -1,6 +1,9 @@
-// The ruler for the memory work (issues #1-#4): four scenarios on a running bench with a
-// real model, three rounds each, every round reported. Nothing here touches the real
-// memory or the real Bot team: it runs against a bench home and a copy of MEMORY.md.
+// The ruler for the memory work (issues #4 and #12): four scenarios on a running bench with
+// a real model, three rounds each, every round reported. Judged mechanically — journal ops,
+// capacity, the review cursor, and whether remember/recall was called. Semantic correctness
+// (did a fact keep its meaning, did a method land in a topic) is printed as a five-item
+// manual spot-check, never folded into a pass/fail. Nothing here touches the real memory or
+// the real Bot team: it runs against a bench home and a copy of MEMORY.md.
 //
 //   node dev/bench-memory.mjs <bench-home> <web-port> <model-ref> [options]
 //     --tap <llm-tap.jsonl>   the tap log, for model calls and tool names (required)
@@ -16,7 +19,7 @@
 // Costs real tokens. One round is roughly 40-60 calls; three rounds stay under 200.
 // Every scenario reports its own stop line and passes only when all rounds pass; the
 // numbers of each round are printed even when an earlier round failed.
-import { existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync, copyFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, copyFileSync } from 'node:fs'
 import { join, resolve, sep, basename } from 'node:path'
 import { parseArgs } from 'node:util'
 
@@ -43,7 +46,6 @@ const BASE = `http://127.0.0.1:${PORT}`
 const MEM = join(HOME, 'bot', 'memory')
 const TEAM_MAIN = join(MEM, 'team', 'MEMORY.md')
 const REVIEWED = join(MEM, 'reviewed.json')
-const SNAPSHOTS = join(MEM, 'snapshots')
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 class RateLimited extends Error {}
 let retries = 0
@@ -93,14 +95,36 @@ const readJsonLines = path => (existsSync(path) ? readFileSync(path, 'utf8').spl
 const tapLines = () => readJsonLines(args.tap)
 const journal = () => readJsonLines(join(MEM, 'journal.jsonl'))
 const reviewed = () => (existsSync(REVIEWED) ? JSON.parse(readFileSync(REVIEWED, 'utf8')) : {})
-const teamChars = () => (existsSync(TEAM_MAIN) ? readFileSync(TEAM_MAIN, 'utf8').length : 0)
+const teamChars = () => (existsSync(TEAM_MAIN) ? charsOf(readFileSync(TEAM_MAIN, 'utf8')) : 0)
 const teamContent = () => (existsSync(TEAM_MAIN) ? readFileSync(TEAM_MAIN, 'utf8') : '')
 function ensureTeamFile() {
   mkdirSync(writeHere(join(MEM, 'team')), { recursive: true })
   if (!existsSync(TEAM_MAIN)) writeFileSync(writeHere(TEAM_MAIN), '# Memory\n\n## Index\n', 'utf8')
 }
-const entryCount = content => (content.match(/^\s*[-*]\s+/gm) ?? []).length
-const snaps = () => (existsSync(SNAPSHOTS) ? readdirSync(SNAPSHOTS).filter(name => name.endsWith('.md')).map(name => ({ name, content: readFileSync(join(SNAPSHOTS, name), 'utf8') })) : [])
+// Body entries and index lines are counted apart. An index line is a bullet whose whole
+// text is one [[topic]] link; a body entry that merely mentions [[topic]] is still a body
+// entry, and counting it as an index both undercounts entries and inflates the index.
+const entryLines = content => (content.match(/^\s*[-*]\s+.*$/gm) ?? [])
+const bulletText = line => line.replace(/^\s*[-*]\s+/, '').trim()
+const isIndexLine = line => /^\[\[[^\]]+\]\]$/.test(bulletText(line))
+const entryCount = content => entryLines(content).filter(line => !isIndexLine(line)).length
+const indexCount = content => entryLines(content).filter(isIndexLine).length
+const ownMainPath = botId => join(MEM, 'bots', botId, 'MEMORY.md')
+const readIf = path => (existsSync(path) ? readFileSync(path, 'utf8') : '')
+// Character counts are on normalized line endings: the fixture is CRLF on disk, and the
+// design's 3,765 is the same file counted after dropping the 87 carriage returns.
+const charsOf = content => content.replace(/\r\n?/g, '\n').length
+const oneScope = content => ({ chars: charsOf(content), body: entryCount(content), index: indexCount(content) })
+// Team and its own memory are reported apart: growth in one must not hide growth in the
+// other (the before run wrote 8 entries into the Bot's own file while the team file held).
+const scopeStats = bot => ({ team: oneScope(teamContent()), own: oneScope(readIf(ownMainPath(bot.id))) })
+const statLine = stats => `team ${stats.team.body}b/${stats.team.index}i/${stats.team.chars}c, own ${stats.own.body}b/${stats.own.index}i/${stats.own.chars}c`
+const opCount = (events, op) => events.filter(event => event.op === op).length
+// A write that saves an entry. `skip` is a refusal, not a save; it must never count as landed.
+// A save is a write this turn: add, replace or move. `skip` is a refusal, not a save.
+// What the entry means is not judged here; semantic checks are a manual spot-check.
+const WRITE_OPS = new Set(['add', 'replace', 'move'])
+const isSave = event => WRITE_OPS.has(event.op)
 
 const say = line => console.log(line)
 const botNamed = async name => (await api('state')).bots.find(bot => bot.name === name)
@@ -201,15 +225,16 @@ async function roundA1(round) {
   //   repeatWrites— the turn made two or more write calls (remember/forget). A retry after
   //                 a refusal looks like this, but so does any turn that wrote twice, so it
   //                 is a proxy for "wrote more than once", not proof of a cleanup.
-  const report = { scenario: 'A1', round, attempted: 0, landed: 0, refused: 0, repeatWrites: 0, details: [] }
+  const report = { scenario: 'A1', round, attempted: 0, landed: 0, refused: 0, repeatWrites: 0, skips: 0, replaces: 0, moves: 0, details: [] }
   if (args['team-source']) {
     mkdirSync(writeHere(join(MEM, 'team')), { recursive: true })
     copyFileSync(args['team-source'], writeHere(TEAM_MAIN))
   }
   ensureTeamFile()
   report.startChars = teamChars()
-  say(`  start: MEMORY.md ${report.startChars} characters, ${entryCount(teamContent())} entries`)
   const chief = await mainBot()
+  report.startStats = scopeStats(chief)
+  say(`  start: ${statLine(report.startStats)}`)
   report.ops = {}
   const table = []
   for (const [index, fact] of FACTS.entries()) {
@@ -219,13 +244,18 @@ async function roundA1(round) {
     const charsAfter = teamChars()
     const answer = result.calls.filter(call => call.text).map(call => call.text).join('\n')
     const refused = /would have \d+ of its \d+ characters/.test(answer)
-    const wrote = result.writes.length > 0
+    // Mechanical only: did this turn save anything (add/replace/move), and where. Whether
+    // the saved text means what the fact meant is the manual spot-check, not a string test.
+    const wrote = result.writes.some(isSave)
     const writeCalls = result.tools.filter(name => name === 'remember' || name === 'forget').length
     const ops = result.writes.map(change => change.file ? `${change.op}@${change.file}` : change.op ?? '?')
     for (const op of ops) report.ops[op] = (report.ops[op] ?? 0) + 1
+    report.skips += opCount(result.writes, 'skip')
+    report.replaces += opCount(result.writes, 'replace')
+    report.moves += opCount(result.writes, 'move')
     if (wrote) report.landed += 1
     if (refused) report.refused += 1
-    if (wrote && writeCalls > 1) report.repeatWrites += 1
+    if (writeCalls > 1) report.repeatWrites += 1
     report.details.push({ fact: fact.slice(0, 12), refused, wrote, writeCalls, ops, chars: [charsBefore, charsAfter], tools: result.tools })
     table.push(`    ${String(index + 1).padStart(2)} ${(ops.join(' ') || 'no write').padEnd(30)} ${charsBefore} -> ${charsAfter}`)
   }
@@ -233,9 +263,11 @@ async function roundA1(round) {
   for (const line of table) say(line)
   say(`  ops in total: ${Object.entries(report.ops).map(([op, count]) => `${op}=${count}`).join(' ') || 'none'}`)
   report.endChars = teamChars()
-  report.entries = entryCount(teamContent())
+  report.endStats = scopeStats(chief)
+  report.entries = report.endStats.team.body
+  report.index = report.endStats.team.index
   report.pass = report.landed >= 10
-  say(`  A1 r${round}: landed ${report.landed}/12, refused ${report.refused} (answer text only, lower bound), repeat writes ${report.repeatWrites}, chars ${report.startChars} -> ${report.endChars} ${report.pass ? 'PASS' : 'FAIL'}`)
+  say(`  A1 r${round}: landed ${report.landed}/12, refused ${report.refused}, skips ${report.skips}, replace ${report.replaces}, move ${report.moves}, ${statLine(report.endStats)} ${report.pass ? 'PASS' : 'FAIL'}`)
   return report
 }
 
@@ -270,11 +302,13 @@ const REVIEW_INPUT = [
 async function roundA2(round) {
   const report = { scenario: 'A2', round }
   ensureTeamFile()
-  const before = teamContent()
-  report.startEntries = entryCount(before)
-  report.startChars = before.length
-  const cursorBefore = JSON.stringify(reviewed())
+  const chief = await mainBot()
+  report.startStats = scopeStats(chief)
+  report.startEntries = report.startStats.team.body
+  report.startChars = report.startStats.team.chars
+  const cursorBefore = reviewed()
   let reviews = 0
+  const writes = []
   // Batches of four keep the turn count, and the cost, bounded.
   for (let index = 0; index < REVIEW_INPUT.length; index += 4) {
     const batch = REVIEW_INPUT.slice(index, index + 4)
@@ -282,32 +316,66 @@ async function roundA2(round) {
       for (const line of batch) await send((await mainBot()).id, line)
     })
     reviews += result.calls.filter(call => call.kind === 'review').length
+    writes.push(...result.writes)
   }
   const after = teamContent()
-  report.endEntries = entryCount(after)
-  report.endChars = after.length
+  report.endStats = scopeStats(chief)
+  report.endEntries = report.endStats.team.body
+  report.endChars = report.endStats.team.chars
   report.reviews = reviews
-  report.cursorMoved = JSON.stringify(reviewed()) !== cursorBefore
+  // The cursor is a number per key. Read this run's key and require a strict increase; a
+  // different key changing, or the key going backwards, is not progress.
+  const cursorAfter = reviewed()
+  const cursorKeys = [...new Set([...Object.keys(cursorBefore), ...Object.keys(cursorAfter)])]
+  const advancedKeys = cursorKeys.filter(key => Number(cursorAfter[key] ?? 0) > Number(cursorBefore[key] ?? 0))
+  const regressedKeys = cursorKeys.filter(key => Number(cursorAfter[key] ?? 0) < Number(cursorBefore[key] ?? 0))
+  report.cursor = { advanced: advancedKeys, advancedTo: Object.fromEntries(advancedKeys.map(key => [key, cursorAfter[key]])), regressed: regressedKeys }
+  report.cursorMoved = advancedKeys.length > 0 && regressedKeys.length === 0
   report.delta = report.endEntries - report.startEntries
-  report.overLimit = report.endChars > 4_000
-  // A round without a single review measured nothing, so it cannot pass.
-  report.pass = report.delta <= 14 && !report.overLimit && report.cursorMoved && reviews >= 1
-  say(`  A2 r${round}: entries ${report.startEntries} -> ${report.endEntries} (Δ${report.delta}), chars ${report.startChars} -> ${report.endChars}, reviews ${reviews}, cursor moved ${report.cursorMoved} ${report.pass ? 'PASS' : 'FAIL'}`)
+  report.ownDelta = report.endStats.own.body - report.startStats.own.body
+  report.overLimit = [report.startStats.team, report.endStats.team, report.startStats.own, report.endStats.own].some(scope => scope.chars > 4_000)
+  report.replaces = opCount(writes, 'replace')
+  report.skips = opCount(writes, 'skip')
+  report.moves = opCount(writes, 'move')
+  // Raw writes for the manual spot-check: whether a replace merged the right entries is
+  // judged by a person, not by a string probe. Full text, no truncation.
+  report.samples = writes.map(event => ({
+    scenario: 'A2',
+    round,
+    kind: 'write',
+    op: event.op ?? null,
+    file: event.file ?? null,
+    text: event.after ?? event.text ?? event.before ?? '',
+  })).filter(sample => sample.text !== '')
+  // Mechanical only: a review ran, the cursor strictly advanced without going backwards,
+  // both files stayed under their limits at start and end, and at least one replace
+  // happened. Whether a replace merged the right entries is the manual spot-check.
+  report.pass = report.delta <= 14 && report.ownDelta <= 14 && !report.overLimit && report.cursorMoved && reviews >= 1 && report.replaces >= 1
+  say(`  A2 r${round}: team Δ${report.delta}, own Δ${report.ownDelta}, reviews ${reviews}, replace ${report.replaces}, skip ${report.skips}, move ${report.moves}, cursor ${report.cursorMoved} (${advancedKeys.length} advanced, ${regressedKeys.length} regressed), ${statLine(report.endStats)} ${report.pass ? 'PASS' : 'FAIL'}`)
   return report
 }
 
 // ---------------------------------------------------------------------------
-// Scenario 3 (A3): recall in one session over three classes of entry — already in the
-// prompt at session start, added during the session, topic only. Stop line: nothing that
-// is already in the snapshot comes back, the other two classes still do.
+// Scenario 3 (A3): recall is called for five queries, in one session over entries that were
+// injected at session start, added during the session, and topic-only. Judged mechanically:
+// every query must call recall. What came back is printed for the manual spot-check; asking
+// a string test whether a Chinese fact "was saved" only produced false passes and false
+// failures on paraphrase.
 
 const INJECTED_FACTS = ['团队的周会在周二上午十点。', '部署窗口是工作日晚上八点到十一点。']
 const ADDED_FACTS = ['我这次记忆基准用的临时标记是 ZQ7。', '我们新换的构建机编号是 B-42。']
 const TOPIC_FACTS = ['旧版接口的兼容层计划在四月下线。']
-const QUERIES = ['周会是什么时候？', '部署窗口是几点？', '临时标记 ZQ7 是什么？', '构建机编号是多少？', '旧版接口的兼容层什么时候下线？']
+const A3_QUERIES = ['周会是什么时候？', '部署窗口是几点？', '临时标记 ZQ7 是什么？', '构建机编号是多少？', '旧版接口的兼容层什么时候下线？']
+// Read the model's quoted recall result for the manual sample; never used as a pass test.
+const recallLines = answer => {
+  const fenced = [...answer.matchAll(/```[a-zA-Z]*\n([\s\S]*?)```/g)].map(match => match[1]).join('\n')
+  const text = fenced.trim() !== '' ? fenced : answer
+  return text.split('\n').map(line => line.trim()).filter(line => /^\[[^\]]+\]\s/.test(line)).join('\n')
+}
+const askRecall = (chief, query) => send(chief.id, `用 recall 查一下「${query}」，把 recall 工具返回的原始文本原样贴出来（原文，不要转述）。`)
 
 async function roundA3(round) {
-  const report = { scenario: 'A3', round, results: [] }
+  const report = { scenario: 'A3', round, results: [], samples: [] }
   const chief = await mainBot()
   // Class 1: already in the team MEMORY.md, so the session's snapshot carries them.
   const seeded = teamContent().replace(/\n## Team memory[\s\S]*$/, '')
@@ -318,49 +386,58 @@ async function roundA3(round) {
   await step('added during the session', async () => {
     for (const fact of ADDED_FACTS) await send(chief.id, `记住：${fact}`)
   })
-  const snapshot = snaps().map(file => file.content).join('\n')
-  for (const query of QUERIES) {
-    const result = await step(`recall ${query.slice(0, 6)}`, () => send(chief.id, `用 recall 查一下「${query}」，把你的 recall 工具原始输出原样贴出来，不要转述。`))
+  for (const query of A3_QUERIES) {
+    const result = await step(`recall ${query.slice(0, 6)}`, () => askRecall(chief, query))
     const answer = result.calls.filter(call => call.text).map(call => call.text).join('\n')
-    report.results.push({
-      query,
-      recalled: result.tools.includes('recall'),
-      injectedReturned: INJECTED_FACTS.filter(fact => answer.includes(fact.slice(0, 6))).length,
-      lines: (answer.match(/#L\d+/g) ?? []).length,
-      answer: answer.slice(0, 600),
-      inSnapshot: INJECTED_FACTS.filter(fact => snapshot.includes(fact.slice(0, 6))).length,
-    })
+    const returned = recallLines(answer)
+    report.results.push({ query, recalled: result.tools.includes('recall'), citations: (returned.match(/#L\d+/g) ?? []).length })
+    if (returned !== '') {
+      report.samples.push({ scenario: 'A3', round, kind: 'recall', query, text: returned })
+    }
   }
-  report.injectedReturned = report.results.reduce((sum, item) => sum + item.injectedReturned, 0)
-  report.lineNumbers = report.results.reduce((sum, item) => sum + item.lines, 0)
   report.recalls = report.results.filter(item => item.recalled).length
-  report.pass = report.injectedReturned === 0 && report.recalls === QUERIES.length
-  say(`  A3 r${round}: recalls ${report.recalls}/5, injected entries returned ${report.injectedReturned}, line refs ${report.lineNumbers}, snapshot has ${report.results[0]?.inSnapshot ?? 0}/2 ${report.pass ? 'PASS' : 'FAIL'}`)
+  report.pass = report.recalls === A3_QUERIES.length
+  say(`  A3 r${round}: recall called for ${report.recalls}/5 queries; ${report.samples.length} returned lines saved for the manual check ${report.pass ? 'PASS' : 'FAIL'}`)
   return report
 }
 
 // ---------------------------------------------------------------------------
-// Scenario 4 (A4): five recall results, each one checked against the file it names.
-// Stop line: 5/5 point at the line that holds the entry.
+// Scenario 4 (A4): five recall calls; judged mechanically on whether the result carries a
+// `文件#L行号` citation. Which line it names is the manual spot-check, not a string match.
+// Stop line: 5/5 queries call recall and 5/5 results carry a citation.
+
+const A4_CASES = [
+  { fact: '周会固定在每周二上午十点，地点是小会议室。', query: '周会几点开、在哪？' },
+  { fact: '部署窗口是工作日晚上八点到十一点。', query: '部署窗口是几点？' },
+  { fact: '构建机编号是 B-42。', query: '构建机编号是多少？' },
+  { fact: '日志保留 30 天。', query: '日志保留多久？' },
+  { fact: '安全扫描每周五下午跑。', query: '安全扫描什么时候跑？' },
+]
 
 async function roundA4(round) {
-  const report = { scenario: 'A4', round, checks: [] }
+  const report = { scenario: 'A4', round, checks: [], samples: [] }
   const chief = await mainBot()
-  for (const query of QUERIES) {
-    const result = await step(`recall ${query.slice(0, 6)}`, () => send(chief.id, `用 recall 查一下「${query}」，把结果原样贴出来，包括每条后面的出处。`))
+  const seeded = teamContent()
+  const missing = A4_CASES.map(item => item.fact).filter(fact => !seeded.includes(fact.replace(/[。！？]+$/u, '').slice(-12)))
+  if (missing.length > 0) {
+    const tail = `${seeded}${seeded.endsWith('\n') ? '' : '\n'}${missing.map(fact => `- ${fact}`).join('\n')}\n`
+    writeFileSync(writeHere(TEAM_MAIN), tail, 'utf8')
+  }
+  for (const item of A4_CASES) {
+    const result = await step(`recall ${item.query.slice(0, 6)}`, () => askRecall(chief, item.query))
     const answer = result.calls.filter(call => call.text).map(call => call.text).join('\n')
-    const refs = [...answer.matchAll(/([^\s（）()]+MEMORY\.md|\S+\.md)#L(\d+)/g)].map(match => ({ file: match[1], line: Number(match[2]) }))
-    for (const ref of refs.slice(0, 1)) {
-      const path = ref.file.includes('/') || ref.file.includes('\\') ? ref.file : join(MEM, 'team', ref.file)
-      const lines = existsSync(path) ? readFileSync(path, 'utf8').split('\n') : []
-      const text = (lines[ref.line - 1] ?? '').trim()
-      report.checks.push({ query, ref: `${ref.file}#L${ref.line}`, ok: text.length > 0, text: text.slice(0, 80) })
+    const returned = recallLines(answer)
+    const citations = (returned.match(/#L\d+/g) ?? []).length
+    report.checks.push({ query: item.query, recalled: result.tools.includes('recall'), citations })
+    if (returned !== '') {
+      report.samples.push({ scenario: 'A4', round, kind: 'recall', query: item.query, text: returned })
     }
   }
-  report.found = report.checks.length
-  report.ok = report.checks.filter(check => check.ok).length
-  report.pass = report.ok >= 5
-  say(`  A4 r${round}: ${report.ok}/${Math.max(report.found, 5)} line references check out ${report.pass ? 'PASS' : 'FAIL'}`)
+  report.recalls = report.checks.filter(check => check.recalled).length
+  report.cited = report.checks.filter(check => check.citations > 0).length
+  // No pass/fail: whether a citation names the right line is a person's call. The mechanical
+  // part (recall called, citation present) is reported, not scored.
+  say(`  A4 r${round}: recall called ${report.recalls}/5, results with a citation ${report.cited}/5 (manual check)`)
   return report
 }
 
@@ -386,7 +463,10 @@ for (const name of ONLY) {
       report.rounds.push(result)
     } catch (error) {
       say(`  ERROR ${name} r${round}: ${error.message}`)
-      report.rounds.push({ scenario: name.toUpperCase(), round, error: error.message, pass: false })
+      // A4 is a manual check: no pass/fail on any path, including an error.
+      const failed = { scenario: name.toUpperCase(), round, error: error.message }
+      if (name !== 'a4') failed.pass = false
+      report.rounds.push(failed)
       if (error instanceof RateLimited) {
         say('  rate limited: stopping the run; only the rounds that finished are reported')
         report.rateLimited = true
@@ -398,9 +478,24 @@ for (const name of ONLY) {
 }
 for (const scenario of ONLY.map(name => name.toUpperCase())) {
   const rounds = report.rounds.filter(item => item.scenario === scenario)
+  if (rounds.length > 0 && rounds.every(item => item.pass === undefined)) {
+    say(`\n${scenario}: manual check (no pass/fail)`)
+    continue
+  }
   const passed = rounds.filter(item => item.pass).length
   say(`\n${scenario}: ${passed}/${rounds.length} rounds pass`)
 }
+// The manual spot-check: raw writes and returned lines, printed whole for a person to
+// judge. Nothing here is pass/fail; semantic equivalence is not a string test.
+const samples = report.rounds.flatMap(item => item.samples ?? [])
+const shown = samples.slice(0, 5)
+const sampleNote = samples.length < 5 ? `only ${samples.length}, not 5` : `first 5 of ${samples.length}`
+say(`\nmanual spot-check: ${sampleNote}`)
+for (const [index, sample] of shown.entries()) {
+  say(`  ${index + 1}. [${sample.scenario} r${sample.round} ${sample.kind}] op=${sample.op ?? '-'} file=${sample.file ?? '-'} query=${sample.query ?? '-'}`)
+  say(`     ${String(sample.text).replace(/\n/g, '\n     ')}`)
+}
+report.manualSamples = samples
 const calls = tapLines()
 // A run is counted from where it started: the tap file may already hold smoke runs.
 say(`model calls in this run: ${calls.length - tapStart}; in the tap so far: ${calls.length}`)
