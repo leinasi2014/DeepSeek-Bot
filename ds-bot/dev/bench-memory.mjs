@@ -8,9 +8,12 @@
 //     --rounds <n>            rounds per scenario (default 3)
 //     --only <a1,a2,a3,a4>    run a subset (default all)
 //     --out <report.json>
+// Every file this script reads or writes is UTF-8 explicitly, and every path is built
+// with join(): the scenarios are Chinese text and the bench also runs on Windows, where a
+// console redirected to a file keeps the bytes but the console itself may not be UTF-8
+// (`chcp 65001`, or write to a file and read it back as UTF-8).
 //
 // Costs real tokens. One round is roughly 40-60 calls; three rounds stay under 200.
-//
 // Every scenario reports its own stop line and passes only when all rounds pass; the
 // numbers of each round are printed even when an earlier round failed.
 import { existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync, copyFileSync } from 'node:fs'
@@ -90,7 +93,7 @@ const teamChars = () => (existsSync(TEAM_MAIN) ? readFileSync(TEAM_MAIN, 'utf8')
 const teamContent = () => (existsSync(TEAM_MAIN) ? readFileSync(TEAM_MAIN, 'utf8') : '')
 function ensureTeamFile() {
   mkdirSync(writeHere(join(MEM, 'team')), { recursive: true })
-  if (!existsSync(TEAM_MAIN)) writeFileSync(writeHere(TEAM_MAIN), '# Memory\n\n## Index\n')
+  if (!existsSync(TEAM_MAIN)) writeFileSync(writeHere(TEAM_MAIN), '# Memory\n\n## Index\n', 'utf8')
 }
 const entryCount = content => (content.match(/^\s*[-*]\s+/gm) ?? []).length
 const snaps = () => (existsSync(SNAPSHOTS) ? readdirSync(SNAPSHOTS).filter(name => name.endsWith('.md')).map(name => ({ name, content: readFileSync(join(SNAPSHOTS, name), 'utf8') })) : [])
@@ -255,7 +258,7 @@ async function roundA3(round) {
   const chief = await mainBot()
   // Class 1: already in the team MEMORY.md, so the session's snapshot carries them.
   const seeded = teamContent().replace(/\n## Team memory[\s\S]*$/, '')
-  writeFileSync(writeHere(TEAM_MAIN), `${seeded}${seeded.endsWith('\n') ? '' : '\n'}- ${INJECTED_FACTS.join('\n- ')}\n`)
+  writeFileSync(writeHere(TEAM_MAIN), `${seeded}${seeded.endsWith('\n') ? '' : '\n'}- ${INJECTED_FACTS.join('\n- ')}\n`, 'utf8')
   // A fresh session: end the running one by starting a new chat for this Bot.
   await step('new session', async () => { await send(chief.id, '我们开始一个新话题，先打个招呼就行。') })
   await step('topic entry', async () => { await send(chief.id, `把这条记进 [[运维]] 主题：${TOPIC_FACTS[0]}`) })
@@ -341,4 +344,4 @@ if (outside.length > 0) {
   process.exitCode = 1
 }
 report.guard = { home: HOME_ROOT, writes: writes.length, outside }
-if (args.out) writeFileSync(args.out, JSON.stringify(report, null, 2))
+if (args.out) writeFileSync(args.out, JSON.stringify(report, null, 2), 'utf8')
