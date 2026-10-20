@@ -95,7 +95,7 @@ const readJsonLines = path => (existsSync(path) ? readFileSync(path, 'utf8').spl
 const tapLines = () => readJsonLines(args.tap)
 const journal = () => readJsonLines(join(MEM, 'journal.jsonl'))
 const reviewed = () => (existsSync(REVIEWED) ? JSON.parse(readFileSync(REVIEWED, 'utf8')) : {})
-const teamChars = () => (existsSync(TEAM_MAIN) ? readFileSync(TEAM_MAIN, 'utf8').length : 0)
+const teamChars = () => (existsSync(TEAM_MAIN) ? charsOf(readFileSync(TEAM_MAIN, 'utf8')) : 0)
 const teamContent = () => (existsSync(TEAM_MAIN) ? readFileSync(TEAM_MAIN, 'utf8') : '')
 function ensureTeamFile() {
   mkdirSync(writeHere(join(MEM, 'team')), { recursive: true })
@@ -108,7 +108,10 @@ const entryCount = content => entryLines(content).filter(line => !line.includes(
 const indexCount = content => entryLines(content).filter(line => line.includes('[[')).length
 const ownMainPath = botId => join(MEM, 'bots', botId, 'MEMORY.md')
 const readIf = path => (existsSync(path) ? readFileSync(path, 'utf8') : '')
-const oneScope = content => ({ chars: content.length, body: entryCount(content), index: indexCount(content) })
+// Character counts are on normalized line endings: the fixture is CRLF on disk, and the
+// design's 3,765 is the same file counted after dropping the 87 carriage returns.
+const charsOf = content => content.replace(/\r\n?/g, '\n').length
+const oneScope = content => ({ chars: charsOf(content), body: entryCount(content), index: indexCount(content) })
 // Team and its own memory are reported apart: growth in one must not hide growth in the
 // other (the before run wrote 8 entries into the Bot's own file while the team file held).
 const scopeStats = bot => ({ team: oneScope(teamContent()), own: oneScope(readIf(ownMainPath(bot.id))) })
