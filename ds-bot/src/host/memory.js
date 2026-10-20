@@ -290,7 +290,7 @@ const wellFormed = (change) => {
   if (change === null || typeof change !== 'object') return false
   const texted = typeof change.text === 'string' && change.text.trim() !== ''
   const numbered = Number.isInteger(Number(change.entry)) && Number(change.entry) >= 1
-  if (change.op === 'add') return texted && (change.topic === undefined || typeof change.topic === 'string') && (change.team === undefined || typeof change.team === 'boolean')
+  if (change.op === 'add') return texted && (change.topic === undefined || typeof change.topic === 'string') && (change.team === undefined || typeof change.team === 'boolean') && (change.kind === undefined || change.kind === 'howto')
   if (change.op === 'edit') return texted && numbered
   return change.op === 'remove' && numbered
 }
@@ -351,7 +351,7 @@ const reviewSystem = teamWrites => [
   'Knowledge about how to do something (a rule, a command, a pitfall) is a howto: it goes in a topic with kind "howto", never in MEMORY.md. Facts about people, places, numbers and decisions stay in MEMORY.md.',
   'Keep, as a new entry:',
   '- a lasting preference the user states or shows: style, tone, format, length, tools, how to work. A complaint counts: "too busy, I like it plain" means the user likes a plain style.',
-  '- a fact about the user, their work, or their team that later work needs, such as their role, their stack, their team, or a plan with a date. Keep it the turn the user says it, even in passing.',
+  '- a fact about the user, their work, or their team that later work needs, such as their role, their stack, their team, or a plan with a date. A fact mentioned in passing while the turn was about something else waits for one of the signals above.',
   '- a decision or a correction from the user that holds beyond the task at hand.',
   'Do not keep:',
   '- what matters only for the task at hand: details of this draft, design, or answer, rules that hold only in the project or file being worked on (its naming, its branches), and anything the user marks as one-off, such as "this time", "for now", or "这次先这样".',
@@ -829,9 +829,9 @@ export function install(rt) {
       const { topic, error } = topicArg(args.topic)
       if (error) return error
       const replace = String(args.replace ?? '').trim()
-      const kindArg = String(args.kind ?? '').trim()
-      if (kindArg !== '' && kindArg !== 'howto') return 'kind is either "howto" or left out; there is no other type.'
-      const kind = kindArg === '' ? undefined : 'howto'
+      const kindArg = args.kind
+      if (kindArg !== undefined && kindArg !== 'howto') return 'kind is either "howto" or left out; there is no other type.'
+      const kind = kindArg === 'howto' ? 'howto' : undefined
       try {
         const meta = await metaFor(context.caller, context.scope, kind)
         const result = replace === ''
@@ -1222,7 +1222,14 @@ export function install(rt) {
       const scope = op === 'add' ? (change.team === true && teamWrites ? TEAM : ownScope(bot.id)) : target?.scope === 'team' ? TEAM : ownScope(bot.id)
       const label = labelOf(scope, bot.id)
       const text = cleanEntry(change?.text)
-      const meta = { source, ...(scope.kind === 'team' ? { by: bot.name } : {}), added: today() }
+      // The review is the main writer: its changes need the type too, or a howto it saves
+      // is stored as a fact.
+      const meta = {
+        source,
+        ...(scope.kind === 'team' ? { by: bot.name } : {}),
+        ...(change?.kind === 'howto' ? { kind: 'howto' } : {}),
+        added: today(),
+      }
       try {
         if (op !== 'add' && target === undefined) continue
         if (scope.kind === 'team' && !teamWrites) continue

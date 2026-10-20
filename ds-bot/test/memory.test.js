@@ -1146,17 +1146,30 @@ for (const code of ['EACCES', 'EPERM']) {
 
 test('kind: howto lives in the meta, and an edit keeps it', async (t) => {
   const { readFileSync } = await import('node:fs')
+  const { parseMemory } = await import('../src/host/memory.js')
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-kind-'))
   const { tool, stop } = start({ home })
   t.after(() => stop())
+  const entries = () => parseMemory(readFileSync(join(home, 'memory', 'bots', 'b2', 'ops.md'), 'utf8')).entries
+
   await tool('remember', { text: 'Deploy with pnpm, never npm.', topic: 'ops', kind: 'howto' }, 'b2')
-  const topicPath = join(home, 'memory', 'bots', 'b2', 'ops.md')
-  const first = readFileSync(topicPath, 'utf8')
-  assert.match(first, /Deploy with pnpm/, 'the entry landed in the topic')
-  assert.match(first, /kind: howto/, 'the type is in the meta, not in the text')
+  const afterAdd = entries()
+  assert.equal(afterAdd.length, 1, 'exactly one entry')
+  assert.equal(afterAdd[0].text, 'Deploy with pnpm, never npm.', 'the text is exactly what was saved')
+  assert.equal(afterAdd[0].meta.kind, 'howto', 'the type is in that entry\'s meta')
+  assert.doesNotMatch(afterAdd[0].text, /kind/, 'the type never enters the text')
+
   // An edit that says nothing about the type keeps the one the entry has.
   await tool('remember', { text: 'Deploy with pnpm, never npm or yarn.', replace: 'Deploy with pnpm', topic: 'ops' }, 'b2')
-  const second = readFileSync(topicPath, 'utf8')
-  assert.match(second, /never npm or yarn/, 'the edit landed')
-  assert.match(second, /kind: howto/, 'the kind survived an edit that did not mention it')
+  const afterEdit = entries()
+  assert.equal(afterEdit.length, 1, 'an edit replaces, it does not append')
+  assert.equal(afterEdit[0].text, 'Deploy with pnpm, never npm or yarn.', 'the new text is there')
+  assert.equal(afterEdit[0].meta.kind, 'howto', 'the kind survived an edit that did not mention it')
+
+  // Anything but "howto" or leaving it out is refused, empty string included.
+  for (const kind of ['fact', '', ' ']) {
+    const answer = await tool('remember', { text: 'Anything else.', topic: 'ops', kind }, 'b2')
+    assert.match(String(answer), /kind is either "howto" or left out/, `kind ${JSON.stringify(kind)} is refused`)
+  }
+  assert.equal(entries().length, 1, 'a refused write changes nothing')
 })
