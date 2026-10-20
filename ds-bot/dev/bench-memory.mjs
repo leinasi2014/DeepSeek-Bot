@@ -101,11 +101,14 @@ function ensureTeamFile() {
   mkdirSync(writeHere(join(MEM, 'team')), { recursive: true })
   if (!existsSync(TEAM_MAIN)) writeFileSync(writeHere(TEAM_MAIN), '# Memory\n\n## Index\n', 'utf8')
 }
-// Body entries and index lines are counted apart: an index line links a topic and is not
-// an entry. Counting both made every new topic look like a new fact.
+// Body entries and index lines are counted apart. An index line is a bullet whose whole
+// text is one [[topic]] link; a body entry that merely mentions [[topic]] is still a body
+// entry, and counting it as an index both undercounts entries and inflates the index.
 const entryLines = content => (content.match(/^\s*[-*]\s+.*$/gm) ?? [])
-const entryCount = content => entryLines(content).filter(line => !line.includes('[[')).length
-const indexCount = content => entryLines(content).filter(line => line.includes('[[')).length
+const bulletText = line => line.replace(/^\s*[-*]\s+/, '').trim()
+const isIndexLine = line => /^\[\[[^\]]+\]\]$/.test(bulletText(line))
+const entryCount = content => entryLines(content).filter(line => !isIndexLine(line)).length
+const indexCount = content => entryLines(content).filter(isIndexLine).length
 const ownMainPath = botId => join(MEM, 'bots', botId, 'MEMORY.md')
 const readIf = path => (existsSync(path) ? readFileSync(path, 'utf8') : '')
 // Character counts are on normalized line endings: the fixture is CRLF on disk, and the
@@ -252,7 +255,7 @@ async function roundA1(round) {
     report.moves += opCount(result.writes, 'move')
     if (wrote) report.landed += 1
     if (refused) report.refused += 1
-    if (wrote && writeCalls > 1) report.repeatWrites += 1
+    if (writeCalls > 1) report.repeatWrites += 1
     report.details.push({ fact: fact.slice(0, 12), refused, wrote, writeCalls, ops, chars: [charsBefore, charsAfter], tools: result.tools })
     table.push(`    ${String(index + 1).padStart(2)} ${(ops.join(' ') || 'no write').padEnd(30)} ${charsBefore} -> ${charsAfter}`)
   }
@@ -460,7 +463,10 @@ for (const name of ONLY) {
       report.rounds.push(result)
     } catch (error) {
       say(`  ERROR ${name} r${round}: ${error.message}`)
-      report.rounds.push({ scenario: name.toUpperCase(), round, error: error.message, pass: false })
+      // A4 is a manual check: no pass/fail on any path, including an error.
+      const failed = { scenario: name.toUpperCase(), round, error: error.message }
+      if (name !== 'a4') failed.pass = false
+      report.rounds.push(failed)
       if (error instanceof RateLimited) {
         say('  rate limited: stopping the run; only the rounds that finished are reported')
         report.rateLimited = true
