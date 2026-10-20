@@ -740,25 +740,38 @@ test('an answer that reaches the change limit exactly is followed by another pas
   assert.deepEqual(JSON.parse(read('reviewed.json')), { 'chat:b2': 11 })
 })
 
-test('a full MEMORY.md keeps the review\'s place, and an add with a topic lands there', async (t) => {
+test('a full MEMORY.md records a skip and moves on, and a later add with a topic lands there', async (t) => {
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-'))
   mkdirSync(join(home, 'memory', 'bots', 'b2'), { recursive: true })
   const filler = Array.from({ length: 13 }, (_, at) => `- Filler fact number ${at + 1} ${'y'.repeat(280)}`)
   writeFileSync(join(home, 'memory', 'bots', 'b2', 'MEMORY.md'), `# Memory\n\n${filler.join('\n')}\n\n## Index\n`)
   const replies = [JSON.stringify({ changes: [{ op: 'add', text: 'The user flies with Air China' }] }), JSON.stringify({ changes: [{ op: 'add', text: 'The user flies with Air China', topic: '出行' }] })]
-  const { ctx, call, read, requests, stop } = start({ home, replies, config: { memoryReviewDelayMs: 0 } })
+  const history = { b2: [...ownChat] }
+  const { ctx, call, read, requests, stop, journal } = start({ home, replies, history, config: { memoryReviewDelayMs: 0 } })
   t.after(() => stop())
   await call('state', {})
   ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
   await reviewed(call)
   assert.match(requests[0].messages[0].content[0].text, /MEMORY\.md has 3\d{3} of 4000 characters \(own\)/)
   assert.match(requests[0].system, /"topic": "travel"/)
-  assert.deepEqual(JSON.parse(read('reviewed.json')), { 'chat:b2': 9 })
+  // A full file used to throw and hold the cursor, so the same lines were reviewed every
+  // turn. Now the refusal is a journaled skip and the cursor moves past the lines: the
+  // change is given up, not retried.
+  assert.deepEqual(JSON.parse(read('reviewed.json')), { 'chat:b2': 11 })
+  const [skipped] = journal()
+  assert.equal(skipped.op, 'skip')
+  assert.equal(skipped.reason, 'memory/full')
+  assert.equal(skipped.intendedOp, 'add')
+  assert.match(skipped.after, /Air China/)
+  assert.doesNotMatch(read('bots', 'b2', 'MEMORY.md'), /Air China/)
+  // New lines in the next turn start a new review; that add carries a topic and lands.
+  history.b2.push({ event: { seq: 12, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'I booked the flight today' }] } } })
+  history.b2.push({ event: { seq: 13, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Noted.' }] } } } })
   ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
   await reviewed(call)
   assert.match(read('bots', 'b2', '出行.md'), /- The user flies with Air China \[/)
   assert.match(read('bots', 'b2', 'MEMORY.md'), /\[\[出行\]\]/)
-  assert.deepEqual(JSON.parse(read('reviewed.json')), { 'chat:b2': 11 })
+  assert.deepEqual(JSON.parse(read('reviewed.json')), { 'chat:b2': 13 })
 })
 
 test('topic entries that share words with the user\'s new lines come first', () => {
@@ -1096,33 +1109,37 @@ test('a memory call names the current part of the Bot chat', async (t) => {
 // the next write rebuilds the scope from EMPTY_MAIN and the old entries are gone.
 // Replacing readers.readText is process-wide: safe only because these tests run one at a
 // time. Turning on concurrency for this file would make them interfere.
-test('a failed read leaves the entries already in MEMORY.md alone', async (t) => {
-  const { readFileSync } = await import('node:fs')
-  const { readers } = await import('../src/host/memory.js')
-  const home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-readerror-'))
-  const { tool, stop } = start({ home })
-  t.after(() => stop())
-  await tool('remember', { text: '第一条：周会固定在周二上午十点。' }, 'b2')
-  const path = join(home, 'memory', 'bots', 'b2', 'MEMORY.md')
-  assert.match(readFileSync(path, 'utf8'), /周会/, 'the entry to protect is there')
-  const real = readers.readText
-  try {
-    readers.readText = () => {
-      const error = new Error('EACCES: permission denied')
-      error.code = 'EACCES'
-      throw error
+// Both codes are covered: a denied read is EACCES on POSIX and EPERM on Windows (an
+// `icacls <file> /deny <user>:R` denies below Node, which reports it as EPERM).
+for (const code of ['EACCES', 'EPERM']) {
+  test(`a failed read (${code}) leaves the entries already in MEMORY.md alone`, async (t) => {
+    const { readFileSync } = await import('node:fs')
+    const { readers } = await import('../src/host/memory.js')
+    const home = mkdtempSync(join(tmpdir(), `ds-bot-memory-readerror-${code}-`))
+    const { tool, stop } = start({ home })
+    t.after(() => stop())
+    await tool('remember', { text: '第一条：周会固定在周二上午十点。' }, 'b2')
+    const path = join(home, 'memory', 'bots', 'b2', 'MEMORY.md')
+    assert.match(readFileSync(path, 'utf8'), /周会/, 'the entry to protect is there')
+    const real = readers.readText
+    try {
+      readers.readText = () => {
+        const error = new Error(`${code}: permission denied`)
+        error.code = code
+        throw error
+      }
+      const before = readFileSync(path, 'utf8')
+      let outcome
+      try { outcome = await tool('remember', { text: '第三条：日志保留 30 天。' }, 'b2') } catch (error) { outcome = error }
+      // What this proves: a failed read is reported as a read failure, not mistaken for an
+      // empty file, and nothing is written over what is already there. What it does NOT
+      // prove: that the entries would have been overwritten without the fix — the write path
+      // gives up at the failed read long before it could rebuild from EMPTY_MAIN.
+      assert.match(String(outcome?.message ?? outcome?.error ?? JSON.stringify(outcome)), new RegExp(code), 'the call reports the read failure, not a success')
+      assert.equal(readFileSync(path, 'utf8'), before, 'the file is byte for byte what it was')
+    } finally {
+      readers.readText = real
     }
-    const before = readFileSync(path, 'utf8')
-    let outcome
-    try { outcome = await tool('remember', { text: '第三条：日志保留 30 天。' }, 'b2') } catch (error) { outcome = error }
-    // What this proves: a failed read is reported as a read failure, not mistaken for an
-    // empty file, and nothing is written over what is already there. What it does NOT
-    // prove: that the entries would have been overwritten without the fix — the write path
-    // gives up at the failed read long before it could rebuild from EMPTY_MAIN.
-    assert.match(String(outcome?.message ?? outcome?.error ?? JSON.stringify(outcome)), /EACCES/, 'the call reports the read failure, not a success')
-    assert.equal(readFileSync(path, 'utf8'), before, 'the file is byte for byte what it was')
-  } finally {
-    readers.readText = real
-  }
-  assert.match(readFileSync(path, 'utf8'), /周会/, 'the old entry survived the failed read')
-})
+    assert.match(readFileSync(path, 'utf8'), /周会/, 'the old entry survived the failed read')
+  })
+}
