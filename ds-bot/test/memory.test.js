@@ -1143,3 +1143,20 @@ for (const code of ['EACCES', 'EPERM']) {
     assert.match(readFileSync(path, 'utf8'), /周会/, 'the old entry survived the failed read')
   })
 }
+
+test('kind: howto lives in the meta, and an edit keeps it', async (t) => {
+  const { readFileSync } = await import('node:fs')
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-kind-'))
+  const { tool, stop } = start({ home })
+  t.after(() => stop())
+  await tool('remember', { text: 'Deploy with pnpm, never npm.', topic: 'ops', kind: 'howto' }, 'b2')
+  const topicPath = join(home, 'memory', 'bots', 'b2', 'ops.md')
+  const first = readFileSync(topicPath, 'utf8')
+  assert.match(first, /Deploy with pnpm/, 'the entry landed in the topic')
+  assert.match(first, /kind: howto/, 'the type is in the meta, not in the text')
+  // An edit that says nothing about the type keeps the one the entry has.
+  await tool('remember', { text: 'Deploy with pnpm, never npm or yarn.', replace: 'Deploy with pnpm', topic: 'ops' }, 'b2')
+  const second = readFileSync(topicPath, 'utf8')
+  assert.match(second, /never npm or yarn/, 'the edit landed')
+  assert.match(second, /kind: howto/, 'the kind survived an edit that did not mention it')
+})
