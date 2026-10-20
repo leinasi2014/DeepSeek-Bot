@@ -774,9 +774,12 @@ export function install(rt) {
     } catch { /* no history to point at: the time stands in */ }
     return seq === undefined ? `part ${number} ${rt.clock(Date.now())}` : `part ${number} #${seq}`
   }
-  const metaFor = async (caller, scope) => ({
+  const metaFor = async (caller, scope, kind) => ({
     source: await sourceOf(caller.sessionId),
     ...(scope.kind === 'team' || scope.botId !== caller.bot.id ? { by: caller.bot.name } : {}),
+    // The type lives in meta only. In the text it would take part in the replace match and
+    // in recall scoring, and it would be injected into every conversation.
+    ...(kind === undefined ? {} : { kind }),
     added: today(),
   })
 
@@ -807,6 +810,7 @@ export function install(rt) {
       text: { type: 'string', required: true, description: `The entry: one line of at most ${MEMORY_LIMITS.entry} characters, in the user's language` },
       replace: { type: 'string', description: 'An entry already saved that this one replaces, because the fact changed: its text, or a part only it contains' },
       topic: { type: 'string', description: 'A topic for details not every conversation needs, such as "travel" or "project-x"; omit for MEMORY.md, which every conversation reads' },
+      kind: { type: 'string', description: '"howto" for knowledge about how to do something (a rule, a command, a pitfall) rather than a fact about people, places or numbers; omit for a fact. A howto entry belongs in a topic, not in MEMORY.md' },
       scope: SCOPE_WRITE,
     },
     output,
@@ -820,8 +824,11 @@ export function install(rt) {
       const { topic, error } = topicArg(args.topic)
       if (error) return error
       const replace = String(args.replace ?? '').trim()
+      const kindArg = String(args.kind ?? '').trim()
+      if (kindArg !== '' && kindArg !== 'howto') return 'kind is either "howto" or left out; there is no other type.'
+      const kind = kindArg === '' ? undefined : 'howto'
       try {
-        const meta = await metaFor(context.caller, context.scope)
+        const meta = await metaFor(context.caller, context.scope, kind)
         const result = replace === ''
           ? await addEntry({ ...context, topic, text, meta })
           : await replaceEntry({ ...context, topic, match: replace, text, meta })
