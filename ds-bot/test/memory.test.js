@@ -1091,3 +1091,30 @@ test('a memory call names the current part of the Bot chat', async (t) => {
   assert.equal(answer.ok, true)
   assert.equal(requests[0].sessionId, 'b2-part2')
 })
+
+// A read that fails for any reason other than ENOENT must not look like an empty file, or
+// the next write rebuilds the scope from EMPTY_MAIN and the old entries are gone.
+// Replacing readers.readText is process-wide: safe only because these tests run one at a
+// time. Turning on concurrency for this file would make them interfere.
+test('a failed read leaves the entries already in MEMORY.md alone', async (t) => {
+  const { readFileSync } = await import('node:fs')
+  const { readers } = await import('../src/host/memory.js')
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-readerror-'))
+  const { tool, stop } = start({ home })
+  t.after(() => stop())
+  await tool('remember', { text: '第一条：周会固定在周二上午十点。' }, 'b2')
+  const path = join(home, 'memory', 'bots', 'b2', 'MEMORY.md')
+  assert.match(readFileSync(path, 'utf8'), /周会/, 'the entry to protect is there')
+  const real = readers.readText
+  try {
+    readers.readText = () => {
+      const error = new Error('EACCES: permission denied')
+      error.code = 'EACCES'
+      throw error
+    }
+    await assert.rejects(tool('remember', { text: '第三条：日志保留 30 天。' }, 'b2'))
+  } finally {
+    readers.readText = real
+  }
+  assert.match(readFileSync(path, 'utf8'), /周会/, 'the old entry survived the failed read')
+})
