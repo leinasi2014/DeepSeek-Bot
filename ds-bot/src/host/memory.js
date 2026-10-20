@@ -35,6 +35,10 @@ import { output } from './tools.js'
 // read whole in one recall. An entry holds one fact.
 export const MEMORY_LIMITS = { entry: 300, main: 4_000, topic: 16_000, topics: 40 }
 
+// The one seam the tests need: swapping this out is the only way to make a read fail while
+// a write to the same path still succeeds. The default is the unchanged behaviour.
+export const readers = { readText: path => readFileSync(path, 'utf8') }
+
 const MAIN = 'MEMORY.md'
 const EMPTY_MAIN = '# Memory\n\n## Index\n'
 const INDEX = /^##\s+index\s*$/i
@@ -428,9 +432,11 @@ export function install(rt) {
 
   const readText = (path) => {
     try {
-      return readFileSync(path, 'utf8')
+      return readers.readText(path)
     } catch (error) {
-      if (error?.code !== 'ENOENT') rt.warn('ds-bot: unreadable memory file %s: %s', path, error)
+      // A missing file is an empty one; anything else must not look empty, or the next
+      // write rebuilds the scope from EMPTY_MAIN and every old entry is gone.
+      if (error?.code !== 'ENOENT') throw error
       return ''
     }
   }
@@ -522,9 +528,14 @@ export function install(rt) {
     const limit = limitOf(file)
     // A file already past its size (edited by hand) may still shrink.
     if (next.length <= limit || next.length <= file.content.length) return
-    throw new Error(file.topic === undefined
+    const full = file.topic === undefined
       ? `${capital(label)}'s MEMORY.md would have ${next.length} of its ${limit} characters. Make room first: move details into a topic (remember with topic, then forget them here), merge entries with replace, or forget what no longer matters.`
-      : `The topic [[${file.topic}]] in ${label} would have ${next.length} of its ${limit} characters. Put the rest in another topic, or forget old entries.`)
+      : `The topic [[${file.topic}]] in ${label} would have ${next.length} of its ${limit} characters. Put the rest in another topic, or forget old entries.`
+    // Tagged so the review can tell a full file from any other write failure without
+    // matching on the wording, which is meant for the model to read.
+    const error = new Error(full)
+    error.code = 'memory/full'
+    throw error
   }
   const capital = text => text[0].toUpperCase() + text.slice(1)
   const sizeNote = (file, size) => `${file.file}: ${size} of ${limitOf(file)} characters`
@@ -552,7 +563,13 @@ export function install(rt) {
       let target = topic === undefined ? main : files.find(file => file.topic === topic)
       const fresh = target === undefined
       if (fresh) {
-        if (files.length - 1 >= MEMORY_LIMITS.topics) throw new Error(`${capital(label)} already has ${MEMORY_LIMITS.topics} topics, the most it holds. Add to one of them (recall lists them), or forget one.`)
+        if (files.length - 1 >= MEMORY_LIMITS.topics) {
+          // Tagged like the size limit: hitting the topic cap must not fail the whole
+          // review pass, or the cursor never advances and the lines are reread forever.
+          const error = new Error(`${capital(label)} already has ${MEMORY_LIMITS.topics} topics, the most it holds. Add to one of them (recall lists them), or forget one.`)
+          error.code = 'memory/full'
+          throw error
+        }
         target = { topic, file: `${topic}.md`, path: join(dirOf(scope), `${topic}.md`), content: '', ...parseMemory(`# ${topic}\n`) }
       }
       const base = target.lines.length > 0 ? target.lines : parseMemory(target === main ? EMPTY_MAIN : `# ${topic}\n`).lines
@@ -686,9 +703,21 @@ export function install(rt) {
     const kept = frozen.get(sessionId)
     if (kept !== undefined && kept.includes(rule)) return kept
     const path = snapshotPath(sessionId)
-    let text = existsSync(path) ? readText(path) : ''
+    // A snapshot that cannot be read must not take the turn down with it: the section is
+    // rebuilt from the files below, which is what the hook is for.
+    let text = ''
+    if (existsSync(path)) {
+      try { text = readText(path) } catch (error) { rt.warn('ds-bot: unreadable memory snapshot %s: %s', path, error) }
+    }
     if (text === '' || !text.includes(rule)) {
-      text = memorySection(bot)
+      // Reading the memory files themselves can fail too. The hook must still produce a
+      // section: an empty one, with a warning, instead of failing the turn.
+      try {
+        text = memorySection(bot)
+      } catch (error) {
+        rt.warn('ds-bot: memory section for %s could not be built: %s', bot.name, error)
+        return ''
+      }
       if (rt.readOnly() === undefined) {
         try {
           mkdirSync(dirname(path), { recursive: true })
@@ -996,8 +1025,15 @@ export function install(rt) {
   function memoryView(body) {
     const bot = rt.botOf(String(body.botId ?? ''))
     if (bot === undefined) throw new Error('Unknown Bot')
-    const own = loadScope(ownScope(bot.id))
-    const team = loadScope(TEAM)
+    // A file that cannot be read must not surface as a broken panel: say so plainly.
+    let own, team
+    try {
+      own = loadScope(ownScope(bot.id))
+      team = loadScope(TEAM)
+    } catch (error) {
+      rt.warn('ds-bot: memory panel for %s could not read its files: %s', bot.name, error)
+      throw new Error(`The memory files of ${bot.name} cannot be read right now.`)
+    }
     const entries = [...panelEntries(own, 'own'), ...panelEntries(team, 'team')]
     const language = languageNow()
     const hash = createHash('sha256').update(JSON.stringify([language, linesFor(own), linesFor(team)])).digest('hex')
@@ -1184,6 +1220,24 @@ export function install(rt) {
         else if (op === 'remove') done.push(await removeEntry({ scope, topic: target.file.topic, match: target.text, actor, label }))
       } catch (failure) {
         if (failure?.code === GONE) return 0
+        // A full file is not a lost pass: record it and move on, so the review cursor
+        // advances instead of rereading the same lines every idle turn.
+        if (failure?.code === 'memory/full') {
+          rt.warn('ds-bot: memory review of %s skipped a change: %s', bot.name, failure?.message ?? failure)
+          // The whole text, not a prefix: this record is what a person reads to write the
+          // entry by hand later, since the review cursor moves past it.
+          await journal({
+            op: 'skip',
+            scope: scopeKey(scope),
+            file: target?.file?.file ?? (topic === undefined ? MAIN : `${topic}.md`),
+            ...actorOf(actor),
+            after: text,
+            before: target?.text,
+            intendedOp: op,
+            reason: 'memory/full',
+          })
+          continue
+        }
         rt.warn('ds-bot: memory review of %s left out a change: %s', bot.name, failure?.message ?? failure)
         if (failure?.code !== NO_MATCH && failure?.code !== DENIED) failed ??= failure
       }
