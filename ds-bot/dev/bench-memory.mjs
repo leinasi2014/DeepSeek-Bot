@@ -26,6 +26,7 @@ const { values: args, positionals } = parseArgs({
     tap: { type: 'string' },
     'team-source': { type: 'string' },
     rounds: { type: 'string', default: '3' },
+    gap: { type: 'string', default: '5000' },
     only: { type: 'string' },
     out: { type: 'string' },
   },
@@ -36,6 +37,7 @@ if (!HOME || !PORT || !MODEL || !args.tap) {
   process.exit(2)
 }
 const ROUNDS = Number(args.rounds)
+const GAP = Number(args.gap)
 const ONLY = (args.only ?? 'a1,a2,a3,a4').split(',').map(value => value.trim())
 const BASE = `http://127.0.0.1:${PORT}`
 const MEM = join(HOME, 'bot', 'memory')
@@ -105,10 +107,24 @@ async function mainBot() {
   const view = await api('state')
   return view.bots.find(bot => bot.id === view.mainBotId)
 }
+
+// One cheap call before a round. A 429 here means the route is still cooling down, so the
+// round never starts: a rate-limited round cannot be mistaken for a clean one.
+async function probe() {
+  const bot = await mainBot()
+  const mark = tapLines().length
+  await send(bot.id, '只回一个字：好')
+  await settle({ quiet: 3000, timeout: 120_000 })
+  const calls = tapLines().slice(mark)
+  if (calls.some(call => call.status === 429)) throw new RateLimited('the probe before the round was rate limited')
+  say(`  probe: ${calls.length} calls, no 429`)
+}
 async function send(target, text) {
   const view = await api('state')
   const id = target.startsWith('#') ? view.rooms.find(room => room.name === target.slice(1)).id : view.bots.find(bot => bot.name === target || bot.id === target).id
   await api('send', { sessionId: id, text })
+  // The route cools down under load: one call every GAP ms, never a burst.
+  if (GAP > 0) await sleep(GAP)
 }
 
 // A bench may start empty: one Main Bot is all these scenarios need. A bench that already
@@ -168,7 +184,15 @@ const FACTS = [
 ]
 
 async function roundA1(round) {
-  const report = { scenario: 'A1', round, attempted: 0, landed: 0, rejected: 0, followUp: 0, details: [] }
+  // Three separate counts, each with its own evidence, never one standing in for another:
+  //   landed      — a journal write in that turn (the only hard evidence of a save)
+  //   refused     — the turn's answer text quotes the capacity refusal. A lower bound:
+  //                 the tool result is not in the tap, so a refusal the model did not
+  //                 repeat is not counted.
+  //   repeatWrites— the turn made two or more write calls (remember/forget). A retry after
+  //                 a refusal looks like this, but so does any turn that wrote twice, so it
+  //                 is a proxy for "wrote more than once", not proof of a cleanup.
+  const report = { scenario: 'A1', round, attempted: 0, landed: 0, refused: 0, repeatWrites: 0, details: [] }
   if (args['team-source']) {
     mkdirSync(writeHere(join(MEM, 'team')), { recursive: true })
     copyFileSync(args['team-source'], writeHere(TEAM_MAIN))
@@ -185,14 +209,14 @@ async function roundA1(round) {
     const wrote = result.writes.length > 0
     const writeCalls = result.tools.filter(name => name === 'remember' || name === 'forget').length
     if (wrote) report.landed += 1
-    if (refused) report.rejected += 1
-    if (wrote && writeCalls > 1) report.followUp += 1
+    if (refused) report.refused += 1
+    if (wrote && writeCalls > 1) report.repeatWrites += 1
     report.details.push({ fact: fact.slice(0, 12), refused, wrote, writeCalls, tools: result.tools })
   }
   report.endChars = teamChars()
   report.entries = entryCount(teamContent())
   report.pass = report.landed >= 10
-  say(`  A1 r${round}: landed ${report.landed}/12, refused ${report.rejected}, follow-up ${report.followUp}, chars ${report.startChars} -> ${report.endChars} ${report.pass ? 'PASS' : 'FAIL'}`)
+  say(`  A1 r${round}: landed ${report.landed}/12, refused ${report.refused} (answer text only, lower bound), repeat writes ${report.repeatWrites}, chars ${report.startChars} -> ${report.endChars} ${report.pass ? 'PASS' : 'FAIL'}`)
   return report
 }
 
@@ -335,6 +359,7 @@ for (const name of ONLY) {
   for (let round = 1; round <= ROUNDS; round += 1) {
     say(`\n=== ${name.toUpperCase()} round ${round}`)
     try {
+      await probe()
       report.rounds.push(await runner(round))
     } catch (error) {
       say(`  ERROR ${name} r${round}: ${error.message}`)
