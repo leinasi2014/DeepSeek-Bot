@@ -99,7 +99,22 @@ function ensureTeamFile() {
   mkdirSync(writeHere(join(MEM, 'team')), { recursive: true })
   if (!existsSync(TEAM_MAIN)) writeFileSync(writeHere(TEAM_MAIN), '# Memory\n\n## Index\n', 'utf8')
 }
-const entryCount = content => (content.match(/^\s*[-*]\s+/gm) ?? []).length
+// Body entries and index lines are counted apart: an index line links a topic and is not
+// an entry. Counting both made every new topic look like a new fact.
+const entryLines = content => (content.match(/^\s*[-*]\s+.*$/gm) ?? [])
+const entryCount = content => entryLines(content).filter(line => !line.includes('[[')).length
+const indexCount = content => entryLines(content).filter(line => line.includes('[[')).length
+const ownMainPath = botId => join(MEM, 'bots', botId, 'MEMORY.md')
+const readIf = path => (existsSync(path) ? readFileSync(path, 'utf8') : '')
+const oneScope = content => ({ chars: content.length, body: entryCount(content), index: indexCount(content) })
+// Team and its own memory are reported apart: growth in one must not hide growth in the
+// other (the before run wrote 8 entries into the Bot's own file while the team file held).
+const scopeStats = bot => ({ team: oneScope(teamContent()), own: oneScope(readIf(ownMainPath(bot.id))) })
+const statLine = stats => `team ${stats.team.body}b/${stats.team.index}i/${stats.team.chars}c, own ${stats.own.body}b/${stats.own.index}i/${stats.own.chars}c`
+const opCount = (events, op) => events.filter(event => event.op === op).length
+// A write that saves an entry. `skip` is a refusal, not a save; it must never count as landed.
+const WRITE_OPS = new Set(['add', 'replace', 'move'])
+const isSave = event => WRITE_OPS.has(event.op)
 const snaps = () => (existsSync(SNAPSHOTS) ? readdirSync(SNAPSHOTS).filter(name => name.endsWith('.md')).map(name => ({ name, content: readFileSync(join(SNAPSHOTS, name), 'utf8') })) : [])
 
 const say = line => console.log(line)
@@ -201,15 +216,16 @@ async function roundA1(round) {
   //   repeatWrites— the turn made two or more write calls (remember/forget). A retry after
   //                 a refusal looks like this, but so does any turn that wrote twice, so it
   //                 is a proxy for "wrote more than once", not proof of a cleanup.
-  const report = { scenario: 'A1', round, attempted: 0, landed: 0, refused: 0, repeatWrites: 0, details: [] }
+  const report = { scenario: 'A1', round, attempted: 0, landed: 0, refused: 0, repeatWrites: 0, skips: 0, replaces: 0, moves: 0, details: [] }
   if (args['team-source']) {
     mkdirSync(writeHere(join(MEM, 'team')), { recursive: true })
     copyFileSync(args['team-source'], writeHere(TEAM_MAIN))
   }
   ensureTeamFile()
   report.startChars = teamChars()
-  say(`  start: MEMORY.md ${report.startChars} characters, ${entryCount(teamContent())} entries`)
   const chief = await mainBot()
+  report.startStats = scopeStats(chief)
+  say(`  start: ${statLine(report.startStats)}`)
   report.ops = {}
   const table = []
   for (const [index, fact] of FACTS.entries()) {
@@ -219,23 +235,31 @@ async function roundA1(round) {
     const charsAfter = teamChars()
     const answer = result.calls.filter(call => call.text).map(call => call.text).join('\n')
     const refused = /would have \d+ of its \d+ characters/.test(answer)
-    const wrote = result.writes.length > 0
+    // Landed means *this* fact reached the journal as a save. Any write would let a turn
+    // that only logged `skip` (a refusal) pass, so bind on the fact's seed text.
+    const seed = fact.slice(0, 10)
+    const wrote = result.writes.some(change => isSave(change) && typeof change.after === 'string' && change.after.includes(seed))
     const writeCalls = result.tools.filter(name => name === 'remember' || name === 'forget').length
     const ops = result.writes.map(change => change.file ? `${change.op}@${change.file}` : change.op ?? '?')
     for (const op of ops) report.ops[op] = (report.ops[op] ?? 0) + 1
+    report.skips += opCount(result.writes, 'skip')
+    report.replaces += opCount(result.writes, 'replace')
+    report.moves += opCount(result.writes, 'move')
     if (wrote) report.landed += 1
     if (refused) report.refused += 1
     if (wrote && writeCalls > 1) report.repeatWrites += 1
-    report.details.push({ fact: fact.slice(0, 12), refused, wrote, writeCalls, ops, chars: [charsBefore, charsAfter], tools: result.tools })
+    report.details.push({ fact: fact.slice(0, 12), refused, wrote, seed, writeCalls, ops, chars: [charsBefore, charsAfter], tools: result.tools })
     table.push(`    ${String(index + 1).padStart(2)} ${(ops.join(' ') || 'no write').padEnd(30)} ${charsBefore} -> ${charsAfter}`)
   }
   say('  per write (from journal.jsonl):')
   for (const line of table) say(line)
   say(`  ops in total: ${Object.entries(report.ops).map(([op, count]) => `${op}=${count}`).join(' ') || 'none'}`)
   report.endChars = teamChars()
-  report.entries = entryCount(teamContent())
+  report.endStats = scopeStats(chief)
+  report.entries = report.endStats.team.body
+  report.index = report.endStats.team.index
   report.pass = report.landed >= 10
-  say(`  A1 r${round}: landed ${report.landed}/12, refused ${report.refused} (answer text only, lower bound), repeat writes ${report.repeatWrites}, chars ${report.startChars} -> ${report.endChars} ${report.pass ? 'PASS' : 'FAIL'}`)
+  say(`  A1 r${round}: landed ${report.landed}/12, refused ${report.refused}, skips ${report.skips}, replace ${report.replaces}, move ${report.moves}, ${statLine(report.endStats)} ${report.pass ? 'PASS' : 'FAIL'}`)
   return report
 }
 
@@ -270,11 +294,13 @@ const REVIEW_INPUT = [
 async function roundA2(round) {
   const report = { scenario: 'A2', round }
   ensureTeamFile()
-  const before = teamContent()
-  report.startEntries = entryCount(before)
-  report.startChars = before.length
+  const chief = await mainBot()
+  report.startStats = scopeStats(chief)
+  report.startEntries = report.startStats.team.body
+  report.startChars = report.startStats.team.chars
   const cursorBefore = JSON.stringify(reviewed())
   let reviews = 0
+  const writes = []
   // Batches of four keep the turn count, and the cost, bounded.
   for (let index = 0; index < REVIEW_INPUT.length; index += 4) {
     const batch = REVIEW_INPUT.slice(index, index + 4)
@@ -282,17 +308,25 @@ async function roundA2(round) {
       for (const line of batch) await send((await mainBot()).id, line)
     })
     reviews += result.calls.filter(call => call.kind === 'review').length
+    writes.push(...result.writes)
   }
   const after = teamContent()
-  report.endEntries = entryCount(after)
-  report.endChars = after.length
+  report.endStats = scopeStats(chief)
+  report.endEntries = report.endStats.team.body
+  report.endChars = report.endStats.team.chars
   report.reviews = reviews
   report.cursorMoved = JSON.stringify(reviewed()) !== cursorBefore
   report.delta = report.endEntries - report.startEntries
-  report.overLimit = report.endChars > 4_000
-  // A round without a single review measured nothing, so it cannot pass.
-  report.pass = report.delta <= 14 && !report.overLimit && report.cursorMoved && reviews >= 1
-  say(`  A2 r${round}: entries ${report.startEntries} -> ${report.endEntries} (Δ${report.delta}), chars ${report.startChars} -> ${report.endChars}, reviews ${reviews}, cursor moved ${report.cursorMoved} ${report.pass ? 'PASS' : 'FAIL'}`)
+  report.ownDelta = report.endStats.own.body - report.startStats.own.body
+  report.overLimit = report.startStats.team.chars > 4_000 || report.endStats.team.chars > 4_000 || report.endStats.own.chars > 4_000
+  report.replaces = opCount(writes, 'replace')
+  report.skips = opCount(writes, 'skip')
+  report.moves = opCount(writes, 'move')
+  // A round without a single review measured nothing, so it cannot pass. `replace` is the
+  // signal the write path merges instead of piling up; ten adds with zero replaces is the
+  // behavior this bench exists to catch.
+  report.pass = report.delta <= 14 && report.ownDelta <= 14 && !report.overLimit && report.cursorMoved && reviews >= 1 && report.replaces >= 1
+  say(`  A2 r${round}: team Δ${report.delta}, own Δ${report.ownDelta}, reviews ${reviews}, replace ${report.replaces}, skip ${report.skips}, move ${report.moves}, cursor ${report.cursorMoved}, ${statLine(report.endStats)} ${report.pass ? 'PASS' : 'FAIL'}`)
   return report
 }
 
@@ -305,6 +339,9 @@ const INJECTED_FACTS = ['团队的周会在周二上午十点。', '部署窗口
 const ADDED_FACTS = ['我这次记忆基准用的临时标记是 ZQ7。', '我们新换的构建机编号是 B-42。']
 const TOPIC_FACTS = ['旧版接口的兼容层计划在四月下线。']
 const QUERIES = ['周会是什么时候？', '部署窗口是几点？', '临时标记 ZQ7 是什么？', '构建机编号是多少？', '旧版接口的兼容层什么时候下线？']
+// The positive control: queries 3-5 must find their entry. Without it, a recall that
+// returns nothing at all would pass the "nothing injected came back" line.
+const EXPECTED = [null, null, ADDED_FACTS[0], ADDED_FACTS[1], TOPIC_FACTS[0]]
 
 async function roundA3(round) {
   const report = { scenario: 'A3', round, results: [] }
@@ -319,13 +356,16 @@ async function roundA3(round) {
     for (const fact of ADDED_FACTS) await send(chief.id, `记住：${fact}`)
   })
   const snapshot = snaps().map(file => file.content).join('\n')
-  for (const query of QUERIES) {
+  for (const [index, query] of QUERIES.entries()) {
     const result = await step(`recall ${query.slice(0, 6)}`, () => send(chief.id, `用 recall 查一下「${query}」，把你的 recall 工具原始输出原样贴出来，不要转述。`))
     const answer = result.calls.filter(call => call.text).map(call => call.text).join('\n')
+    const expected = EXPECTED[index]
     report.results.push({
       query,
       recalled: result.tools.includes('recall'),
       injectedReturned: INJECTED_FACTS.filter(fact => answer.includes(fact.slice(0, 6))).length,
+      expected: expected === null ? null : expected.slice(0, 12),
+      positive: expected !== null && answer.includes(expected.slice(0, 8)),
       lines: (answer.match(/#L\d+/g) ?? []).length,
       answer: answer.slice(0, 600),
       inSnapshot: INJECTED_FACTS.filter(fact => snapshot.includes(fact.slice(0, 6))).length,
@@ -334,8 +374,11 @@ async function roundA3(round) {
   report.injectedReturned = report.results.reduce((sum, item) => sum + item.injectedReturned, 0)
   report.lineNumbers = report.results.reduce((sum, item) => sum + item.lines, 0)
   report.recalls = report.results.filter(item => item.recalled).length
-  report.pass = report.injectedReturned === 0 && report.recalls === QUERIES.length
-  say(`  A3 r${round}: recalls ${report.recalls}/5, injected entries returned ${report.injectedReturned}, line refs ${report.lineNumbers}, snapshot has ${report.results[0]?.inSnapshot ?? 0}/2 ${report.pass ? 'PASS' : 'FAIL'}`)
+  report.positives = report.results.filter(item => item.positive).length
+  report.snapshotHas = report.results[0]?.inSnapshot ?? 0
+  // An empty recall (no result at all) fails the positive control, so it cannot pass here.
+  report.pass = report.recalls === QUERIES.length && report.injectedReturned === 0 && report.positives === 3 && report.snapshotHas === 2
+  say(`  A3 r${round}: recalls ${report.recalls}/5, injected returned ${report.injectedReturned}, positives ${report.positives}/3, snapshot ${report.snapshotHas}/2 ${report.pass ? 'PASS' : 'FAIL'}`)
   return report
 }
 
@@ -346,21 +389,32 @@ async function roundA3(round) {
 async function roundA4(round) {
   const report = { scenario: 'A4', round, checks: [] }
   const chief = await mainBot()
-  for (const query of QUERIES) {
+  for (const [index, query] of QUERIES.entries()) {
+    const expected = EXPECTED[index]
     const result = await step(`recall ${query.slice(0, 6)}`, () => send(chief.id, `用 recall 查一下「${query}」，把结果原样贴出来，包括每条后面的出处。`))
     const answer = result.calls.filter(call => call.text).map(call => call.text).join('\n')
     const refs = [...answer.matchAll(/([^\s（）()]+MEMORY\.md|\S+\.md)#L(\d+)/g)].map(match => ({ file: match[1], line: Number(match[2]) }))
-    for (const ref of refs.slice(0, 1)) {
-      const path = ref.file.includes('/') || ref.file.includes('\\') ? ref.file : join(MEM, 'team', ref.file)
-      const lines = existsSync(path) ? readFileSync(path, 'utf8').split('\n') : []
-      const text = (lines[ref.line - 1] ?? '').trim()
-      report.checks.push({ query, ref: `${ref.file}#L${ref.line}`, ok: text.length > 0, text: text.slice(0, 80) })
+    const ref = refs[0]
+    if (ref === undefined) {
+      // No citation at all is a failed check, never a missing one: the denominator stays 5.
+      report.checks.push({ query, expected: expected?.slice(0, 12) ?? null, ref: null, ok: false, text: '' })
+      continue
     }
+    const candidates = ref.file.includes('/') || ref.file.includes('\\')
+      ? [ref.file]
+      : [join(MEM, 'team', ref.file), join(MEM, 'bots', chief.id, ref.file)]
+    const path = candidates.find(candidate => existsSync(candidate))
+    const lines = path === undefined ? [] : readFileSync(path, 'utf8').split('\n')
+    const text = (lines[ref.line - 1] ?? '').trim()
+    // The cited line must hold the entry the query asked about. Any non-empty heading
+    // line used to pass; a citation that points at the wrong line is not a citation.
+    const ok = expected !== undefined && expected !== null && text.includes(expected.slice(0, 8))
+    report.checks.push({ query, expected: expected?.slice(0, 12) ?? null, ref: `${ref.file}#L${ref.line}`, ok, text: text.slice(0, 80) })
   }
-  report.found = report.checks.length
+  report.found = report.checks.filter(check => check.ref !== null).length
   report.ok = report.checks.filter(check => check.ok).length
-  report.pass = report.ok >= 5
-  say(`  A4 r${round}: ${report.ok}/${Math.max(report.found, 5)} line references check out ${report.pass ? 'PASS' : 'FAIL'}`)
+  report.pass = report.checks.length === QUERIES.length && report.ok === QUERIES.length
+  say(`  A4 r${round}: ${report.ok}/${QUERIES.length} citations hit the entry (${report.found} cited, ${report.checks.length - report.found} missing) ${report.pass ? 'PASS' : 'FAIL'}`)
   return report
 }
 
