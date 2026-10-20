@@ -14,7 +14,7 @@
 // Every scenario reports its own stop line and passes only when all rounds pass; the
 // numbers of each round are printed even when an earlier round failed.
 import { existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync, copyFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve, sep, basename } from 'node:path'
 import { parseArgs } from 'node:util'
 
 const { values: args, positionals } = parseArgs({
@@ -40,6 +40,21 @@ const TEAM_MAIN = join(MEM, 'team', 'MEMORY.md')
 const REVIEWED = join(MEM, 'reviewed.json')
 const SNAPSHOTS = join(MEM, 'snapshots')
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+
+// The bench must be a bench. Its name is the one dev/bench.sh makes (.dsh-test-<name>),
+// it cannot be the DSH_HOME this shell runs with, and every write this script makes goes
+// through writeHere, which refuses a path outside it.
+const HOME_ROOT = resolve(HOME)
+const writes = []
+function writeHere(path) {
+  const abs = resolve(path)
+  if (abs !== HOME_ROOT && !abs.startsWith(`${HOME_ROOT}${sep}`)) throw new Error(`refusing to write outside the bench home: ${abs}`)
+  writes.push(abs)
+  return abs
+}
+if (!/^\.dsh-test-[a-z0-9-]+$/.test(basename(HOME_ROOT))) throw new Error(`not a bench home (expected .dsh-test-<name>): ${HOME_ROOT}`)
+if (process.env.DSH_HOME && resolve(process.env.DSH_HOME) === HOME_ROOT) throw new Error('the bench home is the DSH_HOME of this shell; point the bench at a .dsh-test-* home instead')
+
 
 let cookie
 async function api(endpoint, payload = {}) {
@@ -74,8 +89,8 @@ const reviewed = () => (existsSync(REVIEWED) ? JSON.parse(readFileSync(REVIEWED,
 const teamChars = () => (existsSync(TEAM_MAIN) ? readFileSync(TEAM_MAIN, 'utf8').length : 0)
 const teamContent = () => (existsSync(TEAM_MAIN) ? readFileSync(TEAM_MAIN, 'utf8') : '')
 function ensureTeamFile() {
-  mkdirSync(join(MEM, 'team'), { recursive: true })
-  if (!existsSync(TEAM_MAIN)) writeFileSync(TEAM_MAIN, '# Memory\n\n## Index\n')
+  mkdirSync(writeHere(join(MEM, 'team')), { recursive: true })
+  if (!existsSync(TEAM_MAIN)) writeFileSync(writeHere(TEAM_MAIN), '# Memory\n\n## Index\n')
 }
 const entryCount = content => (content.match(/^\s*[-*]\s+/gm) ?? []).length
 const snaps = () => (existsSync(SNAPSHOTS) ? readdirSync(SNAPSHOTS).filter(name => name.endsWith('.md')).map(name => ({ name, content: readFileSync(join(SNAPSHOTS, name), 'utf8') })) : [])
@@ -142,8 +157,8 @@ const FACTS = [
 async function roundA1(round) {
   const report = { scenario: 'A1', round, attempted: 0, landed: 0, rejected: 0, followUp: 0, details: [] }
   if (args['team-source']) {
-    mkdirSync(join(MEM, 'team'), { recursive: true })
-    copyFileSync(args['team-source'], TEAM_MAIN)
+    mkdirSync(writeHere(join(MEM, 'team')), { recursive: true })
+    copyFileSync(args['team-source'], writeHere(TEAM_MAIN))
   }
   ensureTeamFile()
   report.startChars = teamChars()
@@ -240,7 +255,7 @@ async function roundA3(round) {
   const chief = await mainBot()
   // Class 1: already in the team MEMORY.md, so the session's snapshot carries them.
   const seeded = teamContent().replace(/\n## Team memory[\s\S]*$/, '')
-  writeFileSync(TEAM_MAIN, `${seeded}${seeded.endsWith('\n') ? '' : '\n'}- ${INJECTED_FACTS.join('\n- ')}\n`)
+  writeFileSync(writeHere(TEAM_MAIN), `${seeded}${seeded.endsWith('\n') ? '' : '\n'}- ${INJECTED_FACTS.join('\n- ')}\n`)
   // A fresh session: end the running one by starting a new chat for this Bot.
   await step('new session', async () => { await send(chief.id, '我们开始一个新话题，先打个招呼就行。') })
   await step('topic entry', async () => { await send(chief.id, `把这条记进 [[运维]] 主题：${TOPIC_FACTS[0]}`) })
@@ -318,4 +333,12 @@ for (const scenario of ONLY.map(name => name.toUpperCase())) {
 }
 const calls = tapLines()
 say(`model calls in this run: ${calls.length}`)
+// The zero-touch check: every write this run made, and the home it stayed inside.
+const outside = writes.filter(path => path !== HOME_ROOT && !path.startsWith(`${HOME_ROOT}${sep}`))
+say(`writes: ${writes.length} inside ${HOME_ROOT}, ${outside.length} outside`)
+if (outside.length > 0) {
+  say(`OUTSIDE THE BENCH HOME: ${outside.join(', ')}`)
+  process.exitCode = 1
+}
+report.guard = { home: HOME_ROOT, writes: writes.length, outside }
 if (args.out) writeFileSync(args.out, JSON.stringify(report, null, 2))
