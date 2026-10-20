@@ -46,6 +46,7 @@ const REVIEWED = join(MEM, 'reviewed.json')
 const SNAPSHOTS = join(MEM, 'snapshots')
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 class RateLimited extends Error {}
+let retries = 0
 
 // The bench must be a bench. Its name is the one dev/bench.sh makes (.dsh-test-<name>),
 // it cannot be the DSH_HOME this shell runs with, and every write this script makes goes
@@ -116,8 +117,10 @@ async function probe() {
   await send(bot.id, '只回一个字：好')
   await settle({ quiet: 3000, timeout: 120_000 })
   const calls = tapLines().slice(mark)
-  if (calls.some(call => call.status === 429)) throw new RateLimited('the probe before the round was rate limited')
-  say(`  probe: ${calls.length} calls, no 429`)
+  const limited = calls.filter(call => call.status === 429)
+  const answered = calls.some(call => call.status === 200 && call.text !== undefined)
+  if (!answered) throw new RateLimited('the probe before the round got no answer')
+  say(`  probe: ${calls.length} calls, ${limited.length} rate limited, no stop`)
 }
 async function send(target, text) {
   const view = await api('state')
@@ -158,9 +161,15 @@ async function step(title, run) {
   const writes = journal().slice(journalMark)
   const tools = calls.flatMap(call => call.tools ?? [])
   say(`  ${title}: ${calls.length} calls [${tools.join(' ') || '-'}], ${writes.length} writes, ${((Date.now() - started) / 1000).toFixed(1)} s`)
-  // A rate-limited round measured nothing: stop the whole run and report what finished.
+  // A rate-limited attempt is a retry the provider had to swallow, not a lost step: the
+  // bench provider retries twice. Only a step where nothing got through is fatal.
   const limited = calls.filter(call => call.status === 429 || /rate limit/i.test(call.error ?? ''))
-  if (limited.length > 0) throw new RateLimited(`${limited.length} of ${calls.length} calls were rate limited (${limited[0].error?.error?.message ?? limited[0].error ?? '429'})`)
+  const answered = calls.some(call => call.status === 200 && call.text !== undefined)
+  if (limited.length > 0) {
+    retries += limited.length
+    say(`    ${limited.length} rate-limited attempt(s), ${answered ? 'the step still answered' : 'the step got no answer'}`)
+    if (!answered) throw new RateLimited(`${limited.length} attempts were rate limited and none got through`)
+  }
   return { calls, writes, tools }
 }
 
@@ -368,9 +377,13 @@ for (const name of ONLY) {
   if (!runner) { console.error(`unknown scenario ${name}`); process.exit(2) }
   for (let round = 1; round <= ROUNDS; round += 1) {
     say(`\n=== ${name.toUpperCase()} round ${round}`)
+    const retriesBefore = retries
     try {
       await probe()
-      report.rounds.push(await runner(round))
+      const result = await runner(round)
+      result.retries = retries - retriesBefore
+      if (result.retries > 0) say(`  retries this round: ${result.retries} rate-limited attempts, all answered`)
+      report.rounds.push(result)
     } catch (error) {
       say(`  ERROR ${name} r${round}: ${error.message}`)
       report.rounds.push({ scenario: name.toUpperCase(), round, error: error.message, pass: false })
