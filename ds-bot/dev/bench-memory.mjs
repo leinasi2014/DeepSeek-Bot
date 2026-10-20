@@ -201,18 +201,28 @@ async function roundA1(round) {
   report.startChars = teamChars()
   say(`  start: MEMORY.md ${report.startChars} characters, ${entryCount(teamContent())} entries`)
   const chief = await mainBot()
+  report.ops = {}
+  const table = []
   for (const [index, fact] of FACTS.entries()) {
     report.attempted += 1
+    const charsBefore = teamChars()
     const result = await step(`remember ${index + 1}`, () => send(chief.id, `把这条记进长期记忆，很重要：${fact}`))
+    const charsAfter = teamChars()
     const answer = result.calls.filter(call => call.text).map(call => call.text).join('\n')
     const refused = /would have \d+ of its \d+ characters/.test(answer)
     const wrote = result.writes.length > 0
     const writeCalls = result.tools.filter(name => name === 'remember' || name === 'forget').length
+    const ops = result.writes.map(change => change.file ? `${change.op}@${change.file}` : change.op ?? '?')
+    for (const op of ops) report.ops[op] = (report.ops[op] ?? 0) + 1
     if (wrote) report.landed += 1
     if (refused) report.refused += 1
     if (wrote && writeCalls > 1) report.repeatWrites += 1
-    report.details.push({ fact: fact.slice(0, 12), refused, wrote, writeCalls, tools: result.tools })
+    report.details.push({ fact: fact.slice(0, 12), refused, wrote, writeCalls, ops, chars: [charsBefore, charsAfter], tools: result.tools })
+    table.push(`    ${String(index + 1).padStart(2)} ${(ops.join(' ') || 'no write').padEnd(30)} ${charsBefore} -> ${charsAfter}`)
   }
+  say('  per write (from journal.jsonl):')
+  for (const line of table) say(line)
+  say(`  ops in total: ${Object.entries(report.ops).map(([op, count]) => `${op}=${count}`).join(' ') || 'none'}`)
   report.endChars = teamChars()
   report.entries = entryCount(teamContent())
   report.pass = report.landed >= 10
