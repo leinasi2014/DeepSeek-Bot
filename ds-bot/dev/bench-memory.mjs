@@ -43,6 +43,7 @@ const TEAM_MAIN = join(MEM, 'team', 'MEMORY.md')
 const REVIEWED = join(MEM, 'reviewed.json')
 const SNAPSHOTS = join(MEM, 'snapshots')
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+class RateLimited extends Error {}
 
 // The bench must be a bench. Its name is the one dev/bench.sh makes (.dsh-test-<name>),
 // it cannot be the DSH_HOME this shell runs with, and every write this script makes goes
@@ -141,6 +142,9 @@ async function step(title, run) {
   const writes = journal().slice(journalMark)
   const tools = calls.flatMap(call => call.tools ?? [])
   say(`  ${title}: ${calls.length} calls [${tools.join(' ') || '-'}], ${writes.length} writes, ${((Date.now() - started) / 1000).toFixed(1)} s`)
+  // A rate-limited round measured nothing: stop the whole run and report what finished.
+  const limited = calls.filter(call => call.status === 429 || /rate limit/i.test(call.error ?? ''))
+  if (limited.length > 0) throw new RateLimited(`${limited.length} of ${calls.length} calls were rate limited (${limited[0].error?.error?.message ?? limited[0].error ?? '429'})`)
   return { calls, writes, tools }
 }
 
@@ -320,9 +324,12 @@ async function roundA4(round) {
 // ---------------------------------------------------------------------------
 
 await ensureMainBot()
+const tapStart = tapLines().length
 const report = { model: MODEL, home: HOME, started: new Date().toISOString(), rounds: [] }
 const runners = { a1: roundA1, a2: roundA2, a3: roundA3, a4: roundA4 }
+let stoppedEarly = false
 for (const name of ONLY) {
+  if (stoppedEarly) break
   const runner = runners[name]
   if (!runner) { console.error(`unknown scenario ${name}`); process.exit(2) }
   for (let round = 1; round <= ROUNDS; round += 1) {
@@ -332,6 +339,12 @@ for (const name of ONLY) {
     } catch (error) {
       say(`  ERROR ${name} r${round}: ${error.message}`)
       report.rounds.push({ scenario: name.toUpperCase(), round, error: error.message, pass: false })
+      if (error instanceof RateLimited) {
+        say('  rate limited: stopping the run; only the rounds that finished are reported')
+        report.rateLimited = true
+        stoppedEarly = true
+        break
+      }
     }
   }
 }
@@ -341,7 +354,9 @@ for (const scenario of ONLY.map(name => name.toUpperCase())) {
   say(`\n${scenario}: ${passed}/${rounds.length} rounds pass`)
 }
 const calls = tapLines()
-say(`model calls in this run: ${calls.length}`)
+// A run is counted from where it started: the tap file may already hold smoke runs.
+say(`model calls in this run: ${calls.length - tapStart}; in the tap so far: ${calls.length}`)
+report.calls = { run: calls.length - tapStart, tapTotal: calls.length }
 // The zero-touch check: every write this run made, and the home it stayed inside.
 const outside = writes.filter(path => path !== HOME_ROOT && !path.startsWith(`${HOME_ROOT}${sep}`))
 say(`writes: ${writes.length} inside ${HOME_ROOT}, ${outside.length} outside`)
