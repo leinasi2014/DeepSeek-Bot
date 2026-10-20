@@ -35,6 +35,10 @@ import { output } from './tools.js'
 // read whole in one recall. An entry holds one fact.
 export const MEMORY_LIMITS = { entry: 300, main: 4_000, topic: 16_000, topics: 40 }
 
+// The one seam the tests need: swapping this out is the only way to make a read fail while
+// a write to the same path still succeeds. The default is the unchanged behaviour.
+export const readers = { readText: path => readFileSync(path, 'utf8') }
+
 const MAIN = 'MEMORY.md'
 const EMPTY_MAIN = '# Memory\n\n## Index\n'
 const INDEX = /^##\s+index\s*$/i
@@ -428,7 +432,7 @@ export function install(rt) {
 
   const readText = (path) => {
     try {
-      return readFileSync(path, 'utf8')
+      return readers.readText(path)
     } catch (error) {
       if (error?.code !== 'ENOENT') rt.warn('ds-bot: unreadable memory file %s: %s', path, error)
       return ''
