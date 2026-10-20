@@ -434,7 +434,9 @@ export function install(rt) {
     try {
       return readers.readText(path)
     } catch (error) {
-      if (error?.code !== 'ENOENT') rt.warn('ds-bot: unreadable memory file %s: %s', path, error)
+      // A missing file is an empty one; anything else must not look empty, or the next
+      // write rebuilds the scope from EMPTY_MAIN and every old entry is gone.
+      if (error?.code !== 'ENOENT') throw error
       return ''
     }
   }
@@ -526,9 +528,14 @@ export function install(rt) {
     const limit = limitOf(file)
     // A file already past its size (edited by hand) may still shrink.
     if (next.length <= limit || next.length <= file.content.length) return
-    throw new Error(file.topic === undefined
+    const full = file.topic === undefined
       ? `${capital(label)}'s MEMORY.md would have ${next.length} of its ${limit} characters. Make room first: move details into a topic (remember with topic, then forget them here), merge entries with replace, or forget what no longer matters.`
-      : `The topic [[${file.topic}]] in ${label} would have ${next.length} of its ${limit} characters. Put the rest in another topic, or forget old entries.`)
+      : `The topic [[${file.topic}]] in ${label} would have ${next.length} of its ${limit} characters. Put the rest in another topic, or forget old entries.`
+    // Tagged so the review can tell a full file from any other write failure without
+    // matching on the wording, which is meant for the model to read.
+    const error = new Error(full)
+    error.code = 'memory/full'
+    throw error
   }
   const capital = text => text[0].toUpperCase() + text.slice(1)
   const sizeNote = (file, size) => `${file.file}: ${size} of ${limitOf(file)} characters`
@@ -1188,6 +1195,12 @@ export function install(rt) {
         else if (op === 'remove') done.push(await removeEntry({ scope, topic: target.file.topic, match: target.text, actor, label }))
       } catch (failure) {
         if (failure?.code === GONE) return 0
+        // A full file is not a lost pass: record it and move on, so the review cursor
+        // advances instead of rereading the same lines every idle turn.
+        if (failure?.code === 'memory/full') {
+          rt.warn('ds-bot: memory review of %s skipped a change: %s', bot.name, failure?.message ?? failure)
+          continue
+        }
         rt.warn('ds-bot: memory review of %s left out a change: %s', bot.name, failure?.message ?? failure)
         if (failure?.code !== NO_MATCH && failure?.code !== DENIED) failed ??= failure
       }
