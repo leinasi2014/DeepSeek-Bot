@@ -556,11 +556,13 @@ export function install(rt) {
     news.set(botId, { at: Date.now(), op, text: splitMeta(String(line ?? '').replace(/^- /, '')).text.slice(0, NEWS_TEXT_MAX) })
   }
 
-  function addEntry({ scope, topic, text, meta, actor, label }) {
+  // allowDuplicate is for move only: the text it copies is, by definition, still in the
+  // source file, and the whole-scope dedupe would otherwise refuse to write it anywhere.
+  function addEntry({ scope, topic, text, meta, actor, label, allowDuplicate = false }) {
     return queued(async () => {
       writable(scope, actor)
       const files = loadScope(scope)
-      const [same] = matchEntries(allEntries(files), text).filter(entry => squash(entry.text) === squash(text))
+      const [same] = allowDuplicate ? [] : matchEntries(allEntries(files), text).filter(entry => squash(entry.text) === squash(text))
       if (same !== undefined) return { changed: false, file: same.file, message: `Already in ${label} (${fileName(same.file)}): "${same.text}". Nothing changed.` }
       const main = files[0]
       let target = topic === undefined ? main : files.find(file => file.topic === topic)
