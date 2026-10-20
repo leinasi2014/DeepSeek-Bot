@@ -110,7 +110,8 @@ async function send(target, text) {
   await api('send', { sessionId: id, text })
 }
 
-// A bench may start empty: one Main Bot is all these scenarios need.
+// A bench may start empty: one Main Bot is all these scenarios need. A bench that already
+// has one keeps it, but on the model this run was told to use.
 async function ensureMainBot() {
   let view = await api('state')
   if (view.bots.length === 0) {
@@ -118,6 +119,11 @@ async function ensureMainBot() {
     view = await api('state')
   }
   if (!view.mainBotId) await api('set-main', { id: view.bots[0].id })
+  const bot = view.bots[0]
+  if (bot.model !== MODEL) {
+    await api('update-bot', { id: bot.id, model: MODEL })
+    say(`  bot ${bot.name}: model ${bot.model ?? '-'} -> ${MODEL}`)
+  }
   ensureTeamFile()
 }
 
