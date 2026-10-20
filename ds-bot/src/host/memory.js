@@ -1012,8 +1012,15 @@ export function install(rt) {
   function memoryView(body) {
     const bot = rt.botOf(String(body.botId ?? ''))
     if (bot === undefined) throw new Error('Unknown Bot')
-    const own = loadScope(ownScope(bot.id))
-    const team = loadScope(TEAM)
+    // A file that cannot be read must not surface as a broken panel: say so plainly.
+    let own, team
+    try {
+      own = loadScope(ownScope(bot.id))
+      team = loadScope(TEAM)
+    } catch (error) {
+      rt.warn('ds-bot: memory panel for %s could not read its files: %s', bot.name, error)
+      throw new Error(`The memory files of ${bot.name} cannot be read right now.`)
+    }
     const entries = [...panelEntries(own, 'own'), ...panelEntries(team, 'team')]
     const language = languageNow()
     const hash = createHash('sha256').update(JSON.stringify([language, linesFor(own), linesFor(team)])).digest('hex')
