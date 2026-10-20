@@ -1211,6 +1211,16 @@ export function install(rt) {
         // advances instead of rereading the same lines every idle turn.
         if (failure?.code === 'memory/full') {
           rt.warn('ds-bot: memory review of %s skipped a change: %s', bot.name, failure?.message ?? failure)
+          // The whole text, not a prefix: this record is what a person reads to write the
+          // entry by hand later, since the review cursor moves past it.
+          await journal({
+            op: 'skip',
+            scope: scopeKey(scope),
+            file: topic === undefined ? MAIN : `${topic}.md`,
+            ...actorOf(actor),
+            after: text,
+            reason: 'memory/full',
+          })
           continue
         }
         rt.warn('ds-bot: memory review of %s left out a change: %s', bot.name, failure?.message ?? failure)
