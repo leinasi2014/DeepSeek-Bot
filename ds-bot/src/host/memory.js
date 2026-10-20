@@ -697,7 +697,12 @@ export function install(rt) {
     const kept = frozen.get(sessionId)
     if (kept !== undefined && kept.includes(rule)) return kept
     const path = snapshotPath(sessionId)
-    let text = existsSync(path) ? readText(path) : ''
+    // A snapshot that cannot be read must not take the turn down with it: the section is
+    // rebuilt from the files below, which is what the hook is for.
+    let text = ''
+    if (existsSync(path)) {
+      try { text = readText(path) } catch (error) { rt.warn('ds-bot: unreadable memory snapshot %s: %s', path, error) }
+    }
     if (text === '' || !text.includes(rule)) {
       text = memorySection(bot)
       if (rt.readOnly() === undefined) {
