@@ -1392,6 +1392,9 @@ test('three unreadable reviews in a row give the batch up, with the lines kept',
   await call('state', {})
   for (let tries = 0; tries < 3; tries += 1) {
     lines.push({ event: { seq: 12 + tries, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: `retry ${tries}` }] } } })
+    // A non-idle status in between: the listener debounces, so a second `idle` would only
+    // clear the first one's timer and no second review would run at all.
+    ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'working' })
     ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
     try { await reviewed(call) } catch { /* a refused answer is expected */ }
   }
