@@ -481,9 +481,13 @@ async function roundA2b(round) {
   const cursorBefore = reviewed()
   const result = await step('update 周报', () => send(chief.id, `记一下：${A2B_UPDATE}。`))
   const after = teamContent()
-  const teamReplaces = result.writes.filter(event => event.op === 'replace' && String(event.scope ?? '') === 'team')
+  // Only the review's own writes count: the Bot saves the message itself in many runs, and a
+  // change the Bot made says nothing about the review this scenario is for.
+  const auto = result.writes.filter(event => event.auto === true)
+  const teamReplaces = auto.filter(event => event.op === 'replace' && String(event.scope ?? '') === 'team')
   const weekly = entryLines(after).filter(line => !isIndexLine(line)).map(bulletText).filter(text => text.includes('周报'))
   report.replaces = teamReplaces.length
+  report.autoWrites = auto.length
   report.weekly = weekly
   report.indexBefore = indexBefore
   report.index = indexCount(after)
@@ -503,7 +507,7 @@ async function roundA2b(round) {
     file: event.file ?? null,
     text: event.after ?? event.text ?? event.before ?? '',
   }))
-  say(`  A2b r${round}: team replace ${report.replaces}, 周报 entries ${weekly.length}, index ${report.indexBefore} → ${report.index}, cursor ${report.cursorMoved} ${report.pass ? 'PASS' : 'FAIL'}`)
+  say(`  A2b r${round}: review writes ${report.autoWrites}, team replace ${report.replaces}, 周报 entries ${weekly.length}, index ${report.indexBefore} → ${report.index}, cursor ${report.cursorMoved} ${report.pass ? 'PASS' : 'FAIL'}`)
   for (const text of weekly) say(`    ${text}`)
   return report
 }
