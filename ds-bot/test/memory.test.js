@@ -276,6 +276,49 @@ test('a move whose delete failed finishes on the next call, without a second cop
   assert.deepEqual(journal().map(record => record.op), ['move'])
 })
 
+test('a move keeps its own metadata when the topic holds the same words with other metadata', async (t) => {
+  const { tool, home, read, stop } = start()
+  t.after(() => stop())
+  // The topic's entry says the same thing, with metadata of its own: it is another entry,
+  // so the moved one has to be written whole or its kind is lost with the source line.
+  const kept = '- Deploys on Friday [kind: howto; added: 2026-01-02]'
+  const other = '- Deploys on Friday [added: 2025-12-01]'
+  mkdirSync(join(home, 'memory', 'bots', 'b2'), { recursive: true })
+  writeFileSync(join(home, 'memory', 'bots', 'b2', 'MEMORY.md'), `# Memory\n\n${kept}\n\n## Index\n- [[deploy]]\n`)
+  writeFileSync(join(home, 'memory', 'bots', 'b2', 'deploy.md'), `# deploy\n\n${other}\n`)
+  assert.match(await tool('move', { entry: 'Deploys on Friday', topic: 'deploy' }, 'b2'), /^Moved from MEMORY\.md/)
+  assert.equal(read('bots', 'b2', 'deploy.md'), `# deploy\n\n${other}\n${kept}\n`)
+  assert.deepEqual(parseMemory(read('bots', 'b2', 'MEMORY.md')).entries, [])
+})
+
+test('a move adds the topic link even when the copy was already there', async (t) => {
+  const { tool, home, read, stop } = start()
+  t.after(() => stop())
+  // The copy landed and the link did not: a second move still has to leave MEMORY.md
+  // pointing at the topic, or the entry is in a file nothing links to.
+  const line = '- Deploys on Friday [source: part 1 #10; added: 2026-01-02]'
+  mkdirSync(join(home, 'memory', 'bots', 'b2'), { recursive: true })
+  writeFileSync(join(home, 'memory', 'bots', 'b2', 'MEMORY.md'), `# Memory\n\n${line}\n`)
+  writeFileSync(join(home, 'memory', 'bots', 'b2', 'deploy.md'), `# deploy\n\n${line}\n`)
+  assert.match(await tool('move', { entry: 'Deploys on Friday', topic: 'deploy' }, 'b2'), /^Moved from MEMORY\.md/)
+  assert.deepEqual(parseMemory(read('bots', 'b2', 'MEMORY.md')).entries, [])
+  assert.match(read('bots', 'b2', 'MEMORY.md'), /## Index\n- \[\[deploy\]\]\n$/)
+  assert.equal(read('bots', 'b2', 'deploy.md'), `# deploy\n\n${line}\n`)
+})
+
+test('a move finds an entry written by hand with other spacing', async (t) => {
+  const { tool, home, read, journal, stop } = start()
+  t.after(() => stop())
+  // Two spaces after the bullet: the entry parses, and the line it formats to differs,
+  // so the source has to be found as an entry rather than by its formatted text.
+  mkdirSync(join(home, 'memory', 'bots', 'b2'), { recursive: true })
+  writeFileSync(join(home, 'memory', 'bots', 'b2', 'MEMORY.md'), '# Memory\n\n-  Deploys on Friday [added: 2026-01-02]\n\n## Index\n')
+  assert.match(await tool('move', { entry: 'Deploys on Friday', topic: 'deploy' }, 'b2'), /^Moved from MEMORY\.md/)
+  assert.deepEqual(parseMemory(read('bots', 'b2', 'MEMORY.md')).entries, [])
+  assert.match(read('bots', 'b2', 'deploy.md'), /^- Deploys on Friday \[added: 2026-01-02\]$/m)
+  assert.deepEqual(journal().map(record => record.op), ['add', 'move'])
+})
+
 test('a move that would not leave MEMORY.md shorter is refused, and nothing is written', async (t) => {
   const { tool, home, read, stop } = start()
   t.after(() => stop())
