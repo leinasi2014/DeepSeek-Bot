@@ -19,10 +19,10 @@
 // Costs real tokens. One round is roughly 40-60 calls; three rounds stay under 200.
 // Every scenario reports its own stop line and passes only when all rounds pass; the
 // numbers of each round are printed even when an earlier round failed.
-import { existsSync, readFileSync, writeFileSync, mkdirSync, copyFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, copyFileSync } from 'node:fs'
 import { join, resolve, sep, basename } from 'node:path'
 import { parseArgs } from 'node:util'
-import { a2Pass, cursorProgress } from './bench-rules.mjs'
+import { a2Pass, a2bOutcome, a2bSummary, cursorProgress } from './bench-rules.mjs'
 
 const { values: args, positionals } = parseArgs({
   allowPositionals: true,
@@ -461,6 +461,15 @@ async function roundA4(round) {
 
 const A2B_SEED = '周报控制在五条以内'
 const A2B_UPDATE = '团队记忆里周报那条以后改成三条以内'
+// Every file the team keeps: a fact moved into a topic is still the one entry, not a lost one.
+const teamEntriesAll = () => {
+  const dir = join(MEM, 'team')
+  if (!existsSync(dir)) return []
+  return readdirSync(dir).filter(name => name.endsWith('.md')).flatMap(name => {
+    const content = readFileSync(join(dir, name), 'utf8')
+    return entryLines(content).filter(line => !isIndexLine(line)).map(line => ({ text: bulletText(line), file: name }))
+  })
+}
 
 async function roundA2b(round) {
   const report = { scenario: 'A2B', round }
@@ -481,23 +490,23 @@ async function roundA2b(round) {
   const indexBefore = indexCount(teamContent())
   const cursorBefore = reviewed()
   const result = await step('update 周报', () => send(chief.id, `记一下：${A2B_UPDATE}。`))
-  const after = teamContent()
   // Only the review's own writes count: the Bot saves the message itself in many runs, and a
   // change the Bot made says nothing about the review this scenario is for.
   const auto = result.writes.filter(event => event.auto === true)
   const teamReplaces = auto.filter(event => event.op === 'replace' && String(event.scope ?? '') === 'team')
-  const weekly = entryLines(after).filter(line => !isIndexLine(line)).map(bulletText).filter(text => text.includes('周报'))
+  const weekly = teamEntriesAll().filter(entry => entry.text.includes('周报'))
   report.replaces = teamReplaces.length
   report.autoWrites = auto.length
-  report.weekly = weekly
+  report.weekly = weekly.map(entry => `${entry.file}: ${entry.text}`)
   report.indexBefore = indexBefore
-  report.index = indexCount(after)
+  report.index = indexCount(teamContent())
   report.cursorMoved = cursorProgress(cursorBefore, reviewed(), `chat:${chief.id}`).moved
   // The outcome, not the op: two entries about the weekly report leave the next turn unable to
   // tell which is current, and that is the failure this scenario exists for. One entry saying
   // the new number passes; one entry still saying the old number is "did not act", counted
-  // neither way here — the run's verdict is the count over three rounds.
-  report.outcome = weekly.length === 0 ? 'lost' : weekly.length > 1 ? 'duplicate' : weekly[0].includes('三条') ? 'updated' : 'untouched'
+  // neither way here — the run's verdict is the count over three rounds. All team files are
+  // read, so a fact moved into a topic is one entry, not a lost one.
+  report.outcome = a2bOutcome(weekly)
   report.pass = report.outcome === 'updated'
   report.samples = teamReplaces.map(event => ({
     scenario: 'A2B',
@@ -508,8 +517,8 @@ async function roundA2b(round) {
     file: event.file ?? null,
     text: event.after ?? event.text ?? event.before ?? '',
   }))
-  say(`  A2b r${round}: ${report.outcome} (周报 entries ${weekly.length}), review writes ${report.autoWrites}, team replace ${report.replaces}, index ${report.indexBefore} → ${report.index}, cursor ${report.cursorMoved}`)
-  for (const text of weekly) say(`    ${text}`)
+  say(`  A2b r${round}: ${report.outcome} (周报 entries ${weekly.length} across ${new Set(weekly.map(entry => entry.file)).size} file(s)), review writes ${report.autoWrites}, team replace ${report.replaces}, index ${report.indexBefore} → ${report.index}, cursor ${report.cursorMoved}`)
+  for (const entry of weekly) say(`    ${entry.file}: ${entry.text}`)
   return report
 }
 
@@ -550,13 +559,13 @@ for (const name of ONLY) {
 }
 for (const scenario of ONLY.map(name => name.toUpperCase())) {
   const rounds = report.rounds.filter(item => item.scenario === scenario)
-  // A2b is judged over three rounds: no round may leave two entries about the fact, and at
-  // least two must end with one entry saying the new value.
+  // A2b is judged over three completed rounds: no round may leave two entries about the fact,
+  // and at least two must end with one entry saying the new value. A round that errored, or
+  // never reached its outcome, is not a round: counting it either way would let a run pass on
+  // two results and a crash.
   if (scenario === 'A2B') {
-    const updated = rounds.filter(item => item.outcome === 'updated').length
-    const bad = rounds.filter(item => item.outcome === 'duplicate' || item.outcome === 'lost').length
-    const enough = rounds.length >= 3
-    say(`\nA2B: ${updated}/${rounds.length} updated, ${bad} duplicate or lost${enough ? '' : ' (three rounds needed)'} → ${enough && bad === 0 && updated >= 2 ? 'PASS' : 'FAIL'}`)
+    const summary = a2bSummary(rounds)
+    say(`\nA2B: ${summary.updated}/${summary.done} updated, ${summary.bad} duplicate or lost, ${summary.incomplete} incomplete${summary.done >= 3 ? '' : ' (three completed rounds needed)'} → ${summary.pass ? 'PASS' : 'FAIL'}`)
     continue
   }
   if (rounds.length > 0 && rounds.every(item => item.pass === undefined)) {
