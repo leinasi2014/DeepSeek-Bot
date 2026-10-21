@@ -518,6 +518,25 @@ test('"ask or update" answers from the entries and changes them through the same
   assert.equal((await call('memory-ask', { botId: 'b2', text: ' ' })).error.message, 'Type a question or a change first')
 })
 
+test('"ask or update" puts an add in a topic, and a name that cannot be one is refused', async (t) => {
+  const replies = [JSON.stringify({ reply: 'Done.', changes: [
+    { op: 'add', text: 'Deploys between 8pm and 11pm on weekdays', topic: 'deploy' },
+    { op: 'add', text: 'Likes tea', topic: 'not a topic!!' },
+  ] })]
+  const { call, read, requests, stop } = start({ replies })
+  t.after(() => stop())
+  const answer = (await call('memory-ask', { botId: 'b2', text: 'Deploy window is 8pm to 11pm; I like tea' })).value
+  // The panel prompt offers a topic, so a method or a detail can skip MEMORY.md.
+  assert.match(requests[0].system, /"topic": "travel"/)
+  assert.equal(answer.changes[0].ok, true)
+  assert.equal(answer.changes[0].topic, 'deploy')
+  assert.match(read('bots', 'b2', 'deploy.md'), /Deploys between 8pm and 11pm/)
+  assert.match(read('bots', 'b2', 'MEMORY.md'), /\[\[deploy\]\]/)
+  assert.equal(answer.changes[1].ok, false)
+  assert.match(answer.changes[1].error, /cannot be a topic name/)
+  assert.doesNotMatch(read('bots', 'b2', 'MEMORY.md'), /Likes tea/)
+})
+
 test('a host that only reads the team shows memory but changes none of it', async (t) => {
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-'))
   writeFileSync(join(home, 'state.lock'), JSON.stringify({ pid: process.ppid, host: hostname(), token: 'other' }))
