@@ -105,7 +105,15 @@ export function formatEntry(text, meta = {}) {
 export async function writeTextTo(path, text, warn = () => {}) {
   await mkdir(dirname(path), { recursive: true })
   const temp = `${path}.${process.pid}.tmp`
-  await writeFile(temp, text, 'utf8')
+  try {
+    await writeFile(temp, text, 'utf8')
+  } catch (error) {
+    // A half-written temp file must not stay behind either: it gets the same cleanup
+    // as a rename that fails for good.
+    await unlink(temp).catch(() => {})
+    warn('ds-bot: atomic write to %s failed (%s) before the rename; the target was not replaced', path, error?.code ?? error)
+    throw error
+  }
   try {
     await rename(temp, path)
   } catch (first) {
