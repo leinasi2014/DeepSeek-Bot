@@ -334,8 +334,11 @@ async function roundA2(round) {
   report.endChars = report.endStats.team.chars
   report.reviews = reviews
   const cursorAfter = reviewed()
-  const cursor = cursorProgress(cursorStart, cursorAfter)
-  report.cursor = { advanced: cursor.advanced, advancedTo: Object.fromEntries(cursor.advanced.map(key => [key, cursorAfter[key]])), regressed: cursor.regressed }
+  // The review runs per Session, and this round speaks to the main Bot's own chat: only its
+  // place moving counts. Another chat advancing is reported, never judged as progress here.
+  const cursorKey = `chat:${chief.id}`
+  const cursor = cursorProgress(cursorStart, cursorAfter, cursorKey)
+  report.cursor = { key: cursorKey, from: cursorStart[cursorKey] ?? null, to: cursorAfter[cursorKey] ?? null, elsewhere: cursor.elsewhere, regressed: cursor.regressed }
   report.cursorMoved = cursor.moved
   report.delta = report.endEntries - report.startEntries
   report.ownDelta = report.endStats.own.body - report.startStats.own.body
@@ -360,7 +363,7 @@ async function roundA2(round) {
   // to move through the twenty inputs themselves, and neither file may pass its growth budget
   // or its size limit. Both files are judged: growth moved to one file is still growth.
   report.pass = a2Pass({ delta: report.delta, ownDelta: report.ownDelta, teamReplaces: report.teamReplaces, overLimit: report.overLimit, cursorMoved: report.cursorMoved, reviews })
-  say(`  A2 r${round}: team Δ${report.delta} (replace ${report.teamReplaces}), own Δ${report.ownDelta} (replace ${report.ownReplaces}), reviews ${reviews}, skip ${report.skips}, move ${report.moves}, cursor ${report.cursorMoved} (${cursor.advanced.length} advanced, ${cursor.regressed.length} regressed), ${statLine(report.endStats)} ${report.pass ? 'PASS' : 'FAIL'}`)
+  say(`  A2 r${round}: team Δ${report.delta} (replace ${report.teamReplaces}), own Δ${report.ownDelta} (replace ${report.ownReplaces}), reviews ${reviews}, skip ${report.skips}, move ${report.moves}, cursor ${report.cursorMoved} (${cursorKey} ${report.cursor.from} → ${report.cursor.to}, ${cursor.elsewhere.length} other key(s) advanced), ${statLine(report.endStats)} ${report.pass ? 'PASS' : 'FAIL'}`)
   return report
 }
 
