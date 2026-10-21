@@ -40,6 +40,9 @@ export const MEMORY_LIMITS = { entry: 300, main: 4_000, topic: 16_000, topics: 4
 export const readers = { readText: path => readFileSync(path, 'utf8') }
 
 const MAIN = 'MEMORY.md'
+// How many unreadable review answers in a row on the same batch before the review gives
+// the batch up and moves on. One or two are treated as a slip.
+const REJECTIONS_MAX = 3
 const EMPTY_MAIN = '# Memory\n\n## Index\n'
 const INDEX = /^##\s+index\s*$/i
 const HEADING = /^#{1,6}\s/
@@ -1218,6 +1221,20 @@ export function install(rt) {
   // and a conversation that goes on before its review starts is read in one go.
 
   const cursorsPath = join(root, 'reviewed.json')
+  // How many times in a row the model answered with something unreadable, per conversation
+  // and at which cursor. A model that keeps producing an invalid answer would otherwise be
+  // stuck on the same lines forever: the review fails, so the cursor never moves.
+  const rejectionsPath = join(root, 'rejections.json')
+  const loadRejections = async () => {
+    try {
+      const value = JSON.parse(await readFile(rejectionsPath, 'utf8'))
+      return value !== null && typeof value === 'object' ? value : {}
+    } catch (error) {
+      if (error?.code !== 'ENOENT') rt.warn('ds-bot: unreadable review rejections: %s', error)
+      return {}
+    }
+  }
+  const saveRejections = async record => writeText(rejectionsPath, JSON.stringify(record))
   /** @type {Record<string, number> | undefined} */
   let cursors
   const cursorsNow = () => {
@@ -1437,7 +1454,43 @@ export function install(rt) {
       const language = writtenIn(read.filter(line => line.who === 'user').map(line => line.text.replace(/^User: /, '')), languageNow())
       const reply = await botShot(bot, reviewSystem(writesTeam(bot.id)), reviewRequest({ bot, numbered, left, sizes, where: batch.where, earlier, fresh: fresh.texts, more, language }), { sessionId: rt.chatOf(bot.id), kind: 'memory' })
       const changes = parseReview(reply)
-      if (changes === undefined) throw new Error(`the model's answer is not a list of changes: ${clip(reply.replace(/\s+/g, ' '), 120)}`)
+      if (changes === undefined) {
+        // Count the failure at this cursor. One or two in a row keep the old behaviour:
+        // the answer is refused and the next review reads the same lines.
+        const rejections = await loadRejections()
+        const at = cursorsNow()[key]
+        const count = rejections[key]?.at === at ? rejections[key].count + 1 : 1
+        rejections[key] = { count, at }
+        await saveRejections(rejections)
+        if (count >= REJECTIONS_MAX) {
+          // Three in a row is not a slip: give the batch up, leave the lines in the log so
+          // they can be recovered by hand, and move the cursor past them.
+          await journal({
+            op: 'skip',
+            scope: key,
+            file: MAIN,
+            ...actorOf({ id: bot.id, name: bot.name }),
+            after: read.map(line => `${line.who}: ${line.text}`).join('\n'),
+            reason: 'invalid-review',
+            intendedOp: 'review',
+            truncated: true,
+          })
+          delete rejections[key]
+          await saveRejections(rejections)
+          cursorsNow()[key] = through
+          await writeText(cursorsPath, JSON.stringify(cursors))
+          rt.warn('ds-bot: memory review of %s gave up on three unreadable answers in a row', bot.name)
+          return
+        }
+        throw new Error(`the model's answer is not a list of changes: ${clip(reply.replace(/\s+/g, ' '), 120)}`)
+      }
+      {
+        const rejections = await loadRejections()
+        if (rejections[key] !== undefined) {
+          delete rejections[key]
+          await saveRejections(rejections)
+        }
+      }
       const unknown = changes.find(change => change.op !== 'add' && numbered[Number(change.entry) - 1] === undefined)
       if (unknown !== undefined) throw new Error(`the model's answer names entry ${unknown.entry}, which is not listed`)
       // A secret is left out for good; any other entry memory cannot keep (one too
