@@ -454,11 +454,66 @@ async function roundA4(round) {
 }
 
 // ---------------------------------------------------------------------------
+// Scenario A2b: a fact the team memory already holds changes. The review has to edit that
+// entry, not add a second one: two entries about the same thing leave the next turn unable to
+// tell which is current. Judged mechanically on the journal and the file.
+
+const A2B_SEED = '周报控制在五条以内'
+const A2B_UPDATE = '周报以后改成三条以内'
+
+async function roundA2b(round) {
+  const report = { scenario: 'A2b', round }
+  // A small team file with the fact already saved, next to other entries it must leave alone.
+  const seed = [
+    '# Memory',
+    '',
+    '- 团队周会在每周二上午十点 [source: part 1 #1; by: Chief; added: 2026-01-05]',
+    `- ${A2B_SEED} [source: part 1 #2; by: Chief; added: 2026-01-05]`,
+    '- 客户 A 的合同到 2027 年 3 月 31 日 [source: part 1 #3; by: Chief; added: 2026-01-05]',
+    '',
+    '## Index',
+    '',
+  ].join('\n')
+  mkdirSync(writeHere(join(MEM, 'team')), { recursive: true })
+  writeFileSync(writeHere(TEAM_MAIN), seed, 'utf8')
+  const chief = await mainBot()
+  const indexBefore = indexCount(teamContent())
+  const cursorBefore = reviewed()
+  const result = await step('update 周报', () => send(chief.id, `记一下：${A2B_UPDATE}。`))
+  const after = teamContent()
+  const teamReplaces = result.writes.filter(event => event.op === 'replace' && String(event.scope ?? '') === 'team')
+  const weekly = entryLines(after).filter(line => !isIndexLine(line)).map(bulletText).filter(text => text.includes('周报'))
+  report.replaces = teamReplaces.length
+  report.weekly = weekly
+  report.indexBefore = indexBefore
+  report.index = indexCount(after)
+  report.cursorMoved = cursorProgress(cursorBefore, reviewed(), `chat:${chief.id}`).moved
+  report.pass = report.replaces === 1
+    && weekly.length === 1
+    && weekly[0].includes('三条')
+    && !weekly[0].includes('五条')
+    && report.index === report.indexBefore
+    && report.cursorMoved
+  report.samples = teamReplaces.map(event => ({
+    scenario: 'A2b',
+    round,
+    kind: 'write',
+    op: event.op,
+    scope: String(event.scope ?? ''),
+    file: event.file ?? null,
+    text: event.after ?? event.text ?? event.before ?? '',
+  }))
+  say(`  A2b r${round}: team replace ${report.replaces}, 周报 entries ${weekly.length}, index ${report.indexBefore} → ${report.index}, cursor ${report.cursorMoved} ${report.pass ? 'PASS' : 'FAIL'}`)
+  for (const text of weekly) say(`    ${text}`)
+  return report
+}
+
+// ---------------------------------------------------------------------------
 
 await ensureMainBot()
 const tapStart = tapLines().length
 const report = { model: MODEL, home: HOME, started: new Date().toISOString(), rounds: [] }
-const runners = { a1: roundA1, a2: roundA2, a3: roundA3, a4: roundA4 }
+const runners = { a1: roundA1, a2: roundA2, a2b: roundA2b, a3: roundA3, a4: roundA4 }
 let stoppedEarly = false
 for (const name of ONLY) {
   if (stoppedEarly) break
