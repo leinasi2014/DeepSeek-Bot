@@ -367,6 +367,12 @@ const reviewSystem = teamWrites => [
   '- keys, passwords, tokens, ID or card numbers, even when the user gives them.',
   '- what an entry already says, and what the user\'s project files (such as AGENTS.md) already say: every Session reads those files again.',
   'Change an entry with edit when the user says it changed or is no longer true, and remove one that the messages show was wrong or was only for one task. Never add an entry that contradicts another.',
+  // Two entries about one thing leave every later turn guessing which is current, and a 4,000
+  // character file fills fast when a changed fact is saved again instead of updated.
+  'Merge before adding. When the new messages are about something already saved and only part of it changed — a date, a place, a person, a number, a status — change that entry with edit: it is the same fact, not a new one. When two saved entries say the same thing, keep one, edit it to hold what both said, and remove the other. Add only when nothing saved is about it.',
+  '  saved: "The team trip to Hangzhou is 20–22 October" · the user now says 26–28 October → {"op": "edit", "entry": 4, "text": "The team trip to Hangzhou is 26–28 October"}',
+  '  saved twice, as "Deploys are on weekday evenings" and a copy with another number → keep one with edit and remove the copy',
+  'Put a detail in a topic that already fits it, named in the list above; make a new topic only when none does.',
   'Each change is one of',
   '  {"op": "add", "text": "…"}',
   ...(teamWrites ? ['  {"op": "add", "text": "…", "team": true}  for what every Bot on the team needs, such as how the user wants all work delivered'] : []),
