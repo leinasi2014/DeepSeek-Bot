@@ -40,6 +40,9 @@ export const MEMORY_LIMITS = { entry: 300, main: 4_000, topic: 16_000, topics: 4
 export const readers = { readText: path => readFileSync(path, 'utf8') }
 
 const MAIN = 'MEMORY.md'
+// How many unreadable review answers in a row on the same batch before the review gives
+// the batch up and moves on. One or two are treated as a slip.
+const REJECTIONS_MAX = 3
 const EMPTY_MAIN = '# Memory\n\n## Index\n'
 const INDEX = /^##\s+index\s*$/i
 const HEADING = /^#{1,6}\s/
@@ -1260,6 +1263,20 @@ export function install(rt) {
   // and a conversation that goes on before its review starts is read in one go.
 
   const cursorsPath = join(root, 'reviewed.json')
+  // How many times in a row the model answered with something unreadable, per conversation
+  // and at which cursor. A model that keeps producing an invalid answer would otherwise be
+  // stuck on the same lines forever: the review fails, so the cursor never moves.
+  const rejectionsPath = join(root, 'rejections.json')
+  const loadRejections = async () => {
+    try {
+      const value = JSON.parse(readFileSync(rejectionsPath, 'utf8'))
+      return value !== null && typeof value === 'object' ? value : {}
+    } catch (error) {
+      if (error?.code !== 'ENOENT') rt.warn('ds-bot: unreadable review rejections: %s', error)
+      return {}
+    }
+  }
+  const saveRejections = async record => writeText(rejectionsPath, JSON.stringify(record))
   /** @type {Record<string, number> | undefined} */
   let cursors
   const cursorsNow = () => {
@@ -1479,7 +1496,62 @@ export function install(rt) {
       const language = writtenIn(read.filter(line => line.who === 'user').map(line => line.text.replace(/^User: /, '')), languageNow())
       const reply = await botShot(bot, reviewSystem(writesTeam(bot.id)), reviewRequest({ bot, numbered, left, sizes, where: batch.where, earlier, fresh: fresh.texts, more, language }), { sessionId: rt.chatOf(bot.id), kind: 'memory' })
       const changes = parseReview(reply)
-      if (changes === undefined) throw new Error(`the model's answer is not a list of changes: ${clip(reply.replace(/\s+/g, ' '), 120)}`)
+      if (changes === undefined) {
+        // Count the failure at this cursor. One or two in a row keep the old behaviour:
+        // the answer is refused and the next review reads the same lines.
+        const rejections = await loadRejections()
+        const at = cursorsNow()[key]
+        const count = rejections[key]?.at === at ? rejections[key].count + 1 : 1
+        rejections[key] = { count, at }
+        await saveRejections(rejections)
+        if (count >= REJECTIONS_MAX) {
+          // Three in a row is not a slip: give the batch up and move the cursor past it.
+          // The lines are kept so a person can recover them by hand, but a line that holds
+          // a secret is not written to the log — the same rule the entries follow. The text
+          // is collapsed first: a secret split over lines ("password\nis DEMO_ONLY") would
+          // otherwise look like ordinary prose.
+          const kept = read.map((line) => {
+            const one = line.text.replace(/\s+/g, ' ').trim()
+            return secretEntry(one) ? `${line.who}: (left out: looks like a secret)` : `${line.who}: ${one}`
+          }).join('\n')
+          await journal({
+            op: 'skip',
+            scope: key,
+            file: MAIN,
+            ...actorOf({ id: bot.id, name: bot.name }),
+            after: kept,
+            reason: 'invalid-review',
+            intendedOp: 'review',
+            // Only a batch that was cut short is marked as such.
+            ...(more ? { truncated: true } : {}),
+          })
+          // The cursor first: if that write fails the counter stays, so the next review
+          // starts from the same place instead of silently skipping lines nobody read.
+          // Hand the rest over before anything below can fail: a failed write must not
+          // leave the remaining lines unread for good.
+          if (more) queueReview(sessionId, room === undefined ? seen : { botId: bot.id, roomId: room.id, room })
+          // Disk first, then memory: if the write fails, memory keeps the old cursor and the
+          // batch is retried rather than skipped in name only.
+          await writeText(cursorsPath, JSON.stringify({ ...cursorsNow(), [key]: through }))
+          cursorsNow()[key] = through
+          try {
+            delete rejections[key]
+            await saveRejections(rejections)
+          } catch (error) {
+            rt.warn('ds-bot: could not clear the review rejection count: %s', error)
+          }
+          rt.warn('ds-bot: memory review of %s gave up on three unreadable answers in a row', bot.name)
+          return
+        }
+        throw new Error(`the model's answer is not a list of changes: ${clip(reply.replace(/\s+/g, ' '), 120)}`)
+      }
+      {
+        const rejections = await loadRejections()
+        if (rejections[key] !== undefined) {
+          delete rejections[key]
+          await saveRejections(rejections)
+        }
+      }
       const unknown = changes.find(change => change.op !== 'add' && numbered[Number(change.entry) - 1] === undefined)
       if (unknown !== undefined) throw new Error(`the model's answer names entry ${unknown.entry}, which is not listed`)
       // A secret is left out for good; any other entry memory cannot keep (one too
