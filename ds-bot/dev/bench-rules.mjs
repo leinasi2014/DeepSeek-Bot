@@ -16,9 +16,10 @@ export const cursorProgress = (before, after, key) => {
   }
 }
 
-// Mechanical only: the 20 inputs had to review and replace something on the team memory, the
-// review's place had to move in this run's conversation during the batch phase itself, and
-// neither file may pass its growth budget or its size limit. A file that only grows must not
-// pass by the other one staying still, so ownDelta is a verdict, not just a printed number.
-export const a2Pass = ({ delta, ownDelta, teamReplaces, overLimit, cursorMoved, reviews }) =>
-  delta <= 14 && ownDelta <= 14 && teamReplaces >= 1 && !overLimit && cursorMoved && reviews >= 1
+// Mechanical only: growth stays within budget in both files, topics do not multiply (a detail
+// belongs in a topic that fits, not a new one per fact), the review ran and its place moved in
+// this run's own conversation. A file that only grows must not pass by the other one standing
+// still, so ownDelta is a verdict, not a printed number. The replace count is reported, not
+// judged: A2 has no update in its messages, so a zero says nothing about the review.
+export const a2Pass = ({ delta, ownDelta, indexDelta, overLimit, cursorMoved, reviews }) =>
+  delta <= 14 && ownDelta <= 14 && indexDelta <= 6 && !overLimit && cursorMoved && reviews >= 1

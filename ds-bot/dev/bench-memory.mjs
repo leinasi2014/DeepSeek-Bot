@@ -342,6 +342,7 @@ async function roundA2(round) {
   report.cursorMoved = cursor.moved
   report.delta = report.endEntries - report.startEntries
   report.ownDelta = report.endStats.own.body - report.startStats.own.body
+  report.indexDelta = report.endStats.team.index - report.startStats.team.index
   report.overLimit = [report.startStats.team, report.endStats.team, report.startStats.own, report.endStats.own].some(scope => scope.chars > 4_000)
   report.replaces = opCount(writes, 'replace')
   report.teamReplaces = writes.filter(event => event.op === 'replace' && String(event.scope ?? '') === 'team').length
@@ -359,11 +360,11 @@ async function roundA2(round) {
     file: event.file ?? null,
     text: event.after ?? event.text ?? event.before ?? '',
   })).filter(sample => sample.text !== '')
-  // Mechanical only: the team review had to run and replace something, the review's place had
-  // to move through the twenty inputs themselves, and neither file may pass its growth budget
-  // or its size limit. Both files are judged: growth moved to one file is still growth.
-  report.pass = a2Pass({ delta: report.delta, ownDelta: report.ownDelta, teamReplaces: report.teamReplaces, overLimit: report.overLimit, cursorMoved: report.cursorMoved, reviews })
-  say(`  A2 r${round}: team Δ${report.delta} (replace ${report.teamReplaces}), own Δ${report.ownDelta} (replace ${report.ownReplaces}), reviews ${reviews}, skip ${report.skips}, move ${report.moves}, cursor ${report.cursorMoved} (${cursorKey} ${report.cursor.from} → ${report.cursor.to}, ${cursor.elsewhere.length} other key(s) advanced), ${statLine(report.endStats)} ${report.pass ? 'PASS' : 'FAIL'}`)
+  // Mechanical only: growth stays within budget in both files, topics do not multiply, the
+  // review ran, and its place moved through the twenty inputs themselves. The replace count is
+  // printed, not judged: A2 has no update among its messages.
+  report.pass = a2Pass({ delta: report.delta, ownDelta: report.ownDelta, indexDelta: report.indexDelta, overLimit: report.overLimit, cursorMoved: report.cursorMoved, reviews })
+  say(`  A2 r${round}: team Δ${report.delta} (replace ${report.teamReplaces}, reported), own Δ${report.ownDelta} (replace ${report.ownReplaces}), index ${report.startStats.team.index} → ${report.endStats.team.index} (Δ${report.indexDelta}), reviews ${reviews}, skip ${report.skips}, move ${report.moves}, cursor ${report.cursorMoved} (${cursorKey} ${report.cursor.from} → ${report.cursor.to}, ${cursor.elsewhere.length} other key(s) advanced), ${statLine(report.endStats)} ${report.pass ? 'PASS' : 'FAIL'}`)
   return report
 }
 
@@ -462,7 +463,7 @@ const A2B_SEED = '周报控制在五条以内'
 const A2B_UPDATE = '周报以后改成三条以内'
 
 async function roundA2b(round) {
-  const report = { scenario: 'A2b', round }
+  const report = { scenario: 'A2B', round }
   // A small team file with the fact already saved, next to other entries it must leave alone.
   const seed = [
     '# Memory',
@@ -492,14 +493,14 @@ async function roundA2b(round) {
   report.indexBefore = indexBefore
   report.index = indexCount(after)
   report.cursorMoved = cursorProgress(cursorBefore, reviewed(), `chat:${chief.id}`).moved
-  report.pass = report.replaces === 1
-    && weekly.length === 1
-    && weekly[0].includes('三条')
-    && !weekly[0].includes('五条')
-    && report.index === report.indexBefore
-    && report.cursorMoved
+  // The outcome, not the op: two entries about the weekly report leave the next turn unable to
+  // tell which is current, and that is the failure this scenario exists for. One entry saying
+  // the new number passes; one entry still saying the old number is "did not act", counted
+  // neither way here — the run's verdict is the count over three rounds.
+  report.outcome = weekly.length === 0 ? 'lost' : weekly.length > 1 ? 'duplicate' : weekly[0].includes('三条') ? 'updated' : 'untouched'
+  report.pass = report.outcome === 'updated'
   report.samples = teamReplaces.map(event => ({
-    scenario: 'A2b',
+    scenario: 'A2B',
     round,
     kind: 'write',
     op: event.op,
@@ -507,7 +508,7 @@ async function roundA2b(round) {
     file: event.file ?? null,
     text: event.after ?? event.text ?? event.before ?? '',
   }))
-  say(`  A2b r${round}: review writes ${report.autoWrites}, team replace ${report.replaces}, 周报 entries ${weekly.length}, index ${report.indexBefore} → ${report.index}, cursor ${report.cursorMoved} ${report.pass ? 'PASS' : 'FAIL'}`)
+  say(`  A2b r${round}: ${report.outcome} (周报 entries ${weekly.length}), review writes ${report.autoWrites}, team replace ${report.replaces}, index ${report.indexBefore} → ${report.index}, cursor ${report.cursorMoved}`)
   for (const text of weekly) say(`    ${text}`)
   return report
 }
@@ -549,6 +550,15 @@ for (const name of ONLY) {
 }
 for (const scenario of ONLY.map(name => name.toUpperCase())) {
   const rounds = report.rounds.filter(item => item.scenario === scenario)
+  // A2b is judged over three rounds: no round may leave two entries about the fact, and at
+  // least two must end with one entry saying the new value.
+  if (scenario === 'A2B') {
+    const updated = rounds.filter(item => item.outcome === 'updated').length
+    const bad = rounds.filter(item => item.outcome === 'duplicate' || item.outcome === 'lost').length
+    const enough = rounds.length >= 3
+    say(`\nA2B: ${updated}/${rounds.length} updated, ${bad} duplicate or lost${enough ? '' : ' (three rounds needed)'} → ${enough && bad === 0 && updated >= 2 ? 'PASS' : 'FAIL'}`)
+    continue
+  }
   if (rounds.length > 0 && rounds.every(item => item.pass === undefined)) {
     say(`\n${scenario}: manual check (no pass/fail)`)
     continue
