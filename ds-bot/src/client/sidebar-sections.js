@@ -2,6 +2,7 @@
 // the Bots (agents belong with the Bots). This module is the part that touches no DOM, so the
 // rules for reading, writing and grouping can be tested without a browser.
 import { STORAGE } from './storage.js'
+import { currentPart } from './text.js'
 
 // true means expanded. Both sections start expanded, and anything unreadable means the same:
 // a broken preference must never hide the user's groups.
@@ -69,4 +70,17 @@ export function sectionCounts({ rooms, bots, unread, asks, approvals = [] }) {
   const botCounts = counts(bots)
   botCounts.approvals = approvals.filter(entry => entry.roomId === undefined && bots.some(item => item.id === entry.botId)).length
   return { rooms: counts(rooms), bots: botCounts }
+}
+
+// Every name a conversation's unread mark may sit under: the ids the caller holds (a row's id,
+// or the Session part a search result hands over) and the Bot id when the conversation is that
+// Bot's. A Bot moved to a fresh part keeps its mark under its own id, so opening the fresh part
+// has to clear both or the mark outlives the visit.
+export function unreadNames(ids, bots) {
+  const names = new Set(ids)
+  for (const id of ids) {
+    const bot = bots.find(item => item.id === id || currentPart(item) === id)
+    if (bot !== undefined) names.add(bot.id)
+  }
+  return [...names]
 }

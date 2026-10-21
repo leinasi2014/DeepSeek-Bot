@@ -111,3 +111,29 @@ test('the narrow rail shows every row and no headers at all', () => {
   // Every row is there: the Main Bot, one group chat, two Bots and the Agent.
   assert.equal(nodesWithClass(tree, 'bt-row').length, 5)
 })
+
+test('a hidden Bot is not counted, and a Bot waiting on an answer is', () => {
+  const roster = {
+    ...team,
+    byId: { ...team.byId, b3: { id: 'b3', name: 'Ghost', hidden: true } },
+    bots: [...team.bots, { id: 'b3', name: 'Ghost', hidden: true, createdAt: 1 }],
+    agents: [{ id: 'a1', name: 'DSH Agent', sessions: ['sess-a'], createdAt: 1 }],
+  }
+  // Coder's chat moved to a fresh part, so its unread sits under the part, not the Bot id.
+  const moved = { ...team.byId.b2, sessionId: 'fresh-b2' }
+  roster.byId = { ...roster.byId, b2: moved }
+  roster.bots = roster.bots.map(bot => (bot.id === 'b2' ? moved : bot))
+  const statuses = new Map([
+    ['fresh-b2', { completionUnread: true }],
+    ['sess-a', { pendingInteraction: 'question' }],
+  ])
+  const tree = TeamSidebar({ ...props(true), useRoster: store(roster), useSessionStatus: store(statuses), useWork: store({ approvals: [] }) })
+  // Ghost is hidden and its row draws nothing, so the Bots section holds three rows, not four.
+  const counts = nodesWithClass(tree, 'bt-side-section-count').map(node => node.props.children.join(''))
+  assert.deepEqual(counts, ['1', '3'])
+  // One unread Bot and one Agent waiting on an answer both count as needing the user.
+  const badges = nodesWithClass(tree, 'bt-side-badge').map(node => node.props.children.join(''))
+  assert.deepEqual(badges, ['2'])
+  const labels = nodesWithClass(tree, 'bt-row').map(node => node.props['aria-label'].split(',')[0])
+  assert.equal(labels.includes('Ghost'), false)
+})

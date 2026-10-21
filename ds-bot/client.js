@@ -5059,6 +5059,14 @@ function sectionCounts({ rooms, bots, unread, asks, approvals = [] }) {
   botCounts.approvals = approvals.filter((entry) => entry.roomId === void 0 && bots.some((item) => item.id === entry.botId)).length;
   return { rooms: counts2(rooms), bots: botCounts };
 }
+function unreadNames(ids, bots) {
+  const names = new Set(ids);
+  for (const id of ids) {
+    const bot = bots.find((item) => item.id === id || currentPart(item) === id);
+    if (bot !== void 0) names.add(bot.id);
+  }
+  return [...names];
+}
 
 // src/client/sidebar.js
 var import_react9 = require("react");
@@ -5347,7 +5355,7 @@ function useListGlide(listRef, layout, key) {
     tops.current = { layout, map: next };
   }, [layout, key]);
 }
-function Section({ name, count, numbers, open, onToggle, children }) {
+function Section({ name, numbers, open, onToggle, children }) {
   if (name === void 0) return (0, import_react9.createElement)(import_react9.Fragment, null, children);
   const action = open ? t("Collapse {name}", { name }) : t("Expand {name}", { name });
   const badges = [
@@ -5364,14 +5372,14 @@ function Section({ name, count, numbers, open, onToggle, children }) {
         type: "button",
         className: "bt-side-section",
         "aria-expanded": open ? "true" : "false",
-        "aria-label": `${name}, ${count}. ${action}`,
+        "aria-label": `${name}, ${numbers.rows}. ${action}`,
         title: action,
         onClick: onToggle
       },
       (0, import_react9.createElement)("span", { className: "bt-side-caret", "aria-hidden": true }, open ? "▾" : "▸"),
       (0, import_react9.createElement)("span", { className: "bt-side-section-name" }, name),
       ...badges,
-      (0, import_react9.createElement)("span", { className: "bt-side-section-count" }, String(count))
+      (0, import_react9.createElement)("span", { className: "bt-side-section-count" }, String(numbers.rows))
     ),
     open ? (0, import_react9.createElement)("div", { className: "bt-side-rows", role: "group", "aria-label": name }, children) : null
   );
@@ -5400,19 +5408,30 @@ function TeamSidebar(props) {
   const main = roster.byId[roster.mainBotId];
   const [sections, setSections] = (0, import_react9.useState)(() => readSections());
   const grouped = (0, import_react9.useMemo)(() => groupEntries(order), [order]);
-  const statuses = props.useSessionStatus ? props.useSessionStatus((map) => map) : void 0;
+  const partsOf = (0, import_react9.useMemo)(() => order.map((entry) => {
+    const item = entry.item;
+    if (entry.kind === "room") return [item.id];
+    if (entry.kind === "agent") return item.sessions ?? [];
+    return [currentPart(item)];
+  }), [order]);
+  const statusFlags = props.useSessionStatus ? props.useSessionStatus((map) => JSON.stringify(partsOf.map((parts) => parts.map((part) => [map.get(part)?.completionUnread === true, map.get(part)?.pendingInteraction !== void 0])))) : "[]";
   const approvals = props.useWork ? props.useWork((work) => work?.approvals ?? []) : [];
   const numbers = (0, import_react9.useMemo)(() => {
+    const flags = JSON.parse(statusFlags);
     const unread = /* @__PURE__ */ new Set();
     const asks = /* @__PURE__ */ new Set();
-    for (const entry of order) {
-      const part = entry.item.id;
-      const status = statuses?.get(part);
-      if (markedUnread[entry.item.id] === true || status?.completionUnread === true) unread.add(entry.item.id);
-      if (roster.questions?.[part] !== void 0) asks.add(entry.item.id);
-    }
-    return sectionCounts({ rooms: grouped.rooms.map((entry) => entry.item), bots: grouped.bots.map((entry) => entry.item), unread, asks, approvals });
-  }, [order, grouped, statuses, markedUnread, roster.questions, approvals]);
+    const visible = { rooms: [], bots: [] };
+    order.forEach((entry, at) => {
+      const item = entry.item;
+      if (item.hidden === true) return;
+      const parts = partsOf[at] ?? [];
+      const rows = flags[at] ?? [];
+      if (markedUnread[item.id] === true || rows.some(([isUnread, waiting]) => isUnread || waiting)) unread.add(item.id);
+      if (parts.some((part) => roster.questions?.[part] !== void 0)) asks.add(item.id);
+      (entry.kind === "room" ? visible.rooms : visible.bots).push(item);
+    });
+    return sectionCounts({ rooms: visible.rooms, bots: visible.bots, unread, asks, approvals });
+  }, [order, partsOf, statusFlags, markedUnread, roster.questions, approvals]);
   const open = wide ? sections : { rooms: true, bots: true };
   const toggle = (id) => {
     const next = { ...sections, [id]: !sections[id] };
@@ -5452,12 +5471,12 @@ function TeamSidebar(props) {
       main ? (0, import_react9.createElement)(BotRow, { ...rowProps, bot: main, marked: markedUnread[main.id] === true }) : roster.ready ? null : (0, import_react9.createElement)("div", { className: "bt-hint" }, t("Setting up your Main Bot…")),
       (0, import_react9.createElement)(
         Section,
-        { key: "rooms", name: wide ? t("Group chats") : void 0, count: grouped.rooms.length, numbers: numbers.rooms, open: open.rooms, onToggle: () => toggle("rooms") },
+        { key: "rooms", name: wide ? t("Group chats") : void 0, numbers: numbers.rooms, open: open.rooms, onToggle: () => toggle("rooms") },
         grouped.rooms.map((entry) => (0, import_react9.createElement)(RoomRow, { key: entry.item.id, ...rowProps, room: entry.item, marked: markedUnread[entry.item.id] === true }))
       ),
       (0, import_react9.createElement)(
         Section,
-        { key: "bots", name: wide ? t("Bots") : void 0, count: grouped.bots.length, numbers: numbers.bots, open: open.bots, onToggle: () => toggle("bots") },
+        { key: "bots", name: wide ? t("Bots") : void 0, numbers: numbers.bots, open: open.bots, onToggle: () => toggle("bots") },
         grouped.bots.map((entry) => entry.kind === "bot" ? (0, import_react9.createElement)(BotRow, { key: entry.item.id, ...rowProps, bot: entry.item, marked: markedUnread[entry.item.id] === true }) : (0, import_react9.createElement)(AgentRow, { key: entry.item.id, ...rowProps, agent: entry.item, marked: markedUnread[entry.item.id] === true }))
       )
     )
@@ -14041,7 +14060,7 @@ function apply(ctx) {
       ui2.set((state) => state.newChat || state.exchange || state.menu || state.palette ? { ...state, newChat: null, exchange: null, menu: null, palette: null } : state);
       setPlain(false);
       const target = partFor(id);
-      clearUnread(id, target);
+      clearUnread(...unreadNames([id, target], Object.values(roster.getSnapshot().byId)));
       expected = target;
       ctx.uiWorkspace.openSession(target);
     },

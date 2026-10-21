@@ -26,6 +26,7 @@ import { USAGE_CSS } from './usage-page.js'
 import { SCHEDULE_CSS } from './schedules.js'
 import { STORAGE, migrateStorage } from './storage.js'
 import { clearUnreadFor, noteLeft, setUnread, sharedMap, toggleReaction } from './shared-map.js'
+import { unreadNames } from './sidebar-sections.js'
 import { freePriority, groupsFor, readMode, surfaceGroups, writeMode } from './surface.js'
 import { installLocale, language, t } from './i18n.js'
 import { noteClientError, quietly } from './diagnostics.js'
@@ -355,7 +356,9 @@ export function apply(ctx) {
       ui.set(state => (state.newChat || state.exchange || state.menu || state.palette ? { ...state, newChat: null, exchange: null, menu: null, palette: null } : state))
       setPlain(false)
       const target = partFor(id)
-      clearUnread(id, target)
+      // A Bot that moved to a fresh part keeps its mark under the Bot id, and a search result
+      // hands the opening action the current part: clear every name the conversation holds.
+      clearUnread(...unreadNames([id, target], Object.values(roster.getSnapshot().byId)))
       expected = target
       ctx.uiWorkspace.openSession(target)
     },

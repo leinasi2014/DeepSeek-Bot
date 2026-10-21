@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { DEFAULT_SECTIONS, groupEntries, readSections, sectionCounts, writeSections } from '../src/client/sidebar-sections.js'
+import { DEFAULT_SECTIONS, groupEntries, readSections, sectionCounts, unreadNames, writeSections } from '../src/client/sidebar-sections.js'
 
 const memoryStorage = (initial = {}) => {
   const held = new Map(Object.entries(initial))
@@ -68,4 +68,14 @@ test('a section counts only its own rows, and an approval that names a room coun
   // approval that names no room, and the Bot that is not in the section is not counted.
   assert.deepEqual(counts.rooms, { rows: 2, unread: 1, asks: 1, approvals: 2 })
   assert.deepEqual(counts.bots, { rows: 3, unread: 1, asks: 0, approvals: 1 })
+})
+
+test('opening a conversation clears the Bot id when the part has moved on', () => {
+  const bots = [{ id: 'b1' }, { id: 'b2', sessionId: 'fresh-2' }]
+  // A search result hands over the current part, which is not the Bot id any more.
+  assert.deepEqual(unreadNames(['fresh-2'], bots), ['fresh-2', 'b2'])
+  // A row's own id is already one of the names.
+  assert.deepEqual(unreadNames(['b1', 'b1'], bots), ['b1'])
+  // Something that is no Bot's part is cleared under the name it was opened by.
+  assert.deepEqual(unreadNames(['r1'], bots), ['r1'])
 })

@@ -247,7 +247,7 @@ function useListGlide(listRef, layout, key) {
 // One foldable group of rows. Its count is the rows the group holds, so a folded section
 // still says how much is inside it; the badges say how much of it needs the user. The narrow
 // rail passes no name and shows every row.
-function Section({ name, count, numbers, open, onToggle, children }) {
+function Section({ name, numbers, open, onToggle, children }) {
   if (name === undefined) return h(Fragment, null, children)
   const action = open ? t('Collapse {name}', { name }) : t('Expand {name}', { name })
   const badges = [
@@ -258,12 +258,12 @@ function Section({ name, count, numbers, open, onToggle, children }) {
   return h(Fragment, null,
     h('button', {
       type: 'button', className: 'bt-side-section', 'aria-expanded': open ? 'true' : 'false',
-      'aria-label': `${name}, ${count}. ${action}`, title: action, onClick: onToggle,
+      'aria-label': `${name}, ${numbers.rows}. ${action}`, title: action, onClick: onToggle,
     },
       h('span', { className: 'bt-side-caret', 'aria-hidden': true }, open ? '▾' : '▸'),
       h('span', { className: 'bt-side-section-name' }, name),
       ...badges,
-      h('span', { className: 'bt-side-section-count' }, String(count))),
+      h('span', { className: 'bt-side-section-count' }, String(numbers.rows))),
     open ? h('div', { className: 'bt-side-rows', role: 'group', 'aria-label': name }, children) : null)
 }
 
@@ -291,21 +291,38 @@ export function TeamSidebar(props) {
   const main = roster.byId[roster.mainBotId]
   const [sections, setSections] = useState(() => readSections())
   const grouped = useMemo(() => groupEntries(order), [order])
-  // What the folded headers say: the same signals the rows show, counted over the rows a
-  // section actually has, so a hidden Bot is never part of the number.
-  const statuses = (props.useSessionStatus ? props.useSessionStatus(map => map) : undefined)
+  // What the folded headers say: the same signals the rows show, over the rows a section really
+  // displays. A Bot's chat Session is not its id once it has moved to a fresh part, an Agent
+  // keeps one Session per conversation, and a row with a pending answer is as much a signal as
+  // an unread one — so the parts are read per row kind, and hidden rows are left out.
+  const partsOf = useMemo(() => order.map((entry) => {
+    const item = entry.item
+    if (entry.kind === 'room') return [item.id]
+    if (entry.kind === 'agent') return item.sessions ?? []
+    return [currentPart(item)]
+  }), [order])
+  // Subscribing to the whole status map would recompute on every Bot's every change; this
+  // string changes only when a flag the headers show does.
+  const statusFlags = (props.useSessionStatus
+    ? props.useSessionStatus(map => JSON.stringify(partsOf.map(parts => parts.map(part => [map.get(part)?.completionUnread === true, map.get(part)?.pendingInteraction !== undefined]))))
+    : '[]')
   const approvals = (props.useWork ? props.useWork(work => work?.approvals ?? []) : [])
   const numbers = useMemo(() => {
+    const flags = JSON.parse(statusFlags)
     const unread = new Set()
     const asks = new Set()
-    for (const entry of order) {
-      const part = entry.item.id
-      const status = statuses?.get(part)
-      if (markedUnread[entry.item.id] === true || status?.completionUnread === true) unread.add(entry.item.id)
-      if (roster.questions?.[part] !== undefined) asks.add(entry.item.id)
-    }
-    return sectionCounts({ rooms: grouped.rooms.map(entry => entry.item), bots: grouped.bots.map(entry => entry.item), unread, asks, approvals })
-  }, [order, grouped, statuses, markedUnread, roster.questions, approvals])
+    const visible = { rooms: [], bots: [] }
+    order.forEach((entry, at) => {
+      const item = entry.item
+      if (item.hidden === true) return
+      const parts = partsOf[at] ?? []
+      const rows = flags[at] ?? []
+      if (markedUnread[item.id] === true || rows.some(([isUnread, waiting]) => isUnread || waiting)) unread.add(item.id)
+      if (parts.some(part => roster.questions?.[part] !== undefined)) asks.add(item.id)
+      ;(entry.kind === 'room' ? visible.rooms : visible.bots).push(item)
+    })
+    return sectionCounts({ rooms: visible.rooms, bots: visible.bots, unread, asks, approvals })
+  }, [order, partsOf, statusFlags, markedUnread, roster.questions, approvals])
   // The narrow rail is icons only: folding there would leave nothing to open a chat with.
   const open = wide ? sections : { rooms: true, bots: true }
   const toggle = (id) => {
@@ -336,9 +353,9 @@ export function TeamSidebar(props) {
     wide && roster.readOnly ? h('div', { className: 'bt-hint bt-read-only', role: 'status' }, hostText(roster.readOnly)) : null,
     h('div', { ref: listRef, className: 'bt-list', role: 'region', 'aria-label': t('Bot list') },
       main ? h(BotRow, { ...rowProps, bot: main, marked: markedUnread[main.id] === true }) : roster.ready ? null : h('div', { className: 'bt-hint' }, t('Setting up your Main Bot…')),
-      h(Section, { key: 'rooms', name: wide ? t('Group chats') : undefined, count: grouped.rooms.length, numbers: numbers.rooms, open: open.rooms, onToggle: () => toggle('rooms') },
+      h(Section, { key: 'rooms', name: wide ? t('Group chats') : undefined, numbers: numbers.rooms, open: open.rooms, onToggle: () => toggle('rooms') },
         grouped.rooms.map(entry => h(RoomRow, { key: entry.item.id, ...rowProps, room: entry.item, marked: markedUnread[entry.item.id] === true }))),
-      h(Section, { key: 'bots', name: wide ? t('Bots') : undefined, count: grouped.bots.length, numbers: numbers.bots, open: open.bots, onToggle: () => toggle('bots') },
+      h(Section, { key: 'bots', name: wide ? t('Bots') : undefined, numbers: numbers.bots, open: open.bots, onToggle: () => toggle('bots') },
         grouped.bots.map(entry => (entry.kind === 'bot'
           ? h(BotRow, { key: entry.item.id, ...rowProps, bot: entry.item, marked: markedUnread[entry.item.id] === true })
           : h(AgentRow, { key: entry.item.id, ...rowProps, agent: entry.item, marked: markedUnread[entry.item.id] === true }))))))
