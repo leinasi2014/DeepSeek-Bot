@@ -1391,7 +1391,7 @@ test('three unreadable reviews in a row give the batch up, with the lines kept',
   t.after(() => stop())
   await call('state', {})
   for (let tries = 0; tries < 3; tries += 1) {
-    lines.push({ event: { seq: 12 + tries, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: `retry ${tries}` }] } } })
+    lines.push({ event: { seq: 12 + tries, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: tries === 0 ? 'the password\nis DEMO_ONLY' : `retry ${tries}` }] } } })
     // A non-idle status in between: the listener debounces, so a second `idle` would only
     // clear the first one's timer and no second review would run at all.
     ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'working' })
@@ -1405,6 +1405,10 @@ test('three unreadable reviews in a row give the batch up, with the lines kept',
   assert.ok(skip, 'the batch is recorded as given up')
   assert.equal(skip.intendedOp, 'review')
   assert.match(String(skip.after), /user:/i, 'the lines themselves are kept, not a count')
+  // A secret split over two lines must not reach the log: the text is collapsed before the
+  // check, so the placeholder stands in for the whole line.
+  assert.doesNotMatch(String(skip.after), /DEMO_ONLY/, 'the secret never reaches the log')
+  assert.match(String(skip.after), /left out: looks like a secret/, 'the line is recorded as left out')
   assert.ok(JSON.parse(read('reviewed.json'))['chat:b2'] > 9, 'the cursor moved past the batch it gave up on')
   assert.equal(JSON.parse(read('rejections.json'))['chat:b2'], undefined, 'the counter is cleared')
 })
