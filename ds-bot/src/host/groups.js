@@ -517,6 +517,15 @@ export function install(rt) {
         })
       }
       if (posts.some(post => !post.botId && !post.kickoff)) room.lateRounds = 0
+      // A Main Bot opening a new round with post_to_group earns the same fresh
+      // budget the user gets. Everything else a Bot posts keeps the limit: a late
+      // reply, a step line, a stop, a failure or a kickoff greeting, and any post
+      // by an admin or an ordinary Bot. Otherwise two Main Bots could @ each other
+      // forever and the limit would never bind.
+      else if (posts.some(post => post.botId !== undefined && !post.kickoff
+        && !post.late && !post.progress && !post.done && !post.failed
+        && !post.stopped && !post.resumed && !post.again
+        && rt.isMain(post.botId))) room.lateRounds = 0
       await rt.save()
       // An event post never picks the speakers over a message queued with it.
       const opener = posts.findLast(post => !event(post)) ?? posts.at(-1)
@@ -694,6 +703,11 @@ export function install(rt) {
   }
   rt.postToRoom = postToRoom
 
+  // Appended to a post the late-round limit kept from waking anyone. Without it the
+  // group waits for a reply that was never asked for, and the member waiting on this
+  // result is not woken either.
+  const QUIET_NOTE = '\n\n（本群迟到轮次已达上限，这条没有叫醒任何人；等用户发言或主 Bot 开新一轮后恢复。）'
+
   // A member the round moved on from (it went on working, went quiet or waited for an
   // approval) posts what its turn ended with. The member that asked for it and anyone
   // it names answer; past the late round limit nobody does, so late posts cannot keep a
@@ -711,7 +725,9 @@ export function install(rt) {
     const quiet = (room.lateRounds ?? 0) >= ROOM_LATE_ROUNDS
     if (!quiet) room.lateRounds = (room.lateRounds ?? 0) + 1
     await rt.save()
-    await postToRoom(room, member, done ? '' : text, { late: true, ...(done ? { done: true } : {}), ...(info.askedBy ? { askedBy: info.askedBy } : {}), ...(quiet ? { quiet: true } : {}) })
+    const late = done ? '' : text
+    const note = quiet && !done ? QUIET_NOTE : ''
+    await postToRoom(room, member, late === '' ? '' : late + note, { late: true, ...(done ? { done: true } : {}), ...(info.askedBy ? { askedBy: info.askedBy } : {}), ...(quiet ? { quiet: true } : {}) })
       .catch(error => rt.warn('ds-bot: late group reply from %s failed: %s', member.name, error))
   }
   rt.lateRoomReply = lateRoomReply
@@ -740,7 +756,10 @@ export function install(rt) {
     const quiet = !calls || (room.lateRounds ?? 0) >= ROOM_LATE_ROUNDS
     if (!quiet) room.lateRounds = (room.lateRounds ?? 0) + 1
     await rt.save()
-    await postToRoom(room, member, text, { progress: true, ...(quiet ? { quiet: true } : {}) })
+    // An @ past the limit calls nobody, so the line has to say so or the group
+    // waits for an answer that will never come.
+    const swallowed = quiet && calls ? QUIET_NOTE : ''
+    await postToRoom(room, member, text + swallowed, { progress: true, ...(quiet ? { quiet: true } : {}) })
   }
 
   // Lines a member writes close together reach the group as one message, so a burst of
