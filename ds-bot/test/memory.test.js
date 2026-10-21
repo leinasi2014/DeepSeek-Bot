@@ -1398,13 +1398,15 @@ test('three unreadable reviews in a row give the batch up, with the lines kept',
     ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
     try { await reviewed(call) } catch { /* a refused answer is expected */ }
   }
-  // Even with a new user line before every retry (so the review is not skipped for having
-  // nothing new), the review runs once: the count stays 1 and the cursor stays at 9. Three
-  // refusals cannot be built in this harness, so the give-up path stays unverified here.
-  const rejections = JSON.parse(read('rejections.json'))
-  assert.equal(rejections['chat:b2'].count, 1, 'one refusal is counted; the harness cannot produce three')
-  assert.equal(rejections['chat:b2'].at, 9, 'counted at the cursor it failed on')
-  assert.deepEqual(JSON.parse(read('reviewed.json')), { 'chat:b2': 9 }, 'the cursor is left alone after one refusal')
+  // The third refusal gives the batch up: the lines are recorded, the cursor moves past
+  // them, and the counter for this conversation is cleared.
+  const journal = read('journal.jsonl').split('\n').filter(Boolean).map(line => JSON.parse(line))
+  const skip = journal.find(entry => entry.op === 'skip' && entry.reason === 'invalid-review')
+  assert.ok(skip, 'the batch is recorded as given up')
+  assert.equal(skip.intendedOp, 'review')
+  assert.match(String(skip.after), /user:/i, 'the lines themselves are kept, not a count')
+  assert.ok(JSON.parse(read('reviewed.json'))['chat:b2'] > 9, 'the cursor moved past the batch it gave up on')
+  assert.equal(JSON.parse(read('rejections.json'))['chat:b2'], undefined, 'the counter is cleared')
 })
 
 test('one readable review clears the count, so two more bad ones do not give the batch up', async (t) => {

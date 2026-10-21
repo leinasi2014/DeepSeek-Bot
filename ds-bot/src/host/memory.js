@@ -1227,7 +1227,7 @@ export function install(rt) {
   const rejectionsPath = join(root, 'rejections.json')
   const loadRejections = async () => {
     try {
-      const value = JSON.parse(await readFile(rejectionsPath, 'utf8'))
+      const value = JSON.parse(readFileSync(rejectionsPath, 'utf8'))
       return value !== null && typeof value === 'object' ? value : {}
     } catch (error) {
       if (error?.code !== 'ENOENT') rt.warn('ds-bot: unreadable review rejections: %s', error)
@@ -1463,23 +1463,31 @@ export function install(rt) {
         rejections[key] = { count, at }
         await saveRejections(rejections)
         if (count >= REJECTIONS_MAX) {
-          // Three in a row is not a slip: give the batch up, leave the lines in the log so
-          // they can be recovered by hand, and move the cursor past them.
+          // Three in a row is not a slip: give the batch up and move the cursor past it.
+          // The lines are kept so a person can recover them by hand, but a line that holds
+          // a secret is not written to the log — the same rule the entries follow.
+          const kept = read.map(line => (secretEntry(line.text) ? `${line.who}: (left out: looks like a secret)` : `${line.who}: ${line.text}`)).join('\n')
           await journal({
             op: 'skip',
             scope: key,
             file: MAIN,
             ...actorOf({ id: bot.id, name: bot.name }),
-            after: read.map(line => `${line.who}: ${line.text}`).join('\n'),
+            after: kept,
             reason: 'invalid-review',
             intendedOp: 'review',
-            truncated: true,
+            // Only a batch that was cut short is marked as such.
+            ...(more ? { truncated: true } : {}),
           })
-          delete rejections[key]
-          await saveRejections(rejections)
+          // The cursor first: if that write fails the counter stays, so the next review
+          // starts from the same place instead of silently skipping lines nobody read.
           cursorsNow()[key] = through
           await writeText(cursorsPath, JSON.stringify(cursors))
+          delete rejections[key]
+          await saveRejections(rejections)
           rt.warn('ds-bot: memory review of %s gave up on three unreadable answers in a row', bot.name)
+          // More of this conversation has not been read yet: hand the rest on, or it is
+          // never reviewed because the cursor no longer moves on its own.
+          if (more) queueReview(sessionId, room === undefined ? seen : { botId: bot.id, roomId: room.id, room })
           return
         }
         throw new Error(`the model's answer is not a list of changes: ${clip(reply.replace(/\s+/g, ' '), 120)}`)
