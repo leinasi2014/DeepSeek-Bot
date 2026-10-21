@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { DEFAULT_SECTIONS, groupEntries, readSections, writeSections } from '../src/client/sidebar-sections.js'
+import { DEFAULT_SECTIONS, groupEntries, readSections, sectionCounts, writeSections } from '../src/client/sidebar-sections.js'
 
 const memoryStorage = (initial = {}) => {
   const held = new Map(Object.entries(initial))
@@ -49,4 +49,23 @@ test('groups go to the rooms section, bots and agents to the bots section, order
   const { rooms, bots } = groupEntries(order)
   assert.deepEqual(rooms.map(entry => entry.item.id), ['r1', 'r3'])
   assert.deepEqual(bots.map(entry => entry.item.id), ['b2', 'a1'], 'agents count as Bots')
+})
+
+test('a section counts only its own rows, and an approval that names a room counts once', () => {
+  const counts = sectionCounts({
+    rooms: [{ id: 'r1' }, { id: 'r2' }],
+    bots: [{ id: 'b1' }, { id: 'b2' }, { id: 'a1' }],
+    unread: new Set(['r1', 'b1']),
+    asks: new Set(['r2']),
+    approvals: [
+      { botId: 'b1', roomId: 'r2' },
+      { botId: 'a1', roomId: 'r1' },
+      { botId: 'b2' },
+      { botId: 'gone' },
+    ],
+  })
+  // Both room-scoped approvals sit with the group chats; the Bot group has only the one
+  // approval that names no room, and the Bot that is not in the section is not counted.
+  assert.deepEqual(counts.rooms, { rows: 2, unread: 1, asks: 1, approvals: 2 })
+  assert.deepEqual(counts.bots, { rows: 3, unread: 1, asks: 0, approvals: 1 })
 })

@@ -5045,6 +5045,20 @@ function groupEntries(order) {
   }
   return { rooms, bots };
 }
+function sectionCounts({ rooms, bots, unread, asks, approvals = [] }) {
+  const counts2 = (items) => {
+    const ids = new Set(items.map((item) => item.id));
+    return {
+      rows: items.length,
+      unread: items.filter((item) => unread.has(item.id)).length,
+      asks: items.filter((item) => asks.has(item.id)).length,
+      approvals: approvals.filter((entry) => entry.roomId !== void 0 && ids.has(entry.roomId)).length
+    };
+  };
+  const botCounts = counts2(bots);
+  botCounts.approvals = approvals.filter((entry) => entry.roomId === void 0 && bots.some((item) => item.id === entry.botId)).length;
+  return { rooms: counts2(rooms), bots: botCounts };
+}
 
 // src/client/sidebar.js
 var import_react9 = require("react");
@@ -5333,9 +5347,14 @@ function useListGlide(listRef, layout, key) {
     tops.current = { layout, map: next };
   }, [layout, key]);
 }
-function Section({ name, count, open, onToggle, children }) {
+function Section({ name, count, numbers, open, onToggle, children }) {
   if (name === void 0) return (0, import_react9.createElement)(import_react9.Fragment, null, children);
   const action = open ? t("Collapse {name}", { name }) : t("Expand {name}", { name });
+  const badges = [
+    ...numbers.unread > 0 ? [(0, import_react9.createElement)("span", { key: "u", className: "bt-side-badge", title: t("Unread activity") }, String(numbers.unread))] : [],
+    ...numbers.asks > 0 ? [(0, import_react9.createElement)("span", { key: "a", className: "bt-side-badge", title: t("Waiting for your answer") }, String(numbers.asks))] : [],
+    ...numbers.approvals > 0 ? [(0, import_react9.createElement)("span", { key: "p", className: "bt-side-badge bt-side-badge-alert", title: t("Waiting for your approval") }, String(numbers.approvals))] : []
+  ];
   return (0, import_react9.createElement)(
     import_react9.Fragment,
     null,
@@ -5351,6 +5370,7 @@ function Section({ name, count, open, onToggle, children }) {
       },
       (0, import_react9.createElement)("span", { className: "bt-side-caret", "aria-hidden": true }, open ? "▾" : "▸"),
       (0, import_react9.createElement)("span", { className: "bt-side-section-name" }, name),
+      ...badges,
       (0, import_react9.createElement)("span", { className: "bt-side-section-count" }, String(count))
     ),
     open ? (0, import_react9.createElement)("div", { className: "bt-side-rows", role: "group", "aria-label": name }, children) : null
@@ -5380,6 +5400,19 @@ function TeamSidebar(props) {
   const main = roster.byId[roster.mainBotId];
   const [sections, setSections] = (0, import_react9.useState)(() => readSections());
   const grouped = (0, import_react9.useMemo)(() => groupEntries(order), [order]);
+  const statuses = props.useSessionStatus ? props.useSessionStatus((map) => map) : void 0;
+  const approvals = props.useWork ? props.useWork((work) => work?.approvals ?? []) : [];
+  const numbers = (0, import_react9.useMemo)(() => {
+    const unread = /* @__PURE__ */ new Set();
+    const asks = /* @__PURE__ */ new Set();
+    for (const entry of order) {
+      const part = entry.item.id;
+      const status = statuses?.get(part);
+      if (markedUnread[entry.item.id] === true || status?.completionUnread === true) unread.add(entry.item.id);
+      if (roster.questions?.[part] !== void 0) asks.add(entry.item.id);
+    }
+    return sectionCounts({ rooms: grouped.rooms.map((entry) => entry.item), bots: grouped.bots.map((entry) => entry.item), unread, asks, approvals });
+  }, [order, grouped, statuses, markedUnread, roster.questions, approvals]);
   const open = wide ? sections : { rooms: true, bots: true };
   const toggle = (id) => {
     const next = { ...sections, [id]: !sections[id] };
@@ -5419,12 +5452,12 @@ function TeamSidebar(props) {
       main ? (0, import_react9.createElement)(BotRow, { ...rowProps, bot: main, marked: markedUnread[main.id] === true }) : roster.ready ? null : (0, import_react9.createElement)("div", { className: "bt-hint" }, t("Setting up your Main Bot…")),
       (0, import_react9.createElement)(
         Section,
-        { key: "rooms", name: wide ? t("Group chats") : void 0, count: grouped.rooms.length, open: open.rooms, onToggle: () => toggle("rooms") },
+        { key: "rooms", name: wide ? t("Group chats") : void 0, count: grouped.rooms.length, numbers: numbers.rooms, open: open.rooms, onToggle: () => toggle("rooms") },
         grouped.rooms.map((entry) => (0, import_react9.createElement)(RoomRow, { key: entry.item.id, ...rowProps, room: entry.item, marked: markedUnread[entry.item.id] === true }))
       ),
       (0, import_react9.createElement)(
         Section,
-        { key: "bots", name: wide ? t("Bots") : void 0, count: grouped.bots.length, open: open.bots, onToggle: () => toggle("bots") },
+        { key: "bots", name: wide ? t("Bots") : void 0, count: grouped.bots.length, numbers: numbers.bots, open: open.bots, onToggle: () => toggle("bots") },
         grouped.bots.map((entry) => entry.kind === "bot" ? (0, import_react9.createElement)(BotRow, { key: entry.item.id, ...rowProps, bot: entry.item, marked: markedUnread[entry.item.id] === true }) : (0, import_react9.createElement)(AgentRow, { key: entry.item.id, ...rowProps, agent: entry.item, marked: markedUnread[entry.item.id] === true }))
       )
     )
@@ -5799,6 +5832,8 @@ var SIDEBAR_CSS = `
 .bt-side-caret{flex:0 0 10px;width:10px;font-size:9px;opacity:.8}
 .bt-side-section-name{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .bt-side-section-count{flex:0 0 auto;font-variant-numeric:tabular-nums;opacity:.7}
+.bt-side-badge{flex:0 0 auto;min-width:16px;padding:0 4px;border-radius:8px;background:var(--bt-hover);color:var(--bt-ink-2);font-size:10px;line-height:16px;text-align:center;font-variant-numeric:tabular-nums}
+.bt-side-badge-alert{background:color-mix(in srgb,var(--bt-accent) 78%,var(--bt-sidebar));color:var(--bt-accent-ink,#fff)}
 .bt-side-rows{display:flex;flex-direction:column;gap:3px}
 .bt-side-top .bt-brand{cursor:default;padding-left:6px}
 .bt-side-top .bt-brand:hover{background:none}

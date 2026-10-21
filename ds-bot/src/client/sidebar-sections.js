@@ -51,3 +51,22 @@ export function groupEntries(order) {
   }
   return { rooms, bots }
 }
+
+// What a folded section says inside it: how many rows it holds, and the three things the user
+// may need to act on. Everything is counted from the rows the section actually shows, so a
+// hidden Bot is not counted at all. An approval that names a room belongs to the group chats
+// and is never counted again under Bots.
+export function sectionCounts({ rooms, bots, unread, asks, approvals = [] }) {
+  const counts = (items) => {
+    const ids = new Set(items.map(item => item.id))
+    return {
+      rows: items.length,
+      unread: items.filter(item => unread.has(item.id)).length,
+      asks: items.filter(item => asks.has(item.id)).length,
+      approvals: approvals.filter(entry => entry.roomId !== undefined && ids.has(entry.roomId)).length,
+    }
+  }
+  const botCounts = counts(bots)
+  botCounts.approvals = approvals.filter(entry => entry.roomId === undefined && bots.some(item => item.id === entry.botId)).length
+  return { rooms: counts(rooms), bots: botCounts }
+}

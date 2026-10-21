@@ -11,7 +11,7 @@ import { Shimmer, workPhrase } from './cells.js'
 import { springEasing, SPRING_SHAPE } from './motion.js'
 import { hostText, t } from './i18n.js'
 import { showsDshRow } from './dsh-offer.js'
-import { groupEntries, readSections, writeSections } from './sidebar-sections.js'
+import { groupEntries, readSections, sectionCounts, writeSections } from './sidebar-sections.js'
 
 // -------------------------------------------------------------------------
 // Sidebar
@@ -245,10 +245,16 @@ function useListGlide(listRef, layout, key) {
 }
 
 // One foldable group of rows. Its count is the rows the group holds, so a folded section
-// still says how much is inside it. The narrow rail passes no name and shows every row.
-function Section({ name, count, open, onToggle, children }) {
+// still says how much is inside it; the badges say how much of it needs the user. The narrow
+// rail passes no name and shows every row.
+function Section({ name, count, numbers, open, onToggle, children }) {
   if (name === undefined) return h(Fragment, null, children)
   const action = open ? t('Collapse {name}', { name }) : t('Expand {name}', { name })
+  const badges = [
+    ...(numbers.unread > 0 ? [h('span', { key: 'u', className: 'bt-side-badge', title: t('Unread activity') }, String(numbers.unread))] : []),
+    ...(numbers.asks > 0 ? [h('span', { key: 'a', className: 'bt-side-badge', title: t('Waiting for your answer') }, String(numbers.asks))] : []),
+    ...(numbers.approvals > 0 ? [h('span', { key: 'p', className: 'bt-side-badge bt-side-badge-alert', title: t('Waiting for your approval') }, String(numbers.approvals))] : []),
+  ]
   return h(Fragment, null,
     h('button', {
       type: 'button', className: 'bt-side-section', 'aria-expanded': open ? 'true' : 'false',
@@ -256,6 +262,7 @@ function Section({ name, count, open, onToggle, children }) {
     },
       h('span', { className: 'bt-side-caret', 'aria-hidden': true }, open ? '▾' : '▸'),
       h('span', { className: 'bt-side-section-name' }, name),
+      ...badges,
       h('span', { className: 'bt-side-section-count' }, String(count))),
     open ? h('div', { className: 'bt-side-rows', role: 'group', 'aria-label': name }, children) : null)
 }
@@ -284,6 +291,21 @@ export function TeamSidebar(props) {
   const main = roster.byId[roster.mainBotId]
   const [sections, setSections] = useState(() => readSections())
   const grouped = useMemo(() => groupEntries(order), [order])
+  // What the folded headers say: the same signals the rows show, counted over the rows a
+  // section actually has, so a hidden Bot is never part of the number.
+  const statuses = (props.useSessionStatus ? props.useSessionStatus(map => map) : undefined)
+  const approvals = (props.useWork ? props.useWork(work => work?.approvals ?? []) : [])
+  const numbers = useMemo(() => {
+    const unread = new Set()
+    const asks = new Set()
+    for (const entry of order) {
+      const part = entry.item.id
+      const status = statuses?.get(part)
+      if (markedUnread[entry.item.id] === true || status?.completionUnread === true) unread.add(entry.item.id)
+      if (roster.questions?.[part] !== undefined) asks.add(entry.item.id)
+    }
+    return sectionCounts({ rooms: grouped.rooms.map(entry => entry.item), bots: grouped.bots.map(entry => entry.item), unread, asks, approvals })
+  }, [order, grouped, statuses, markedUnread, roster.questions, approvals])
   // The narrow rail is icons only: folding there would leave nothing to open a chat with.
   const open = wide ? sections : { rooms: true, bots: true }
   const toggle = (id) => {
@@ -314,9 +336,9 @@ export function TeamSidebar(props) {
     wide && roster.readOnly ? h('div', { className: 'bt-hint bt-read-only', role: 'status' }, hostText(roster.readOnly)) : null,
     h('div', { ref: listRef, className: 'bt-list', role: 'region', 'aria-label': t('Bot list') },
       main ? h(BotRow, { ...rowProps, bot: main, marked: markedUnread[main.id] === true }) : roster.ready ? null : h('div', { className: 'bt-hint' }, t('Setting up your Main Bot…')),
-      h(Section, { key: 'rooms', name: wide ? t('Group chats') : undefined, count: grouped.rooms.length, open: open.rooms, onToggle: () => toggle('rooms') },
+      h(Section, { key: 'rooms', name: wide ? t('Group chats') : undefined, count: grouped.rooms.length, numbers: numbers.rooms, open: open.rooms, onToggle: () => toggle('rooms') },
         grouped.rooms.map(entry => h(RoomRow, { key: entry.item.id, ...rowProps, room: entry.item, marked: markedUnread[entry.item.id] === true }))),
-      h(Section, { key: 'bots', name: wide ? t('Bots') : undefined, count: grouped.bots.length, open: open.bots, onToggle: () => toggle('bots') },
+      h(Section, { key: 'bots', name: wide ? t('Bots') : undefined, count: grouped.bots.length, numbers: numbers.bots, open: open.bots, onToggle: () => toggle('bots') },
         grouped.bots.map(entry => (entry.kind === 'bot'
           ? h(BotRow, { key: entry.item.id, ...rowProps, bot: entry.item, marked: markedUnread[entry.item.id] === true })
           : h(AgentRow, { key: entry.item.id, ...rowProps, agent: entry.item, marked: markedUnread[entry.item.id] === true }))))))
@@ -642,6 +664,8 @@ export const SIDEBAR_CSS = `
 .bt-side-caret{flex:0 0 10px;width:10px;font-size:9px;opacity:.8}
 .bt-side-section-name{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .bt-side-section-count{flex:0 0 auto;font-variant-numeric:tabular-nums;opacity:.7}
+.bt-side-badge{flex:0 0 auto;min-width:16px;padding:0 4px;border-radius:8px;background:var(--bt-hover);color:var(--bt-ink-2);font-size:10px;line-height:16px;text-align:center;font-variant-numeric:tabular-nums}
+.bt-side-badge-alert{background:color-mix(in srgb,var(--bt-accent) 78%,var(--bt-sidebar));color:var(--bt-accent-ink,#fff)}
 .bt-side-rows{display:flex;flex-direction:column;gap:3px}
 .bt-side-top .bt-brand{cursor:default;padding-left:6px}
 .bt-side-top .bt-brand:hover{background:none}
