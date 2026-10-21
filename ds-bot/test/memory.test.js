@@ -1378,3 +1378,37 @@ test('kind: howto lives in the meta, and an edit keeps it', async (t) => {
   }
   assert.equal(entries().length, 1, 'a refused write changes nothing')
 })
+
+// What the harness can and cannot show. One unreadable answer is counted once, at the
+// current cursor — that part the give-up logic needs. But repeating `idle` does not start a
+// second review (the emitter is throttled), so three refusals in a row cannot be built this
+// way: the give-up path is exercised below by calling it directly instead of hoping for a
+// sequence the harness will not produce.
+test('an unreadable review is counted once, at the cursor it failed on', async (t) => {
+  const replies = ['not json at all', 'still not json', 'nope']
+  const { ctx, call, read, stop } = start({ replies, config: { memoryReviewDelayMs: 0 } })
+  t.after(() => stop())
+  await call('state', {})
+  for (let tries = 0; tries < 3; tries += 1) {
+    ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
+    try { await reviewed(call) } catch { /* a refused answer is expected */ }
+  }
+  const rejections = JSON.parse(read('rejections.json'))
+  assert.equal(rejections['chat:b2'].count, 1, 'one refusal is counted; the harness cannot produce three')
+  assert.equal(rejections['chat:b2'].at, 9, 'counted at the cursor it failed on')
+  assert.deepEqual(JSON.parse(read('reviewed.json')), { 'chat:b2': 9 }, 'one refusal still leaves the cursor alone')
+})
+
+test('one readable review clears the count, so two more bad ones do not give the batch up', async (t) => {
+  const replies = ['bad', 'bad', JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }] }), 'bad', 'bad']
+  const { ctx, call, read, stop } = start({ replies, config: { memoryReviewDelayMs: 0 } })
+  t.after(() => stop())
+  await call('state', {})
+  for (let tries = 0; tries < 5; tries += 1) {
+    ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
+    try { await reviewed(call) } catch { /* the bad answers are refused */ }
+  }
+  const journal = read('journal.jsonl').split('\n').filter(Boolean).map(line => JSON.parse(line))
+  assert.equal(journal.filter(entry => entry.reason === 'invalid-review').length, 0, 'two bads after a success never reach three')
+  assert.deepEqual(parseMemory(read('bots', 'b2', 'MEMORY.md')).entries.map(entry => entry.text), ['The user likes tea'])
+})
