@@ -76,6 +76,7 @@ test('apply registers listeners, tools, and effects in a fixed order', (t) => {
     'prompt bot-memory 645',
     'tool remember',
     'tool forget',
+    'tool move',
     'tool recall',
     'on agent/status',
     'effect ds-bot: memory review',
