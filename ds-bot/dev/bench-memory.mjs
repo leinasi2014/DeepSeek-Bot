@@ -22,6 +22,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, copyFileSync } from 'node:fs'
 import { join, resolve, sep, basename } from 'node:path'
 import { parseArgs } from 'node:util'
+import { a2Pass, cursorProgress } from './bench-rules.mjs'
 
 const { values: args, positionals } = parseArgs({
   allowPositionals: true,
@@ -308,12 +309,17 @@ async function roundA2(round) {
   report.startStats = scopeStats(chief)
   report.startEntries = report.startStats.team.body
   report.startChars = report.startStats.team.chars
-  const cursorBefore = reviewed()
   let reviews = 0
   const writes = []
   // The team file is the one that fills up, so this round asks for team writes first; own is
-  // the control. The review still chooses the scope, and both are reported.
-  await step('scope primer', () => send(chief.id, '以后团队相关的事请写进团队记忆（remember 带 scope: "team"）；个人偏好可以写我自己的记忆。'))
+  // the control. The review still chooses the scope, and both are reported. The primer's turn
+  // is inside the window the files are measured over, so its reviews and writes count here.
+  const primer = await step('scope primer', () => send(chief.id, '以后团队相关的事请写进团队记忆（remember 带 scope: "team"）；个人偏好可以写我自己的记忆。'))
+  reviews += primer.calls.filter(call => call.kind === 'review').length
+  writes.push(...primer.writes)
+  // Read after the primer: the twenty inputs themselves have to move the review's place, or a
+  // primer that moved it would make a batch phase that never reviewed look like progress.
+  const cursorStart = reviewed()
   // Batches of four keep the turn count, and the cost, bounded.
   for (let index = 0; index < REVIEW_INPUT.length; index += 4) {
     const batch = REVIEW_INPUT.slice(index, index + 4)
@@ -327,14 +333,10 @@ async function roundA2(round) {
   report.endEntries = report.endStats.team.body
   report.endChars = report.endStats.team.chars
   report.reviews = reviews
-  // The cursor is a number per key. Read this run's key and require a strict increase; a
-  // different key changing, or the key going backwards, is not progress.
   const cursorAfter = reviewed()
-  const cursorKeys = [...new Set([...Object.keys(cursorBefore), ...Object.keys(cursorAfter)])]
-  const advancedKeys = cursorKeys.filter(key => Number(cursorAfter[key] ?? 0) > Number(cursorBefore[key] ?? 0))
-  const regressedKeys = cursorKeys.filter(key => Number(cursorAfter[key] ?? 0) < Number(cursorBefore[key] ?? 0))
-  report.cursor = { advanced: advancedKeys, advancedTo: Object.fromEntries(advancedKeys.map(key => [key, cursorAfter[key]])), regressed: regressedKeys }
-  report.cursorMoved = advancedKeys.length > 0 && regressedKeys.length === 0
+  const cursor = cursorProgress(cursorStart, cursorAfter)
+  report.cursor = { advanced: cursor.advanced, advancedTo: Object.fromEntries(cursor.advanced.map(key => [key, cursorAfter[key]])), regressed: cursor.regressed }
+  report.cursorMoved = cursor.moved
   report.delta = report.endEntries - report.startEntries
   report.ownDelta = report.endStats.own.body - report.startStats.own.body
   report.overLimit = [report.startStats.team, report.endStats.team, report.startStats.own, report.endStats.own].some(scope => scope.chars > 4_000)
@@ -354,12 +356,11 @@ async function roundA2(round) {
     file: event.file ?? null,
     text: event.after ?? event.text ?? event.before ?? '',
   })).filter(sample => sample.text !== '')
-  // Team is the primary criterion: the review had to run, the team cursor strictly advanced
-  // without going backwards, the team file stayed under its limit at start and end, team
-  // growth stayed within +14, and at least one replace happened on the team memory. Own is
-  // reported as a control.
-  report.pass = report.delta <= 14 && !report.overLimit && report.cursorMoved && reviews >= 1 && report.teamReplaces >= 1
-  say(`  A2 r${round}: team Δ${report.delta} (replace ${report.teamReplaces}), own Δ${report.ownDelta} (replace ${report.ownReplaces}), reviews ${reviews}, skip ${report.skips}, move ${report.moves}, cursor ${report.cursorMoved} (${advancedKeys.length} advanced, ${regressedKeys.length} regressed), ${statLine(report.endStats)} ${report.pass ? 'PASS' : 'FAIL'}`)
+  // Mechanical only: the team review had to run and replace something, the review's place had
+  // to move through the twenty inputs themselves, and neither file may pass its growth budget
+  // or its size limit. Both files are judged: growth moved to one file is still growth.
+  report.pass = a2Pass({ delta: report.delta, ownDelta: report.ownDelta, teamReplaces: report.teamReplaces, overLimit: report.overLimit, cursorMoved: report.cursorMoved, reviews })
+  say(`  A2 r${round}: team Δ${report.delta} (replace ${report.teamReplaces}), own Δ${report.ownDelta} (replace ${report.ownReplaces}), reviews ${reviews}, skip ${report.skips}, move ${report.moves}, cursor ${report.cursorMoved} (${cursor.advanced.length} advanced, ${cursor.regressed.length} regressed), ${statLine(report.endStats)} ${report.pass ? 'PASS' : 'FAIL'}`)
   return report
 }
 
