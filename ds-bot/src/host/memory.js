@@ -286,13 +286,17 @@ export function parseReview(text) {
   if (value === null || typeof value !== 'object' || !Array.isArray(value.changes)) return undefined
   return value.changes.every(wellFormed) ? value.changes : undefined
 }
+// The one place a type is judged, shared by add and edit: left out means "keep what the
+// entry has", and "howto" is the only type there is. Anything else is refused rather than
+// silently ignored, so the model learns its change did not happen.
+const kindOk = value => value === undefined || value === 'howto'
 const wellFormed = (change) => {
   if (change === null || typeof change !== 'object') return false
   const texted = typeof change.text === 'string' && change.text.trim() !== ''
   const numbered = Number.isInteger(Number(change.entry)) && Number(change.entry) >= 1
-  if (change.op === 'add') return texted && (change.topic === undefined || typeof change.topic === 'string') && (change.team === undefined || typeof change.team === 'boolean') && (change.kind === undefined || change.kind === 'howto')
-  if (change.op === 'move') return texted && numbered && typeof change.topic === 'string' && change.topic.trim() !== ''
-  if (change.op === 'edit') return texted && numbered
+  if (change.op === 'add') return texted && (change.topic === undefined || typeof change.topic === 'string') && (change.team === undefined || typeof change.team === 'boolean') && kindOk(change.kind)
+  if (change.op === 'move') return texted && numbered && typeof change.topic === 'string' && change.topic.trim() !== '' && kindOk(change.kind)
+  if (change.op === 'edit') return texted && numbered && kindOk(change.kind)
   return change.op === 'remove' && numbered
 }
 
