@@ -1474,3 +1474,45 @@ test('one readable review clears the count, so two more bad ones do not give the
   // Every queued answer was really sent, so "two bads after a success" means something.
   assert.equal(requests.length, 5, 'a review ran on every turn')
 })
+
+// What a cleared count means for the batches themselves: after a readable answer moves
+// the cursor on, the next reviews read only what arrived since — each failure count
+// belongs to the batch at its own cursor, and no batch is read twice after it succeeded.
+test('after a cleared count, the next reviews each read their own new lines', async (t) => {
+  const replies = ['bad one', 'bad two', JSON.stringify({ changes: [] }), 'bad three', 'bad four']
+  const lines = [
+    { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'seed line' }] } } },
+    { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Saved.' }] } } } },
+  ]
+  const { ctx, call, read, requests, home, stop } = start({ replies, history: { b2: lines }, config: { memoryReviewDelayMs: 0 } })
+  t.after(() => stop())
+  await call('state', {})
+  for (let tries = 0; tries < 5; tries += 1) {
+    lines.push({ event: { seq: 12 + tries, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: `line ${tries}` }] } } })
+    ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'working' })
+    ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
+    try { await reviewed(call) } catch (error) { if (!/not a list of changes/.test(String(error))) throw error }
+  }
+  const promptOf = request => (request.messages ?? []).flatMap(message => message.content ?? []).map(part => part.text ?? '').join('\n')
+  // Only the "New in" block is the batch this review reads; the "Earlier" block above it
+  // is context from before, and legitimately repeats older lines.
+  const freshOf = request => promptOf(request).split(/New in [^\n]*\n/)[1] ?? ''
+  assert.equal(requests.length, 5, 'a review ran on every turn')
+  // The first three attempts share one batch (the two failures reread it), and the
+  // readable answer consumes it.
+  assert.match(freshOf(requests[0]), /User: line 0/, 'the first review reads the first batch')
+  assert.match(freshOf(requests[2]), /User: line 2/, 'the readable review reads the batch grown to line 2')
+  // After the cleared count the cursor is past that batch: the next reviews read only
+  // what arrived since, never the lines the readable answer already consumed.
+  assert.match(freshOf(requests[3]), /User: line 3/, 'the first review after the clear runs on the new batch')
+  assert.doesNotMatch(freshOf(requests[3]), /User: line 2/, 'the consumed batch is not reread')
+  assert.match(freshOf(requests[4]), /User: line 4/, 'the second review after the clear runs too, and rereads only its own pending batch')
+  // This scenario writes nothing on purpose (the readable answer has no changes), so the
+  // journal may not exist at all — which is itself the absence of any give-up record.
+  const journal = existsSync(join(home, 'memory', 'journal.jsonl')) ? read('journal.jsonl').split('\n').filter(Boolean).map(line => JSON.parse(line)) : []
+  assert.equal(journal.filter(entry => entry.reason === 'invalid-review').length, 0, 'the counts on both sides of the clear stay independent, so nobody reaches three')
+  assert.equal(JSON.parse(read('reviewed.json'))['chat:b2'], 14, 'the cursor stands at the end of the batch the clear consumed; the two later failures have not given theirs up')
+  // The counter after the clear counts only the new batch: two failures at cursor 14,
+  // nothing carried over from the two before the readable answer.
+  assert.deepEqual(JSON.parse(read('rejections.json'))['chat:b2'], { count: 2, at: 14 }, 'the count restarted at the new batch')
+})
