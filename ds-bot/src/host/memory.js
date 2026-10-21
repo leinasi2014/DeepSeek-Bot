@@ -97,6 +97,32 @@ export function formatEntry(text, meta = {}) {
   return `- ${text}${pairs.length > 0 ? ` [${pairs.join('; ')}]` : ''}`
 }
 
+// The atomic write: a temp file, then a rename over the target. On Windows the rename
+// can be refused for a beat while another process has just created the target (issue
+// #20: on the bench machine the refusal was transient — an immediate retry landed —
+// and by the time it was observed no process held the file). So retry once, and never
+// leave the temp file behind when the write fails for good.
+export async function writeTextTo(path, text, warn = () => {}) {
+  await mkdir(dirname(path), { recursive: true })
+  const temp = `${path}.${process.pid}.tmp`
+  await writeFile(temp, text, 'utf8')
+  try {
+    await rename(temp, path)
+  } catch (first) {
+    try {
+      await rename(temp, path)
+      warn('ds-bot: atomic write to %s was refused once (%s) and landed on the retry', path, first?.code ?? first)
+      return
+    } catch {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try { await unlink(temp); break } catch {}
+      }
+      warn('ds-bot: atomic write to %s failed (%s); the target was not replaced', path, first?.code ?? first)
+      throw first
+    }
+  }
+}
+
 // One line, without a bullet or metadata of its own: the tool adds those.
 export function cleanEntry(raw) {
   const line = String(raw ?? '').replace(/\s+/g, ' ').trim().replace(/^(?:[-*•]\s+)+/, '')
@@ -471,10 +497,7 @@ export function install(rt) {
   const fileName = file => (file.topic === undefined ? MAIN : `topic [[${file.topic}]]`)
 
   async function writeText(path, text) {
-    await mkdir(dirname(path), { recursive: true })
-    const temp = `${path}.${process.pid}.tmp`
-    await writeFile(temp, text, 'utf8')
-    await rename(temp, path)
+    await writeTextTo(path, text, rt.warn)
   }
   async function journal(record) {
     await mkdir(root, { recursive: true })
