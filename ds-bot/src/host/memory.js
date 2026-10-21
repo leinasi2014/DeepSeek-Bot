@@ -338,6 +338,7 @@ const ASK_SYSTEM = [
   '- reply: one to three short sentences to the user. Say what you changed, or answer the question; when the entries do not say, say so. The user does not see the entry numbers, so never mention them.',
   '- changes: empty unless the user asks to add, correct, or remove something. Each change is one of',
   '  {"op": "add", "text": "…", "team": false}  a new entry; team true only when the user wants every Bot to know it',
+  '  {"op": "add", "text": "…", "topic": "travel"}  a detail only some conversations need, or how to do something (a command, a pitfall); a short topic name, in the user\'s language',
   '  {"op": "edit", "entry": 3, "text": "…"}  replaces entry 3',
   '  {"op": "remove", "entry": 3}  removes entry 3',
   `- An entry is one short, self-contained fact of at most ${MEMORY_LIMITS.entry} characters that says whom it is about: "The user writes code in Vim", not "Writes code in Vim". Never save keys or passwords.`,
@@ -1086,17 +1087,23 @@ export function install(rt) {
       const scope = op === 'add' ? (change.team === true ? TEAM : ownScope(bot.id)) : target?.scope === 'team' ? TEAM : ownScope(bot.id)
       const label = scope.kind === 'team' ? 'the team memory' : `${bot.name}'s memory`
       const next = cleanEntry(change?.text)
+      // An add may choose a topic; edit and remove keep the entry where it is.
+      const { topic, error: topicError } = op === 'add' ? topicArg(change?.topic) : {}
       try {
+        if (op === 'add' && topicError) throw new Error(topicError)
         if (op !== 'add' && target === undefined) throw new Error(`There is no entry ${change?.entry}.`)
         if (op === 'add' || op === 'edit') {
           const problem = entryProblem(next)
           if (problem) throw new Error(problem)
         }
-        if (op === 'add') await addEntry({ scope, text: next, meta, actor: USER, label })
-        else if (op === 'edit') await replaceEntry({ scope, topic: target.file.topic, match: target.text, text: next, meta, actor: USER, label })
+        // An add that duplicates an entry already in the scope writes nothing, so the
+        // panel must not report it as saved: it says where the entry is instead.
+        const landed = op === 'add' ? await addEntry({ scope, topic, text: next, meta, actor: USER, label }) : undefined
+        if (landed !== undefined && !landed.changed) throw new Error(landed.message)
+        if (op === 'edit') await replaceEntry({ scope, topic: target.file.topic, match: target.text, text: next, meta, actor: USER, label })
         else if (op === 'remove') await removeEntry({ scope, topic: target.file.topic, match: target.text, actor: USER, label })
-        else continue
-        changes.push({ op, scope: scope.kind === 'team' ? 'team' : 'own', text: op === 'remove' ? target.text : next, ...(op === 'edit' ? { before: target.text } : {}), ok: true })
+        else if (op !== 'add') continue
+        changes.push({ op, scope: scope.kind === 'team' ? 'team' : 'own', text: op === 'remove' ? target.text : next, ...(landed?.file.topic !== undefined ? { topic: landed.file.topic } : {}), ...(op === 'edit' ? { before: target.text } : {}), ok: true })
       } catch (failure) {
         changes.push({ op, scope: scope.kind === 'team' ? 'team' : 'own', text: next || target?.text || '', ok: false, error: failure.message })
       }
