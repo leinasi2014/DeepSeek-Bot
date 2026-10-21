@@ -11,6 +11,7 @@ import { Shimmer, workPhrase } from './cells.js'
 import { springEasing, SPRING_SHAPE } from './motion.js'
 import { hostText, t } from './i18n.js'
 import { showsDshRow } from './dsh-offer.js'
+import { readSections, sectionCounts, writeSections } from './sidebar-sections.js'
 
 // -------------------------------------------------------------------------
 // Sidebar
@@ -243,6 +244,29 @@ function useListGlide(listRef, layout, key) {
   }, [layout, key])
 }
 
+// One foldable group of rows. Its count is the rows the group holds, so a folded section
+// still says how much is inside it; the badges say how much of it needs the user. The narrow
+// rail passes no name and shows every row.
+function Section({ name, numbers, open, onToggle, children }) {
+  if (name === undefined) return h(Fragment, null, children)
+  const action = open ? t('Collapse {name}', { name }) : t('Expand {name}', { name })
+  const badges = [
+    ...(numbers.unread > 0 ? [h('span', { key: 'u', className: 'bt-side-badge', title: t('Unread activity') }, String(numbers.unread))] : []),
+    ...(numbers.asks > 0 ? [h('span', { key: 'a', className: 'bt-side-badge', title: t('Waiting for your answer') }, String(numbers.asks))] : []),
+    ...(numbers.approvals > 0 ? [h('span', { key: 'p', className: 'bt-side-badge bt-side-badge-alert', title: t('Waiting for your approval') }, String(numbers.approvals))] : []),
+  ]
+  return h(Fragment, null,
+    h('button', {
+      type: 'button', className: 'bt-side-section', 'aria-expanded': open ? 'true' : 'false',
+      'aria-label': `${name}, ${numbers.rows}. ${action}`, title: action, onClick: onToggle,
+    },
+      h('span', { className: 'bt-side-caret', 'aria-hidden': true }, open ? '▾' : '▸'),
+      h('span', { className: 'bt-side-section-name' }, name),
+      ...badges,
+      h('span', { className: 'bt-side-section-count' }, String(numbers.rows))),
+    open ? h('div', { className: 'bt-side-rows', role: 'group', 'aria-label': name }, children) : null)
+}
+
 export function TeamSidebar(props) {
   const { wide, useRoster, useUi, useSessions, actions } = props
   const listRef = useRef(null)
@@ -265,6 +289,53 @@ export function TeamSidebar(props) {
     return entries.sort((a, b) => Number(Boolean(b.item.pinned)) - Number(Boolean(a.item.pinned)) || b.at - a.at)
   }, [roster, updated])
   const main = roster.byId[roster.mainBotId]
+  const [sections, setSections] = useState(() => readSections())
+  // What the folded headers say: the same signals the rows show, over the rows a section really
+  // displays. A Bot's chat Session is not its id once it has moved to a fresh part, an Agent
+  // keeps one Session per conversation, and a row with a pending answer is as much a signal as
+  // an unread one — so the parts are read per row kind, and hidden rows are left out.
+  const partsOf = useMemo(() => order.map((entry) => {
+    const item = entry.item
+    if (entry.kind === 'room') return [item.id]
+    if (entry.kind === 'agent') return item.sessions ?? []
+    return [currentPart(item)]
+  }), [order])
+  // Subscribing to the whole status map would recompute on every Bot's every change; this
+  // string changes only when a flag the headers show does.
+  const statusFlags = (props.useSessionStatus
+    ? props.useSessionStatus(map => JSON.stringify(partsOf.map(parts => parts.map(part => [map.get(part)?.completionUnread === true, map.get(part)?.pendingInteraction !== undefined]))))
+    : '[]')
+  const approvals = (props.useWork ? props.useWork(work => work?.approvals ?? []) : [])
+  // A hidden conversation is still drawn while it is the one that is open, so the headers use
+  // the same rule the rows do: visible means not hidden, or hidden but now open.
+  const activeParts = (props.useSessions
+    ? props.useSessions(list => Object.entries(list.byId ?? {}).filter(([, session]) => (session?.retainedBy?.mainView ?? 0) > 0).map(([part]) => part).join(','))
+    : '')
+  const activeSet = useMemo(() => new Set(activeParts.split(',').filter(Boolean)), [activeParts])
+  const view = useMemo(() => {
+    const flags = JSON.parse(statusFlags)
+    const unread = new Set()
+    const asks = new Set()
+    const rooms = []
+    const bots = []
+    order.forEach((entry, at) => {
+      const item = entry.item
+      const parts = partsOf[at] ?? []
+      const rows = flags[at] ?? []
+      if (item.hidden === true && !parts.some(part => activeSet.has(part))) return
+      if (markedUnread[item.id] === true || rows.some(([isUnread, waiting]) => isUnread || waiting)) unread.add(item.id)
+      if (parts.some(part => roster.questions?.[part] !== undefined)) asks.add(item.id)
+      ;(entry.kind === 'room' ? rooms : bots).push(entry)
+    })
+    return { rooms, bots, numbers: sectionCounts({ rooms: rooms.map(entry => entry.item), bots: bots.map(entry => entry.item), unread, asks, approvals }) }
+  }, [order, partsOf, statusFlags, activeSet, markedUnread, roster.questions, approvals])
+  // The narrow rail is icons only: folding there would leave nothing to open a chat with.
+  const open = wide ? sections : { rooms: true, bots: true }
+  const toggle = (id) => {
+    const next = { ...sections, [id]: !sections[id] }
+    setSections(next)
+    writeSections(next)
+  }
   useListGlide(listRef, wide, order.map(entry => entry.item.id).join(','))
   useLandOnMainBot(roster, useSessions, actions)
   const rowProps = { roster, actions, useSessions, useUi, useSessionStatus: props.useSessionStatus, useSessionRetainInfo: props.useSessionRetainInfo, useActivity: props.useActivity, useWork: props.useWork, wide }
@@ -288,11 +359,12 @@ export function TeamSidebar(props) {
     wide && roster.readOnly ? h('div', { className: 'bt-hint bt-read-only', role: 'status' }, hostText(roster.readOnly)) : null,
     h('div', { ref: listRef, className: 'bt-list', role: 'region', 'aria-label': t('Bot list') },
       main ? h(BotRow, { ...rowProps, bot: main, marked: markedUnread[main.id] === true }) : roster.ready ? null : h('div', { className: 'bt-hint' }, t('Setting up your Main Bot…')),
-      order.map(entry => (entry.kind === 'bot'
-        ? h(BotRow, { key: entry.item.id, ...rowProps, bot: entry.item, marked: markedUnread[entry.item.id] === true })
-        : entry.kind === 'room'
-          ? h(RoomRow, { key: entry.item.id, ...rowProps, room: entry.item, marked: markedUnread[entry.item.id] === true })
-          : h(AgentRow, { key: entry.item.id, ...rowProps, agent: entry.item, marked: markedUnread[entry.item.id] === true })))))
+      h(Section, { key: 'rooms', name: wide ? t('Group chats') : undefined, numbers: view.numbers.rooms, open: open.rooms, onToggle: () => toggle('rooms') },
+        view.rooms.map(entry => h(RoomRow, { key: entry.item.id, ...rowProps, room: entry.item, marked: markedUnread[entry.item.id] === true }))),
+      h(Section, { key: 'bots', name: wide ? t('Bots') : undefined, numbers: view.numbers.bots, open: open.bots, onToggle: () => toggle('bots') },
+        view.bots.map(entry => (entry.kind === 'bot'
+          ? h(BotRow, { key: entry.item.id, ...rowProps, bot: entry.item, marked: markedUnread[entry.item.id] === true })
+          : h(AgentRow, { key: entry.item.id, ...rowProps, agent: entry.item, marked: markedUnread[entry.item.id] === true }))))))
 }
 
 // The update button at the sidebar's top right: a cloud while a newer DS Bot —
@@ -609,6 +681,15 @@ export function BrandName() {
 // and Connect plugins; FooterAccount only shows when the seat went to no one. The
 // shell's footer classes are CSS-module names, so they match on their stems.
 export const SIDEBAR_CSS = `
+.bt-side-section{display:flex;align-items:center;gap:6px;width:100%;padding:8px 8px 2px;border:0;border-radius:8px;background:transparent;color:var(--bt-ink-2);font-family:inherit;font-size:11px;line-height:16px;text-align:left;cursor:pointer}
+.bt-side-section:hover{color:var(--bt-ink)}
+.bt-side-section:focus-visible{outline:2px solid var(--bt-accent);outline-offset:1px}
+.bt-side-caret{flex:0 0 10px;width:10px;font-size:9px;opacity:.8}
+.bt-side-section-name{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bt-side-section-count{flex:0 0 auto;font-variant-numeric:tabular-nums;opacity:.7}
+.bt-side-badge{flex:0 0 auto;min-width:16px;padding:0 4px;border-radius:8px;background:var(--bt-hover);color:var(--bt-ink-2);font-size:10px;line-height:16px;text-align:center;font-variant-numeric:tabular-nums}
+.bt-side-badge-alert{background:color-mix(in srgb,var(--bt-accent) 78%,var(--bt-sidebar));color:var(--bt-accent-ink,#fff)}
+.bt-side-rows{display:flex;flex-direction:column;gap:3px}
 .bt-side-top .bt-brand{cursor:default;padding-left:6px}
 .bt-side-top .bt-brand:hover{background:none}
 .bt-brand .bt-mark{flex:none}
@@ -644,6 +725,7 @@ export const SIDEBAR_CSS = `
 .bt-update-go:active:not(:disabled){transform:scale(.96)}
 .bt-update-go:disabled{opacity:.6;cursor:default}
 .bt-update-dsh:not(:first-child){margin-top:12px;padding-top:12px;border-top:.5px solid var(--bt-line-2)}
+
 @media (prefers-reduced-motion:reduce){.bt-round.bt-update,.bt-update-pop,.bt-update .bt-cloud-arrow{animation:none}}
 
 /* The DSH Agent row and its expanding Session list. The black whale is the

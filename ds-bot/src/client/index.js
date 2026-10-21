@@ -25,7 +25,8 @@ import { FOLDER_CSS } from './folder-menu.js'
 import { USAGE_CSS } from './usage-page.js'
 import { SCHEDULE_CSS } from './schedules.js'
 import { STORAGE, migrateStorage } from './storage.js'
-import { noteLeft, setUnread, sharedMap, toggleReaction } from './shared-map.js'
+import { clearUnreadFor, noteLeft, setUnread, sharedMap, toggleReaction } from './shared-map.js'
+import { unreadNames } from './sidebar-sections.js'
 import { freePriority, groupsFor, readMode, surfaceGroups, writeMode } from './surface.js'
 import { installLocale, language, t } from './i18n.js'
 import { noteClientError, quietly } from './diagnostics.js'
@@ -125,6 +126,12 @@ export function apply(ctx) {
   try { savedPrefs = JSON.parse(localStorage.getItem(PREFS_KEY) ?? '{}') ?? {} } catch { savedPrefs = {} }
   const writeUnread = (id, value) => {
     const unread = unreadStore.update(marks => setUnread(marks, id, value), ui.getSnapshot().unread)
+    ui.set(state => (JSON.stringify(state.unread) === JSON.stringify(unread) ? state : { ...state, unread }))
+  }
+  // Opening a conversation clears every name its mark may sit under, whether or not the row
+  // that shows it is drawn: a folded section must not keep an unread mark alive.
+  const clearUnread = (...ids) => {
+    const unread = unreadStore.update(marks => clearUnreadFor(marks, ...ids), ui.getSnapshot().unread)
     ui.set(state => (JSON.stringify(state.unread) === JSON.stringify(unread) ? state : { ...state, unread }))
   }
   const refreshed = new Set()
@@ -349,12 +356,16 @@ export function apply(ctx) {
       ui.set(state => (state.newChat || state.exchange || state.menu || state.palette ? { ...state, newChat: null, exchange: null, menu: null, palette: null } : state))
       setPlain(false)
       const target = partFor(id)
+      // A Bot that moved to a fresh part keeps its mark under the Bot id, and a search result
+      // hands the opening action the current part: clear every name the conversation holds.
+      clearUnread(...unreadNames([id, target], roster.getSnapshot().bots))
       expected = target
       ctx.uiWorkspace.openSession(target)
     },
     // The conversation replacements withdraw for a plain Session; set the surface
     // before the navigation so the Bot skin never flashes.
     openAgentSession: (sessionId) => {
+      clearUnread(sessionId)
       ui.set(state => ({ ...state, newChat: null, exchange: null, menu: null, palette: null, details: null, view: 'details', renaming: false, tab: null }))
       setPlain(true)
       expected = sessionId
@@ -505,7 +516,7 @@ export function apply(ctx) {
     },
     quote: (sessionId, text) => ui.set(state => ({ ...state, quote: { sessionId, text, token: Date.now() } })),
     clearQuote: token => ui.set(state => (state.quote?.token === token ? { ...state, quote: null } : state)),
-    clearUnread: id => writeUnread(id, false),
+    clearUnread: id => clearUnread(id),
     setFlags: (id, flags) => after(call('set-flags', { id, ...flags })),
     deleteRoom: id => after(call('delete-room', { id })),
     openMenu: (menu) => { ui.set(state => ({ ...state, menu })) },

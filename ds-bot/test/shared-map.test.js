@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createBotBrowsers } from '../src/client/bot-browsers.js'
-import { noteLeft, setUnread, sharedMap, toggleReaction } from '../src/client/shared-map.js'
+import { clearUnreadFor, noteLeft, setUnread, sharedMap, toggleReaction } from '../src/client/shared-map.js'
 import { STORAGE } from '../src/client/storage.js'
 
 // One browser storage that two windows (tabs of DSH Web, or Desktop windows) share.
@@ -84,4 +84,11 @@ test('Bot browser tabs saved by two windows are both kept', () => {
   first.openTab('writer')
   second.openTab('coder')
   assert.deepEqual(Object.keys(JSON.parse(storage.getItem(STORAGE.browsers))).sort(), ['coder', 'writer'])
+})
+
+test('opening a conversation clears its mark under every name it may sit under', () => {
+  const marks = { b1: true, part1: true, r1: true }
+  assert.deepEqual(clearUnreadFor(marks, 'b1', 'part1'), { r1: true })
+  // An id that carries no mark leaves the map itself, so opening a read chat changes nothing.
+  assert.equal(clearUnreadFor(marks, 'none'), marks)
 })

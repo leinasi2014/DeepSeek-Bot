@@ -56,6 +56,10 @@ export function setUnread(unread, id, value) {
   return next
 }
 
+// Opening a conversation clears its mark under every name it may be kept under: the row's id,
+// and the Session part the open chat reads. An id without a mark leaves the map as it was.
+export const clearUnreadFor = (unread, ...ids) => ids.reduce((map, id) => setUnread(map, id, false), unread)
+
 // seen: { [Bot or group id]: when it was last left }. A time never goes back, so a window
 // that closes late with an old copy cannot make seen messages new again.
 export function noteLeft(seen, ids, now) {

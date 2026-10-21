@@ -52,6 +52,8 @@ var ZH = {
   "New chat": "新对话",
   "New…": "新建",
   "Collapse sidebar": "收起侧边栏",
+  "Collapse {name}": "收起{name}",
+  "Expand {name}": "展开{name}",
   "Animation": "动画",
   "Bot animation": "Bot 动画",
   "Quiet": "安静",
@@ -1508,10 +1510,10 @@ var contentText = (content) => (content ?? []).filter((block) => block?.type ===
 var HEADER = /^\[(Message from|Reply from|Group chat|Group post from|Bot team setup|Handoff · part|Secret card)[^\]]*\]\n?/;
 var currentPart = (bot) => bot.sessionId ?? bot.id;
 function reminderPrompts(text) {
-  const one = /^reminder_prompt_json: (.*)$/m.exec(text);
+  const one2 = /^reminder_prompt_json: (.*)$/m.exec(text);
   const batch = /^reminders_json: (.*)$/m.exec(text);
   try {
-    const prompts = [...one ? [JSON.parse(one[1])] : [], ...batch ? JSON.parse(batch[1]).map((entry) => entry.reminder_prompt) : []];
+    const prompts = [...one2 ? [JSON.parse(one2[1])] : [], ...batch ? JSON.parse(batch[1]).map((entry) => entry.reminder_prompt) : []];
     return prompts.filter((prompt) => typeof prompt === "string" && prompt.trim() !== "");
   } catch {
     return [];
@@ -3740,7 +3742,7 @@ function AddSecret({ actions, run, onDone }) {
     )
   );
 }
-function SecretsPage({ roster, actions, run, Section }) {
+function SecretsPage({ roster, actions, run, Section: Section2 }) {
   const [open, setOpen] = (0, import_react5.useState)(null);
   const [adding, setAdding] = (0, import_react5.useState)(false);
   const secrets = roster.secrets ?? [];
@@ -3755,7 +3757,7 @@ function SecretsPage({ roster, actions, run, Section }) {
       t(" before anything goes to a model.")
     ),
     (0, import_react5.createElement)(
-      Section,
+      Section2,
       { key: "list", title: t("Secrets · {count}", { count: secrets.length }) },
       secrets.length === 0 && !adding ? (0, import_react5.createElement)("div", { className: "bt-set-row" }, (0, import_react5.createElement)("span", { className: "bt-set-hint" }, t("No keys yet. When a Bot needs one, it shows a card in its chat."))) : null,
       secrets.map((secret) => (0, import_react5.createElement)(SecretRow, { key: secret.name, secret, roster, actions, run, open: open === secret.name, onToggle: () => setOpen(open === secret.name ? null : secret.name) })),
@@ -4937,6 +4939,136 @@ function showsDshRow(dsh, app) {
   return dsh.kind === "app" && APP_OFFER.has(app?.phase) && sameVersion(app.version, dsh.verified);
 }
 
+// src/client/storage.js
+var STORAGE = {
+  unread: "ds-bot:unread",
+  reactions: "ds-bot:reactions",
+  seen: "ds-bot:seen",
+  prefs: "ds-bot:prefs",
+  surface: "ds-bot:surface",
+  agentSessions: "ds-bot:agent-sessions",
+  browserWidth: "ds-bot:browser-width",
+  browsers: "ds-bot.browser.v2",
+  ui: "ds-bot:ui"
+};
+var LEGACY_PREFIXES = ["dsh-bot:", "dsh-bot-team:"];
+var LEGACY_BROWSER_KEYS = ["ds-bot.browser.v1", "dsh-bot.browser.v1"];
+var LEGACY_THEMES = { grok: "mono" };
+function legacyKeys(key) {
+  if (key === STORAGE.browsers) return LEGACY_BROWSER_KEYS;
+  const name = key.slice(key.indexOf(":") + 1);
+  return LEGACY_PREFIXES.map((prefix) => `${prefix}${name}`);
+}
+var migrateBrowsers = (storage) => {
+  if (storage.getItem(STORAGE.browsers) !== null) {
+    for (const key of LEGACY_BROWSER_KEYS) storage.removeItem(key);
+    return;
+  }
+  for (const key of LEGACY_BROWSER_KEYS) {
+    try {
+      const value = storage.getItem(key);
+      if (value === null) continue;
+      const previous = JSON.parse(value) ?? {};
+      const tabs = Object.fromEntries(Object.entries(previous).filter(([, page]) => page && typeof page === "object").map(([botId, page]) => {
+        const tab = { id: `v1-${botId}`, url: page.url ?? "", title: page.title ?? "" };
+        return [botId, { tabs: [tab], active: tab.id }];
+      }));
+      storage.setItem(STORAGE.browsers, JSON.stringify(tabs));
+      for (const earlier of LEGACY_BROWSER_KEYS) storage.removeItem(earlier);
+      return;
+    } catch {
+    }
+  }
+};
+function migrateStorage(storage = globalThis.localStorage) {
+  for (const key of Object.values(STORAGE)) {
+    if (key === STORAGE.browsers) continue;
+    for (const legacy of legacyKeys(key)) {
+      try {
+        const value = storage.getItem(legacy);
+        if (value !== null && storage.getItem(key) === null) storage.setItem(key, value);
+        storage.removeItem(legacy);
+      } catch {
+      }
+    }
+  }
+  try {
+    migrateBrowsers(storage);
+  } catch {
+  }
+  try {
+    const prefs = JSON.parse(storage.getItem(STORAGE.prefs) ?? "null");
+    if (prefs && Object.hasOwn(LEGACY_THEMES, prefs.theme ?? "")) {
+      storage.setItem(STORAGE.prefs, JSON.stringify({ ...prefs, theme: LEGACY_THEMES[prefs.theme] }));
+    }
+  } catch {
+  }
+}
+
+// src/client/sidebar-sections.js
+var DEFAULT_SECTIONS = Object.freeze({ rooms: true, bots: true });
+var one = (value, fallback) => typeof value === "boolean" ? value : fallback;
+function readSections(storage = globalThis.localStorage) {
+  try {
+    const raw = storage?.getItem(STORAGE.ui);
+    if (typeof raw !== "string" || raw === "") return { ...DEFAULT_SECTIONS };
+    const value = JSON.parse(raw);
+    if (value === null || typeof value !== "object") return { ...DEFAULT_SECTIONS };
+    const sections = value.sections;
+    if (sections === null || typeof sections !== "object") return { ...DEFAULT_SECTIONS };
+    return { rooms: one(sections.rooms, true), bots: one(sections.bots, true) };
+  } catch {
+    return { ...DEFAULT_SECTIONS };
+  }
+}
+function writeSections(next, storage = globalThis.localStorage) {
+  try {
+    const raw = storage?.getItem(STORAGE.ui);
+    let held = {};
+    try {
+      const value = typeof raw === "string" && raw !== "" ? JSON.parse(raw) : {};
+      if (value !== null && typeof value === "object") held = value;
+    } catch {
+      held = {};
+    }
+    const sections = { ...readSections(storage), ...next };
+    storage?.setItem(STORAGE.ui, JSON.stringify({ ...held, sections }));
+  } catch {
+  }
+}
+function groupEntries(order) {
+  const rooms = [];
+  const bots = [];
+  for (const entry of order) {
+    if (entry.kind === "room") rooms.push(entry);
+    else bots.push(entry);
+  }
+  return { rooms, bots };
+}
+function sectionCounts({ rooms, bots, unread, asks, approvals = [] }) {
+  const counts2 = (items) => {
+    const ids = new Set(items.map((item) => item.id));
+    return {
+      rows: items.length,
+      unread: items.filter((item) => unread.has(item.id)).length,
+      asks: items.filter((item) => asks.has(item.id)).length,
+      approvals: approvals.filter((entry) => entry.roomId !== void 0 && ids.has(entry.roomId)).length
+    };
+  };
+  const botIds = new Set(bots.map((item) => item.id));
+  const botCounts = counts2(bots);
+  botCounts.approvals = approvals.filter((entry) => entry.roomId === void 0 && botIds.has(entry.botId)).length;
+  return { rooms: counts2(rooms), bots: botCounts };
+}
+function unreadNames(ids, bots) {
+  const names = new Set(ids);
+  for (const id of ids) {
+    const bot = bots.find((item) => item.id === id || currentPart(item) === id);
+    if (bot !== void 0) names.add(bot.id);
+  }
+  return [...names];
+}
+
 // src/client/sidebar.js
 var import_react9 = require("react");
 var import_react_dom3 = require("react-dom");
@@ -5224,6 +5356,35 @@ function useListGlide(listRef, layout, key) {
     tops.current = { layout, map: next };
   }, [layout, key]);
 }
+function Section({ name, numbers, open, onToggle, children }) {
+  if (name === void 0) return (0, import_react9.createElement)(import_react9.Fragment, null, children);
+  const action = open ? t("Collapse {name}", { name }) : t("Expand {name}", { name });
+  const badges = [
+    ...numbers.unread > 0 ? [(0, import_react9.createElement)("span", { key: "u", className: "bt-side-badge", title: t("Unread activity") }, String(numbers.unread))] : [],
+    ...numbers.asks > 0 ? [(0, import_react9.createElement)("span", { key: "a", className: "bt-side-badge", title: t("Waiting for your answer") }, String(numbers.asks))] : [],
+    ...numbers.approvals > 0 ? [(0, import_react9.createElement)("span", { key: "p", className: "bt-side-badge bt-side-badge-alert", title: t("Waiting for your approval") }, String(numbers.approvals))] : []
+  ];
+  return (0, import_react9.createElement)(
+    import_react9.Fragment,
+    null,
+    (0, import_react9.createElement)(
+      "button",
+      {
+        type: "button",
+        className: "bt-side-section",
+        "aria-expanded": open ? "true" : "false",
+        "aria-label": `${name}, ${numbers.rows}. ${action}`,
+        title: action,
+        onClick: onToggle
+      },
+      (0, import_react9.createElement)("span", { className: "bt-side-caret", "aria-hidden": true }, open ? "▾" : "▸"),
+      (0, import_react9.createElement)("span", { className: "bt-side-section-name" }, name),
+      ...badges,
+      (0, import_react9.createElement)("span", { className: "bt-side-section-count" }, String(numbers.rows))
+    ),
+    open ? (0, import_react9.createElement)("div", { className: "bt-side-rows", role: "group", "aria-label": name }, children) : null
+  );
+}
 function TeamSidebar(props) {
   const { wide, useRoster, useUi, useSessions, actions } = props;
   const listRef = (0, import_react9.useRef)(null);
@@ -5246,6 +5407,40 @@ function TeamSidebar(props) {
     return entries2.sort((a, b) => Number(Boolean(b.item.pinned)) - Number(Boolean(a.item.pinned)) || b.at - a.at);
   }, [roster, updated]);
   const main = roster.byId[roster.mainBotId];
+  const [sections, setSections] = (0, import_react9.useState)(() => readSections());
+  const partsOf = (0, import_react9.useMemo)(() => order.map((entry) => {
+    const item = entry.item;
+    if (entry.kind === "room") return [item.id];
+    if (entry.kind === "agent") return item.sessions ?? [];
+    return [currentPart(item)];
+  }), [order]);
+  const statusFlags = props.useSessionStatus ? props.useSessionStatus((map) => JSON.stringify(partsOf.map((parts) => parts.map((part) => [map.get(part)?.completionUnread === true, map.get(part)?.pendingInteraction !== void 0])))) : "[]";
+  const approvals = props.useWork ? props.useWork((work) => work?.approvals ?? []) : [];
+  const activeParts = props.useSessions ? props.useSessions((list) => Object.entries(list.byId ?? {}).filter(([, session]) => (session?.retainedBy?.mainView ?? 0) > 0).map(([part]) => part).join(",")) : "";
+  const activeSet = (0, import_react9.useMemo)(() => new Set(activeParts.split(",").filter(Boolean)), [activeParts]);
+  const view = (0, import_react9.useMemo)(() => {
+    const flags = JSON.parse(statusFlags);
+    const unread = /* @__PURE__ */ new Set();
+    const asks = /* @__PURE__ */ new Set();
+    const rooms = [];
+    const bots = [];
+    order.forEach((entry, at) => {
+      const item = entry.item;
+      const parts = partsOf[at] ?? [];
+      const rows = flags[at] ?? [];
+      if (item.hidden === true && !parts.some((part) => activeSet.has(part))) return;
+      if (markedUnread[item.id] === true || rows.some(([isUnread, waiting]) => isUnread || waiting)) unread.add(item.id);
+      if (parts.some((part) => roster.questions?.[part] !== void 0)) asks.add(item.id);
+      (entry.kind === "room" ? rooms : bots).push(entry);
+    });
+    return { rooms, bots, numbers: sectionCounts({ rooms: rooms.map((entry) => entry.item), bots: bots.map((entry) => entry.item), unread, asks, approvals }) };
+  }, [order, partsOf, statusFlags, activeSet, markedUnread, roster.questions, approvals]);
+  const open = wide ? sections : { rooms: true, bots: true };
+  const toggle = (id) => {
+    const next = { ...sections, [id]: !sections[id] };
+    setSections(next);
+    writeSections(next);
+  };
   useListGlide(listRef, wide, order.map((entry) => entry.item.id).join(","));
   useLandOnMainBot(roster, useSessions, actions);
   const rowProps = { roster, actions, useSessions, useUi, useSessionStatus: props.useSessionStatus, useSessionRetainInfo: props.useSessionRetainInfo, useActivity: props.useActivity, useWork: props.useWork, wide };
@@ -5277,7 +5472,16 @@ function TeamSidebar(props) {
       "div",
       { ref: listRef, className: "bt-list", role: "region", "aria-label": t("Bot list") },
       main ? (0, import_react9.createElement)(BotRow, { ...rowProps, bot: main, marked: markedUnread[main.id] === true }) : roster.ready ? null : (0, import_react9.createElement)("div", { className: "bt-hint" }, t("Setting up your Main Bot…")),
-      order.map((entry) => entry.kind === "bot" ? (0, import_react9.createElement)(BotRow, { key: entry.item.id, ...rowProps, bot: entry.item, marked: markedUnread[entry.item.id] === true }) : entry.kind === "room" ? (0, import_react9.createElement)(RoomRow, { key: entry.item.id, ...rowProps, room: entry.item, marked: markedUnread[entry.item.id] === true }) : (0, import_react9.createElement)(AgentRow, { key: entry.item.id, ...rowProps, agent: entry.item, marked: markedUnread[entry.item.id] === true }))
+      (0, import_react9.createElement)(
+        Section,
+        { key: "rooms", name: wide ? t("Group chats") : void 0, numbers: view.numbers.rooms, open: open.rooms, onToggle: () => toggle("rooms") },
+        view.rooms.map((entry) => (0, import_react9.createElement)(RoomRow, { key: entry.item.id, ...rowProps, room: entry.item, marked: markedUnread[entry.item.id] === true }))
+      ),
+      (0, import_react9.createElement)(
+        Section,
+        { key: "bots", name: wide ? t("Bots") : void 0, numbers: view.numbers.bots, open: open.bots, onToggle: () => toggle("bots") },
+        view.bots.map((entry) => entry.kind === "bot" ? (0, import_react9.createElement)(BotRow, { key: entry.item.id, ...rowProps, bot: entry.item, marked: markedUnread[entry.item.id] === true }) : (0, import_react9.createElement)(AgentRow, { key: entry.item.id, ...rowProps, agent: entry.item, marked: markedUnread[entry.item.id] === true }))
+      )
     )
   );
 }
@@ -5644,6 +5848,15 @@ function BrandName() {
   return (0, import_react9.createElement)("span", { style: { fontWeight: 600, fontSize: 14 } }, "DS Bot");
 }
 var SIDEBAR_CSS = `
+.bt-side-section{display:flex;align-items:center;gap:6px;width:100%;padding:8px 8px 2px;border:0;border-radius:8px;background:transparent;color:var(--bt-ink-2);font-family:inherit;font-size:11px;line-height:16px;text-align:left;cursor:pointer}
+.bt-side-section:hover{color:var(--bt-ink)}
+.bt-side-section:focus-visible{outline:2px solid var(--bt-accent);outline-offset:1px}
+.bt-side-caret{flex:0 0 10px;width:10px;font-size:9px;opacity:.8}
+.bt-side-section-name{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bt-side-section-count{flex:0 0 auto;font-variant-numeric:tabular-nums;opacity:.7}
+.bt-side-badge{flex:0 0 auto;min-width:16px;padding:0 4px;border-radius:8px;background:var(--bt-hover);color:var(--bt-ink-2);font-size:10px;line-height:16px;text-align:center;font-variant-numeric:tabular-nums}
+.bt-side-badge-alert{background:color-mix(in srgb,var(--bt-accent) 78%,var(--bt-sidebar));color:var(--bt-accent-ink,#fff)}
+.bt-side-rows{display:flex;flex-direction:column;gap:3px}
 .bt-side-top .bt-brand{cursor:default;padding-left:6px}
 .bt-side-top .bt-brand:hover{background:none}
 .bt-brand .bt-mark{flex:none}
@@ -5679,6 +5892,7 @@ var SIDEBAR_CSS = `
 .bt-update-go:active:not(:disabled){transform:scale(.96)}
 .bt-update-go:disabled{opacity:.6;cursor:default}
 .bt-update-dsh:not(:first-child){margin-top:12px;padding-top:12px;border-top:.5px solid var(--bt-line-2)}
+
 @media (prefers-reduced-motion:reduce){.bt-round.bt-update,.bt-update-pop,.bt-update .bt-cloud-arrow{animation:none}}
 
 /* The DSH Agent row and its expanding Session list. The black whale is the
@@ -7682,7 +7896,7 @@ function Summary({ bot, view, regenerate }) {
     )
   );
 }
-var groupEntries = (entries2) => entries2.reduce((groups, entry) => {
+var groupEntries2 = (entries2) => entries2.reduce((groups, entry) => {
   const key = `${entry.scope}:${entry.topic ?? ""}`;
   const group = groups.find((item) => item.key === key);
   if (group) group.entries.push(entry);
@@ -7728,7 +7942,7 @@ function EntryRow({ entry, remove }) {
   );
 }
 function Entries({ bot, view, remove }) {
-  const groups = groupEntries(view.entries);
+  const groups = groupEntries2(view.entries);
   const sections = [
     { scope: "own", title: t("{name}'s memory", { name: bot.name }), size: view.sizes.own },
     { scope: "team", title: t("Team memory"), hint: t("Every Bot reads it"), size: view.sizes.team }
@@ -10550,7 +10764,7 @@ function issueWindow() {
     }
   };
 }
-function FeedbackPage({ actions, run, Section, Row: Row3 }) {
+function FeedbackPage({ actions, run, Section: Section2, Row: Row3 }) {
   const [what, setWhat] = (0, import_react28.useState)("");
   const [report, setReport] = (0, import_react28.useState)(null);
   const [preview, setPreview] = (0, import_react28.useState)(false);
@@ -10595,7 +10809,7 @@ function FeedbackPage({ actions, run, Section, Row: Row3 }) {
   const shown = entries2.slice(0, 8);
   return [
     (0, import_react28.createElement)(
-      Section,
+      Section2,
       { key: "report", title: t("Report a problem") },
       (0, import_react28.createElement)(
         "div",
@@ -10628,7 +10842,7 @@ function FeedbackPage({ actions, run, Section, Row: Row3 }) {
       issueLink ? [" ", (0, import_react28.createElement)("a", { key: "link", href: issueLink, target: "_blank", rel: "noopener noreferrer" }, t("Open the issue"))] : null
     ) : null,
     (0, import_react28.createElement)(
-      Section,
+      Section2,
       { key: "errors", title: report ? t("Recent errors · {count}", { count: total }) : t("Recent errors") },
       shown.length === 0 ? (0, import_react28.createElement)(Row3, { label: t("No errors recorded."), hint: t("Failed model calls and DS Bot problems show here, newest first.") }) : shown.map((entry, index) => (0, import_react28.createElement)(
         "div",
@@ -10729,7 +10943,7 @@ function dshHint(dsh, shown) {
   return t("Version {version}", { version: dsh.current });
 }
 var linkProps = (href) => ({ className: "bt-soft bt-soft-sm bt-about-link", href, target: "_blank", rel: "noopener noreferrer" });
-function AboutPage({ useUpdate, actions, run, Section, Row: Row3 }) {
+function AboutPage({ useUpdate, actions, run, Section: Section2, Row: Row3 }) {
   const update = useUpdate((value) => value) ?? {};
   const [checking, setChecking] = (0, import_react29.useState)(false);
   const [stars, setStars] = (0, import_react29.useState)(null);
@@ -10803,13 +11017,13 @@ function AboutPage({ useUpdate, actions, run, Section, Row: Row3 }) {
     ),
     repo ? (0, import_react29.createElement)("p", { key: "ask", className: "bt-about-ask" }, t("If DS Bot helps you, a star on GitHub helps more people find it.")) : null,
     (0, import_react29.createElement)(
-      Section,
+      Section2,
       { key: "updates", title: t("Updates") },
       (0, import_react29.createElement)(Row3, { label: "DS Bot", hint: botHint(update) }, botControl, update.available && update.notesUrl ? (0, import_react29.createElement)("a", linkProps(update.notesUrl), t("What's new")) : null),
       dsh?.current ? (0, import_react29.createElement)(Row3, { label: "DeepSeek Harness", hint: dshHint(dsh, dshShown) }, dshControl) : null
     ),
     (0, import_react29.createElement)(
-      Section,
+      Section2,
       { key: "links", title: t("Links") },
       repo ? (0, import_react29.createElement)(Row3, { label: t("Source code"), hint: repo.replace(/^https:\/\//, "") }, (0, import_react29.createElement)("a", linkProps(repo), (0, import_react29.createElement)(GitHubMark), t("Open"))) : null,
       update.notesUrl ? (0, import_react29.createElement)(Row3, { label: t("Release notes") }, (0, import_react29.createElement)("a", linkProps(update.notesUrl), t("Open"))) : null,
@@ -11248,71 +11462,6 @@ function AgentMenu({ menu, roster, actions, leaving }) {
       }, (0, import_react31.createElement)(Icon), label))
     ))
   );
-}
-
-// src/client/storage.js
-var STORAGE = {
-  unread: "ds-bot:unread",
-  reactions: "ds-bot:reactions",
-  seen: "ds-bot:seen",
-  prefs: "ds-bot:prefs",
-  surface: "ds-bot:surface",
-  agentSessions: "ds-bot:agent-sessions",
-  browserWidth: "ds-bot:browser-width",
-  browsers: "ds-bot.browser.v2"
-};
-var LEGACY_PREFIXES = ["dsh-bot:", "dsh-bot-team:"];
-var LEGACY_BROWSER_KEYS = ["ds-bot.browser.v1", "dsh-bot.browser.v1"];
-var LEGACY_THEMES = { grok: "mono" };
-function legacyKeys(key) {
-  if (key === STORAGE.browsers) return LEGACY_BROWSER_KEYS;
-  const name = key.slice(key.indexOf(":") + 1);
-  return LEGACY_PREFIXES.map((prefix) => `${prefix}${name}`);
-}
-var migrateBrowsers = (storage) => {
-  if (storage.getItem(STORAGE.browsers) !== null) {
-    for (const key of LEGACY_BROWSER_KEYS) storage.removeItem(key);
-    return;
-  }
-  for (const key of LEGACY_BROWSER_KEYS) {
-    try {
-      const value = storage.getItem(key);
-      if (value === null) continue;
-      const previous = JSON.parse(value) ?? {};
-      const tabs = Object.fromEntries(Object.entries(previous).filter(([, page]) => page && typeof page === "object").map(([botId, page]) => {
-        const tab = { id: `v1-${botId}`, url: page.url ?? "", title: page.title ?? "" };
-        return [botId, { tabs: [tab], active: tab.id }];
-      }));
-      storage.setItem(STORAGE.browsers, JSON.stringify(tabs));
-      for (const earlier of LEGACY_BROWSER_KEYS) storage.removeItem(earlier);
-      return;
-    } catch {
-    }
-  }
-};
-function migrateStorage(storage = globalThis.localStorage) {
-  for (const key of Object.values(STORAGE)) {
-    if (key === STORAGE.browsers) continue;
-    for (const legacy of legacyKeys(key)) {
-      try {
-        const value = storage.getItem(legacy);
-        if (value !== null && storage.getItem(key) === null) storage.setItem(key, value);
-        storage.removeItem(legacy);
-      } catch {
-      }
-    }
-  }
-  try {
-    migrateBrowsers(storage);
-  } catch {
-  }
-  try {
-    const prefs = JSON.parse(storage.getItem(STORAGE.prefs) ?? "null");
-    if (prefs && Object.hasOwn(LEGACY_THEMES, prefs.theme ?? "")) {
-      storage.setItem(STORAGE.prefs, JSON.stringify({ ...prefs, theme: LEGACY_THEMES[prefs.theme] }));
-    }
-  } catch {
-  }
 }
 
 // src/client/member-status.js
@@ -12933,6 +13082,7 @@ function setUnread(unread, id, value) {
   else delete next[id];
   return next;
 }
+var clearUnreadFor = (unread, ...ids) => ids.reduce((map, id) => setUnread(map, id, false), unread);
 function noteLeft(seen, ids, now) {
   const next = { ...seen };
   for (const id of ids) next[id] = Math.max(Number(next[id]) || 0, now);
@@ -13661,6 +13811,10 @@ function apply(ctx) {
     const unread = unreadStore.update((marks) => setUnread(marks, id, value), ui2.getSnapshot().unread);
     ui2.set((state) => JSON.stringify(state.unread) === JSON.stringify(unread) ? state : { ...state, unread });
   };
+  const clearUnread = (...ids) => {
+    const unread = unreadStore.update((marks) => clearUnreadFor(marks, ...ids), ui2.getSnapshot().unread);
+    ui2.set((state) => JSON.stringify(state.unread) === JSON.stringify(unread) ? state : { ...state, unread });
+  };
   const refreshed = /* @__PURE__ */ new Set();
   let pulls = 0;
   let applied = 0;
@@ -13909,12 +14063,14 @@ function apply(ctx) {
       ui2.set((state) => state.newChat || state.exchange || state.menu || state.palette ? { ...state, newChat: null, exchange: null, menu: null, palette: null } : state);
       setPlain(false);
       const target = partFor(id);
+      clearUnread(...unreadNames([id, target], roster.getSnapshot().bots));
       expected = target;
       ctx.uiWorkspace.openSession(target);
     },
     // The conversation replacements withdraw for a plain Session; set the surface
     // before the navigation so the Bot skin never flashes.
     openAgentSession: (sessionId) => {
+      clearUnread(sessionId);
       ui2.set((state) => ({ ...state, newChat: null, exchange: null, menu: null, palette: null, details: null, view: "details", renaming: false, tab: null }));
       setPlain(true);
       expected = sessionId;
@@ -14092,7 +14248,7 @@ function apply(ctx) {
     },
     quote: (sessionId, text) => ui2.set((state) => ({ ...state, quote: { sessionId, text, token: Date.now() } })),
     clearQuote: (token) => ui2.set((state) => state.quote?.token === token ? { ...state, quote: null } : state),
-    clearUnread: (id) => writeUnread(id, false),
+    clearUnread: (id) => clearUnread(id),
     setFlags: (id, flags) => after(call("set-flags", { id, ...flags })),
     deleteRoom: (id) => after(call("delete-room", { id })),
     openMenu: (menu) => {
