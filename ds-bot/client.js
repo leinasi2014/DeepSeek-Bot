@@ -13060,6 +13060,7 @@ function setUnread(unread, id, value) {
   else delete next[id];
   return next;
 }
+var clearUnreadFor = (unread, ...ids) => ids.reduce((map, id) => setUnread(map, id, false), unread);
 function noteLeft(seen, ids, now) {
   const next = { ...seen };
   for (const id of ids) next[id] = Math.max(Number(next[id]) || 0, now);
@@ -13788,6 +13789,10 @@ function apply(ctx) {
     const unread = unreadStore.update((marks) => setUnread(marks, id, value), ui2.getSnapshot().unread);
     ui2.set((state) => JSON.stringify(state.unread) === JSON.stringify(unread) ? state : { ...state, unread });
   };
+  const clearUnread = (...ids) => {
+    const unread = unreadStore.update((marks) => clearUnreadFor(marks, ...ids), ui2.getSnapshot().unread);
+    ui2.set((state) => JSON.stringify(state.unread) === JSON.stringify(unread) ? state : { ...state, unread });
+  };
   const refreshed = /* @__PURE__ */ new Set();
   let pulls = 0;
   let applied = 0;
@@ -14036,12 +14041,14 @@ function apply(ctx) {
       ui2.set((state) => state.newChat || state.exchange || state.menu || state.palette ? { ...state, newChat: null, exchange: null, menu: null, palette: null } : state);
       setPlain(false);
       const target = partFor(id);
+      clearUnread(id, target);
       expected = target;
       ctx.uiWorkspace.openSession(target);
     },
     // The conversation replacements withdraw for a plain Session; set the surface
     // before the navigation so the Bot skin never flashes.
     openAgentSession: (sessionId) => {
+      clearUnread(sessionId);
       ui2.set((state) => ({ ...state, newChat: null, exchange: null, menu: null, palette: null, details: null, view: "details", renaming: false, tab: null }));
       setPlain(true);
       expected = sessionId;
@@ -14219,7 +14226,7 @@ function apply(ctx) {
     },
     quote: (sessionId, text) => ui2.set((state) => ({ ...state, quote: { sessionId, text, token: Date.now() } })),
     clearQuote: (token) => ui2.set((state) => state.quote?.token === token ? { ...state, quote: null } : state),
-    clearUnread: (id) => writeUnread(id, false),
+    clearUnread: (id) => clearUnread(id),
     setFlags: (id, flags) => after(call("set-flags", { id, ...flags })),
     deleteRoom: (id) => after(call("delete-room", { id })),
     openMenu: (menu) => {
