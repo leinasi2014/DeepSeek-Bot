@@ -369,10 +369,11 @@ const reviewSystem = teamWrites => [
   'Change an entry with edit when the user says it changed or is no longer true, and remove one that the messages show was wrong or was only for one task. Never add an entry that contradicts another.',
   // Two entries about one thing leave every later turn guessing which is current, and a 4,000
   // character file fills fast when a changed fact is saved again instead of updated.
-  'Merge before adding. When the new messages are about something already saved and only part of it changed — a date, a place, a person, a number, a status — change that entry with edit: it is the same fact, not a new one. When two saved entries say the same thing, keep one, edit it to hold what both said, and remove the other. Add only when nothing saved is about it.',
+  'Merge only the same fact. When the new messages update something already saved — a date, a place, a person, a number, a status that changed — change that entry with edit: it is the same fact, not a new one. When two saved entries say the same thing, keep one, edit it to hold what both said, and remove the other. A different fact about the same person, place or project is an entry of its own: one fact per entry.',
   '  saved: "The team trip to Hangzhou is 20–22 October" · the user now says 26–28 October → {"op": "edit", "entry": 4, "text": "The team trip to Hangzhou is 26–28 October"}',
+  '  saved: "The user lives in Hangzhou" · the user now says they are a doctor → a new entry of its own, not an edit of the first',
   '  saved twice, as "Deploys are on weekday evenings" and a copy with another number → keep one with edit and remove the copy',
-  'Change an entry with edit, never by removing it and adding the new text back: the entry keeps its place and its source that way. When two entries say the same thing, edit the one that stays and remove the other; never remove both and add a third.',
+  'Change an entry with edit, never by removing it and adding the new text back: the entry keeps its place that way. When two entries say the same thing, edit the one that stays and remove the other; never remove both and add a third.',
   'Put a detail in a topic that already fits it, named in the list above; make a new topic only when none does.',
   'Each change is one of',
   '  {"op": "add", "text": "…"}',
