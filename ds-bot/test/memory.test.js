@@ -71,6 +71,8 @@ test('the memory panel reads JSON from the model, in a fence or not', () => {
   assert.deepEqual(parseReview('{"changes": []}'), [])
   for (const bad of ['Nothing to keep.', '{"changes": "none"}', '{"changes": [{"op": "add"', '{"changes": ["remember this"]}', '{"changes": [{"text": "x"}]}', '{"changes": [{"op": "add", "text": " "}]}', '{"changes": [{"op": "edit", "entry": "two", "text": "x"}]}', '{"changes": [{"op": "remove", "entry": 0}]}', '{"changes": [{"op": "add", "text": "x", "team": "true"}]}']) assert.equal(parseReview(bad), undefined, bad)
   assert.deepEqual(parseReview('{"changes": [{"op": "remove", "entry": "2"}]}'), [{ op: 'remove', entry: '2' }])
+  assert.deepEqual(parseReview('{"changes": [{"op": "move", "entry": 2, "topic": "travel", "text": "x"}]}'), [{ op: 'move', entry: 2, topic: 'travel', text: 'x' }])
+  for (const bad of ['{"changes": [{"op": "move", "entry": 2, "topic": "travel"}]}', '{"changes": [{"op": "move", "entry": 2, "text": "x"}]}', '{"changes": [{"op": "move", "topic": "travel", "text": "x"}]}', '{"changes": [{"op": "move", "entry": 2, "topic": " ", "text": "x"}]}']) assert.equal(parseReview(bad), undefined, bad)
 })
 
 test('the panel shows a summary as headings over paragraphs', () => {
@@ -233,6 +235,58 @@ test('topics hold details, linked from MEMORY.md, and go when their last entry d
   assert.equal(read('bots', 'b2', 'MEMORY.md'), '# Memory\n\n## Index\n')
 })
 
+test('move takes an entry out of MEMORY.md into a topic, whole, with one record', async (t) => {
+  const { tool, read, journal, stop } = start()
+  t.after(() => stop())
+  assert.match(await tool('remember', { text: 'The user prefers short replies', kind: 'howto' }, 'b2'), /^Saved to your memory, in MEMORY\.md/)
+  const before = read('bots', 'b2', 'MEMORY.md')
+  assert.match(await tool('move', { entry: 'short replies', topic: 'Style' }, 'b2'), /^Moved from MEMORY\.md to topic \[\[style\]\] in your memory \(MEMORY\.md \d+ → \d+ characters\): "The user prefers short replies"\. recall finds it in \[\[style\]\] now\.$/)
+  const after = read('bots', 'b2', 'MEMORY.md')
+  assert.doesNotMatch(after, /short replies/)
+  assert.deepEqual(parseMemory(after).entries, [])
+  assert.match(after, /## Index\n- \[\[style\]\]\n$/)
+  assert.ok(after.length < before.length)
+  // The whole line moved, its kind included: how-to is a property of the entry, not of MEMORY.md.
+  assert.match(read('bots', 'b2', 'style.md'), /^# style\n\n- The user prefers short replies \[source: part 1 #10; kind: howto; added: \d{4}-\d{2}-\d{2}\]\n$/)
+  // The topic write is the add it is, and the move is recorded once, after both ends
+  // are done, so a move that stops halfway leaves its trace.
+  assert.deepEqual(journal().map(record => [record.op, record.file]), [
+    ['add', 'MEMORY.md'],
+    ['add', 'style.md'],
+    ['move', 'style.md'],
+  ])
+  const moved = journal().at(-1)
+  assert.deepEqual([moved.from, moved.to, moved.text, moved.actorName], ['MEMORY.md', 'topic [[style]]', 'The user prefers short replies', 'Writer'])
+  // A second move names where the entry is instead of writing another copy.
+  assert.match(await tool('move', { entry: 'short replies', topic: 'other' }, 'b2'), /^"The user prefers short replies" is in your memory, in topic \[\[style\]\]; a move only takes an entry out of MEMORY\.md\.$/)
+})
+
+test('a move whose delete failed finishes on the next call, without a second copy', async (t) => {
+  const { tool, home, read, journal, stop } = start()
+  t.after(() => stop())
+  // The first move wrote the topic and read it back, and stopped before the source line went.
+  const line = '- Deploys on Friday [source: part 1 #10; kind: howto; added: 2026-01-02]'
+  mkdirSync(join(home, 'memory', 'bots', 'b2'), { recursive: true })
+  writeFileSync(join(home, 'memory', 'bots', 'b2', 'MEMORY.md'), `# Memory\n\n${line}\n\n## Index\n- [[deploy]]\n`)
+  writeFileSync(join(home, 'memory', 'bots', 'b2', 'deploy.md'), `# deploy\n\n${line}\n`)
+  assert.match(await tool('move', { entry: 'Deploys on Friday', topic: 'deploy' }, 'b2'), /^Moved from MEMORY\.md to topic \[\[deploy\]\]/)
+  assert.equal(read('bots', 'b2', 'deploy.md'), `# deploy\n\n${line}\n`)
+  assert.deepEqual(parseMemory(read('bots', 'b2', 'MEMORY.md')).entries, [])
+  assert.match(read('bots', 'b2', 'MEMORY.md'), /## Index\n- \[\[deploy\]\]\n$/)
+  assert.deepEqual(journal().map(record => record.op), ['move'])
+})
+
+test('a move that would not leave MEMORY.md shorter is refused, and nothing is written', async (t) => {
+  const { tool, home, read, stop } = start()
+  t.after(() => stop())
+  // A line saved by hand, short enough that its link in the Index would be longer.
+  mkdirSync(join(home, 'memory', 'bots', 'b2'), { recursive: true })
+  writeFileSync(join(home, 'memory', 'bots', 'b2', 'MEMORY.md'), '# Memory\n\n- Go\n\n## Index\n')
+  assert.match(await tool('move', { entry: 'Go', topic: 'language' }, 'b2'), /^Moving "Go" into \[\[language\]\] would not leave MEMORY\.md shorter \(\d+ of 4000 characters\)\./)
+  assert.equal(read('bots', 'b2', 'MEMORY.md'), '# Memory\n\n- Go\n\n## Index\n')
+  assert.equal(existsSync(join(home, 'memory', 'bots', 'b2', 'language.md')), false)
+})
+
 test('Main Bots and group admins write the team memory; only Main Bots touch another Bot\'s', async (t) => {
   const { tool, read, stop } = start()
   t.after(() => stop())
@@ -262,7 +316,7 @@ test('keys, long entries, and full files are refused with what to do instead', a
   const big = Array.from({ length: 16 }, (_, index) => `- Fact ${index} ${'y'.repeat(250)}`)
   mkdirSync(join(home, 'memory', 'bots', 'b2'), { recursive: true })
   writeFileSync(join(home, 'memory', 'bots', 'b2', 'MEMORY.md'), `# Memory\n\n${big.join('\n')}\n`)
-  assert.match(await tool('remember', { text: 'One more' }, 'b2'), /MEMORY\.md would have \d+ of its 4000 characters\. Make room first: move details into a topic/)
+  assert.match(await tool('remember', { text: 'One more' }, 'b2'), /MEMORY\.md would have \d+ of its 4000 characters\. Make room first: move an entry into a topic with move/)
   assert.match(await tool('remember', { text: 'Fact 3 is short now', replace: 'Fact 3 ' }, 'b2'), /is now "Fact 3 is short now"/)
   assert.match(read('bots', 'b2', 'MEMORY.md'), /- Fact 3 is short now \[/)
   assert.match(await tool('forget', { entry: 'Fact 1' }, 'b2'), /matches \d+ entries in your memory; quote more of the one you mean:\n- Fact 1 y+ \(MEMORY\.md\)\n- Fact 10/)
@@ -655,6 +709,27 @@ test('when a turn ends, the memory review keeps what the user said, through the 
   replies.push(JSON.stringify({ reply: 'Done.', changes: [{ op: 'add', text: 'Likes tea' }] }))
   await call('memory-ask', { botId: 'b2', text: 'I like tea' })
   assert.equal((await call('state', {})).value.memoryNews.b2.text, 'The user writes Rust')
+})
+
+test('the memory review moves an entry out of MEMORY.md into a topic', async (t) => {
+  const history = {
+    b2: [
+      { event: { seq: 20, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Remember that I like short replies, and put that kind of thing in a topic.' }] } } },
+    ],
+  }
+  const replies = []
+  const { ctx, tool, call, read, journal, requests, stop } = start({ replies, history, config: { memoryReviewDelayMs: 0 } })
+  t.after(() => stop())
+  await tool('remember', { text: 'The user prefers short replies', kind: 'howto' }, 'b2')
+  replies.push(JSON.stringify({ changes: [{ op: 'move', entry: 1, topic: 'style', text: 'The user prefers short replies' }] }))
+  ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
+  await reviewed(call)
+  // The review knows the operation, and the entry leaves MEMORY.md whole.
+  assert.match(requests[0].system, /"op": "move", "entry": 3, "topic": "travel"/)
+  assert.deepEqual(parseMemory(read('bots', 'b2', 'MEMORY.md')).entries, [])
+  assert.match(read('bots', 'b2', 'style.md'), /^- The user prefers short replies \[source: part 1 #20; kind: howto; added: \d{4}-\d{2}-\d{2}\]$/m)
+  assert.deepEqual(journal().slice(-1).map(record => [record.op, record.file, record.auto]), [['move', 'style.md', true]])
+  assert.deepEqual(JSON.parse(read('reviewed.json')), { 'chat:b2': 20 })
 })
 
 test('in a group, each member reviews the log, and an admin may keep it for the team', async (t) => {
