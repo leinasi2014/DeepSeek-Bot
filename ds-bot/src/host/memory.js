@@ -40,6 +40,9 @@ export const MEMORY_LIMITS = { entry: 300, main: 4_000, topic: 16_000, topics: 4
 export const readers = { readText: path => readFileSync(path, 'utf8') }
 
 const MAIN = 'MEMORY.md'
+// At most this many moves in one turn. Measured bursts are 9-10 entries per call, and 70 in
+// a single turn (3,931 -> 547 characters), which takes away what every conversation reads.
+const MOVES_PER_TURN = 2
 const EMPTY_MAIN = '# Memory\n\n## Index\n'
 const INDEX = /^##\s+index\s*$/i
 const HEADING = /^#{1,6}\s/
@@ -460,6 +463,9 @@ const askRequest = ({ name, numbered, language, text }) => [
 
 export function install(rt) {
   const { ctx, config, home, state } = rt
+  // Moves spent in the turn now running, per Session. Cleared when the agent goes idle,
+  // which is the only turn boundary a tool can see: `exec` carries a per-call id, not a turn.
+  const moveBudget = new Map()
 
   if (config.memory === false) {
     Object.assign(rt, {
@@ -994,8 +1000,16 @@ export function install(rt) {
       const { topic, error } = topicArg(args.topic)
       if (error) return error
       if (topic === undefined) return 'Name the topic to move the entry into, such as "travel".'
+      const session = exec?.sessionId ?? context.caller.sessionId
+      const spent = moveBudget.get(session) ?? 0
+      if (spent >= MOVES_PER_TURN) {
+        // Say it, do not just refuse: a silent drop makes the model retry the same batch.
+        return `This turn has used its ${MOVES_PER_TURN} moves, so nothing was moved. Do not call move again this turn; make room in a later turn, or forget what no longer matters.`
+      }
       try {
-        return (await moveEntry({ ...context, topic, match: args.entry })).message
+        const moved = await moveEntry({ ...context, topic, match: args.entry })
+        if (moved.changed) moveBudget.set(session, spent + 1)
+        return moved.message
       } catch (failure) {
         return failure.message
       }
@@ -1572,6 +1586,7 @@ export function install(rt) {
       }
       const started = turnOwners.get(id)
       turnOwners.delete(id)
+      moveBudget.delete(id)
       const seen = ownerOf(id) ?? started
       const live = seen?.roomId === undefined ? undefined : rt.roomOf(seen.roomId)
       if (live !== undefined) queueLaggingMembers(live, seen.botId)

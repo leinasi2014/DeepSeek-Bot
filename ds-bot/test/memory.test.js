@@ -1378,3 +1378,27 @@ test('kind: howto lives in the meta, and an edit keeps it', async (t) => {
   }
   assert.equal(entries().length, 1, 'a refused write changes nothing')
 })
+
+// One turn may move two entries. A model that moves ten per call can empty MEMORY.md in one
+// turn (70 entries measured), so the cap sits on the tool path and refuses out loud.
+test('a turn may move two entries and the third is refused, until the turn ends', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-move-budget-'))
+  const { ctx, tool, read, stop } = start({ home })
+  t.after(() => stop())
+  for (const text of ['Alpha one', 'Bravo two', 'Charlie three']) await tool('remember', { text }, 'b2')
+  const mainEntries = () => parseMemory(read('bots', 'b2', 'MEMORY.md')).entries.map(entry => entry.text)
+  assert.equal(mainEntries().length, 3, 'three entries to move')
+
+  await tool('move', { entry: 'Alpha one', topic: 'ops' }, 'b2')
+  await tool('move', { entry: 'Bravo two', topic: 'ops' }, 'b2')
+  assert.deepEqual(mainEntries(), ['Charlie three'], 'two moves took two entries out of MEMORY.md')
+
+  const refused = await tool('move', { entry: 'Charlie three', topic: 'ops' }, 'b2')
+  assert.match(String(refused), /used its 2 moves/, 'the third move is refused, and says why')
+  assert.deepEqual(mainEntries(), ['Charlie three'], 'a refused move changes nothing')
+
+  ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
+  const afterTurn = await tool('move', { entry: 'Charlie three', topic: 'ops' }, 'b2')
+  assert.doesNotMatch(String(afterTurn), /used its 2 moves/, 'the next turn has its budget back')
+  assert.deepEqual(mainEntries(), [], 'and the move really happened')
+})
