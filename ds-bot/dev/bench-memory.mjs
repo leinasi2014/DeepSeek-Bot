@@ -460,7 +460,7 @@ async function roundA4(round) {
 // tell which is current. Judged mechanically on the journal and the file.
 
 const A2B_SEED = '周报控制在五条以内'
-const A2B_UPDATE = '周报以后改成三条以内'
+const A2B_UPDATE = '周报以后改成三条以内；团队记忆里那条是旧的，改掉它'
 
 async function roundA2b(round) {
   const report = { scenario: 'A2B', round }
