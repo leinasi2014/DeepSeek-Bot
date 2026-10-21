@@ -1381,9 +1381,8 @@ test('kind: howto lives in the meta, and an edit keeps it', async (t) => {
 
 // One turn may move two entries. A model that moves ten per call can empty MEMORY.md in one
 // turn (70 entries measured), so the cap sits on the tool path and refuses out loud.
-test('a turn may move two entries and the third is refused, until the turn ends', async (t) => {
+test('two moves inside the window, and the third is refused', async (t) => {
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-move-budget-'))
-  const { moveBudget } = await import('../src/host/memory.js')
   const { tool, read, stop } = start({ home })
   t.after(() => stop())
   for (const text of ['Alpha one', 'Bravo two', 'Charlie three']) await tool('remember', { text }, 'b2')
@@ -1397,13 +1396,20 @@ test('a turn may move two entries and the third is refused, until the turn ends'
   const refused = await tool('move', { entry: 'Charlie three', topic: 'ops' }, 'b2')
   assert.match(String(refused), /Moved 2 entries just now/, 'the third move is refused, and says why')
   assert.deepEqual(mainEntries(), ['Charlie three'], 'a refused move changes nothing')
+})
 
-  // A zero window means the next call is already past it: the cap is time based, not turn
-  // based, because two turns can run back to back with no idle between them.
-  moveBudget.windowMs = 0
-  moveBudget.clear()
-  const after = await tool('move', { entry: 'Charlie three', topic: 'ops' }, 'b2')
-  assert.doesNotMatch(String(after), /Moved 2 entries just now/, 'a new window has its budget back')
-  assert.deepEqual(mainEntries(), [], 'and the move really happened')
+// The window comes from the plugin config, so a test can make it zero: then every call opens
+// a fresh window and nothing is refused. That is what proves the cap is time based and not
+// tied to a turn boundary the tool cannot see.
+test('a zero move window means the budget never binds', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-move-window-'))
+  const { tool, read, stop } = start({ home, config: { memoryReviewDelayMs: 0, memoryMoveWindowMs: 0 } })
+  t.after(() => stop())
+  for (const text of ['Alpha one', 'Bravo two', 'Charlie three']) await tool('remember', { text }, 'b2')
+  for (const entry of ['Alpha one', 'Bravo two', 'Charlie three']) {
+    const answer = await tool('move', { entry, topic: 'ops' }, 'b2')
+    assert.doesNotMatch(String(answer), /Moved 2 entries just now/, 'nothing is refused when the window does not hold')
+  }
+  assert.equal(parseMemory(read('bots', 'b2', 'MEMORY.md')).entries.length, 0, 'all three moved')
 })
 

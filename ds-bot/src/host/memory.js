@@ -44,7 +44,8 @@ const MAIN = 'MEMORY.md'
 // in one run (3,931 -> 547 characters), which takes away what every conversation reads. A tool
 // cannot see a turn boundary — exec carries a per-call id, and two turns can run back to back
 // with no idle between them — so the cap is a time window, not a turn.
-export const moveBudget = { windowMs: 30_000, perWindow: 2 }
+const MOVES_PER_WINDOW = 2
+const MOVE_WINDOW_MS = 30_000
 const EMPTY_MAIN = '# Memory\n\n## Index\n'
 const INDEX = /^##\s+index\s*$/i
 const HEADING = /^#{1,6}\s/
@@ -466,19 +467,19 @@ const askRequest = ({ name, numbered, language, text }) => [
 export function install(rt) {
   const { ctx, config, home, state } = rt
   // Moves made in the window now open, per Session. Expiry is a timer, so nothing here
-  // depends on status events (which a session with memoryReview off never gets).
+  // depends on status events (which a session with memoryReview off never gets). The window
+  // length comes from the plugin config, the same place as memoryReviewDelayMs.
+  const moveWindowMs = config.memoryMoveWindowMs ?? MOVE_WINDOW_MS
   const moveSpent = new Map()
-  // Tests need to start a fresh window without waiting 30 seconds; production never calls it.
-  moveBudget.clear = () => moveSpent.clear()
   const moveBudgetOf = (session, now) => {
     const held = moveSpent.get(session)
     if (held !== undefined && now < held.until) return held
-    const fresh = { count: 0, until: now + moveBudget.windowMs }
+    const fresh = { count: 0, until: now + moveWindowMs }
     moveSpent.set(session, fresh)
     const timer = setTimeout(() => {
       const current = moveSpent.get(session)
       if (current === fresh) moveSpent.delete(session)
-    }, moveBudget.windowMs + 1000)
+    }, moveWindowMs + 1000)
     timer.unref?.()
     return fresh
   }
@@ -1019,9 +1020,9 @@ export function install(rt) {
       const session = exec?.sessionId ?? context.caller.sessionId
       const now = Date.now()
       const held = moveBudgetOf(session, now)
-      if (held.count >= moveBudget.perWindow) {
+      if (held.count >= MOVES_PER_WINDOW) {
         // Say it, do not just refuse: a silent drop makes the model retry the same batch.
-        return `Moved ${moveBudget.perWindow} entries just now, so nothing was moved: wait ${Math.ceil(moveBudget.windowMs / 1000)} seconds before moving more. Do not call move again in this run; forget what no longer matters, or make room later.`
+        return `Moved ${MOVES_PER_WINDOW} entries just now, so nothing was moved: wait ${Math.ceil(moveWindowMs / 1000)} seconds before moving more. Do not call move again in this run; forget what no longer matters, or make room later.`
       }
       // Take the slot before awaiting: three calls in one answer all see the same count
       // otherwise, and a burst would slip through.
