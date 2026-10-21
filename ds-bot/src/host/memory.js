@@ -565,7 +565,9 @@ export function install(rt) {
   const addEntry = options => queued(() => addNow(options))
   // Inside the write queue already: move writes its target here, in the same job that
   // removes the source, so no other write can land between the copy and the deletion.
-  async function addNow({ scope, topic, text, meta, actor, label, allowDuplicate = false }) {
+  // skipIndex is for move too: MEMORY.md is written once, with the link and without the
+  // source line, so its size is judged on the file that lands.
+  async function addNow({ scope, topic, text, meta, actor, label, allowDuplicate = false, skipIndex = false }) {
     writable(scope, actor)
     const files = loadScope(scope)
     const [same] = allowDuplicate ? [] : matchEntries(allEntries(files), text).filter(entry => squash(entry.text) === squash(text))
@@ -588,7 +590,7 @@ export function install(rt) {
     const next = joinLines(insertEntry(base, line))
     checkSize(target, next, label)
     let index
-    if (topic !== undefined && !main.links.includes(topic)) {
+    if (topic !== undefined && !main.links.includes(topic) && !skipIndex) {
       index = joinLines(addLink(main.lines.length > 0 ? main.lines : parseMemory(EMPTY_MAIN).lines, topic))
       checkSize(main, index, label)
     }
@@ -670,38 +672,43 @@ export function install(rt) {
       writable(scope, actor)
       const files = loadScope(scope)
       const main = files[0]
+      const before = main.content.length
       let source
       try {
         source = findOne([main], undefined, match, label)
       } catch (failure) {
         const elsewhere = matchEntries(allEntries(files.filter(file => file.topic !== undefined)), match)
         const found = elsewhere.length === 1 ? elsewhere[0] : undefined
+        // A second call after a move that went through: the entry is in the topic already.
+        if (found !== undefined && found.file.topic === topic) return { changed: false, file: found.file, message: `"${found.text}" is already in ${label}, in topic [[${topic}]], and no longer in MEMORY.md; nothing to move.` }
         if (found === undefined) throw failure
         throw new Error(`"${found.text}" is in ${label}, in topic [[${found.file.topic}]]; a move only takes an entry out of MEMORY.md.`)
       }
       const line = formatEntry(source.text, source.meta)
+      // MEMORY.md is written once, with the link and without the source line, so the size
+      // judged is the size that lands: a file that is nearly full is where a move matters.
       const next = withoutSource(main, source)
-      if (next.length >= main.content.length) {
+      if (next.length >= before) {
         throw new Error(`Moving "${source.text}" into [[${topic}]] would not leave MEMORY.md shorter (${next.length} of ${MEMORY_LIMITS.main} characters). A move is for the room it frees: save what still matters in the topic with remember, then forget the entry here.`)
       }
       // The line whole, byte for byte: an entry that only reads the same is another entry,
       // with metadata of its own, and skipping the write would drop that metadata.
       const held = files.some(file => file.topic === topic && file.lines.includes(line))
-      if (!held) await addNow({ scope, topic, text: source.text, meta: source.meta, actor, label, allowDuplicate: true })
+      if (!held) await addNow({ scope, topic, text: source.text, meta: source.meta, actor, label, allowDuplicate: true, skipIndex: true })
       const after = loadScope(scope)
-      const mainNow = after[0]
       const target = after.find(file => file.topic === topic)
       if (target === undefined || !target.lines.includes(line)) throw new Error(`The entry did not reach [[${topic}]] whole, so MEMORY.md still has it and nothing was lost. Try again.`)
-      // Found again as an entry, not as the line it formats to: a file written by hand can
-      // mark or space the same entry differently.
-      const again = matchEntries(mainNow.entries, source.text).find(entry => squash(entry.text) === squash(source.text))
-      if (again === undefined) return { changed: false, file: target, message: `"${source.text}" is no longer in ${label} MEMORY.md, and topic [[${topic}]] has it; nothing to move.` }
-      const shorter = withoutSource(mainNow, again)
-      await writeText(mainNow.path, shorter)
-      // One record for one move, written only once both ends are done.
-      await journal({ op: 'move', scope: scopeKey(scope), file: `${topic}.md`, from: MAIN, to: `topic [[${topic}]]`, ...actorOf(actor), text: source.text, after: line })
+      await writeText(main.path, next)
+      // One record for one move, written only once both ends are done. A journal that cannot
+      // write leaves the data right: reporting a failure would send the model back for a retry
+      // that finds nothing to move, and the warning stays in the log.
+      try {
+        await journal({ op: 'move', scope: scopeKey(scope), file: `${topic}.md`, from: MAIN, to: `topic [[${topic}]]`, ...actorOf(actor), text: source.text, after: line })
+      } catch (failure) {
+        rt.warn('ds-bot: memory move of %s not journaled: %s', label, failure?.message ?? failure)
+      }
       noteNews(scope, actor, 'move', line)
-      return { changed: true, file: target, message: `Moved from MEMORY.md to topic [[${topic}]] in ${label} (MEMORY.md ${mainNow.content.length} → ${shorter.length} characters): "${source.text}". recall finds it in [[${topic}]] now.` }
+      return { changed: true, file: target, message: `Moved from MEMORY.md to topic [[${topic}]] in ${label} (MEMORY.md ${before} → ${next.length} characters): "${source.text}". recall finds it in [[${topic}]] now.` }
     })
   }
 

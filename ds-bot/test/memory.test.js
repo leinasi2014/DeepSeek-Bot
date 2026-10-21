@@ -319,6 +319,55 @@ test('a move finds an entry written by hand with other spacing', async (t) => {
   assert.deepEqual(journal().map(record => record.op), ['add', 'move'])
 })
 
+test('a move works when MEMORY.md is nearly full and the topic is new', async (t) => {
+  const { tool, home, read, stop } = start()
+  t.after(() => stop())
+  // 3,990 characters, and the topic has no link yet: the link would take a file that still
+  // holds the entry past 4,000, but the entry leaves in the same write.
+  const entry = 'Deploys between 8pm and 11pm on weekdays, never on a Friday afternoon'
+  const head = '# Memory\n\n'
+  const tail = '\n\n## Index\n'
+  const room = 3990 - head.length - (entry.length + 2) - tail.length - 1
+  const content = `${head}- ${'f'.repeat(room - 2)}\n- ${entry}${tail}`
+  assert.equal(content.length, 3990)
+  mkdirSync(join(home, 'memory', 'bots', 'b2'), { recursive: true })
+  writeFileSync(join(home, 'memory', 'bots', 'b2', 'MEMORY.md'), content)
+  assert.match(await tool('move', { entry: 'Deploys between', topic: 'deploy' }, 'b2'), /^Moved from MEMORY\.md to topic \[\[deploy\]\]/)
+  const after = read('bots', 'b2', 'MEMORY.md')
+  assert.ok(after.length < 3990)
+  assert.match(after, /## Index\n- \[\[deploy\]\]\n$/)
+  assert.deepEqual(parseMemory(after).entries.map(item => item.text.includes('Deploys between')), [false])
+  assert.match(read('bots', 'b2', 'deploy.md'), /Deploys between 8pm and 11pm/)
+})
+
+test('a move reports success when only the journal write fails', async (t) => {
+  const { tool, home, read, stop } = start()
+  t.after(() => stop())
+  const line = '- Deploys on Friday [source: part 1 #10; added: 2026-01-02]'
+  mkdirSync(join(home, 'memory', 'bots', 'b2'), { recursive: true })
+  writeFileSync(join(home, 'memory', 'bots', 'b2', 'MEMORY.md'), `# Memory\n\n${line}\n\n## Index\n- [[deploy]]\n`)
+  writeFileSync(join(home, 'memory', 'bots', 'b2', 'deploy.md'), `# deploy\n\n${line}\n`)
+  // The journal cannot be written at all. Both ends are done, so the move must not be
+  // reported as failed: a retry would find nothing in MEMORY.md to move.
+  mkdirSync(join(home, 'memory', 'journal.jsonl'), { recursive: true })
+  assert.match(await tool('move', { entry: 'Deploys on Friday', topic: 'deploy' }, 'b2'), /^Moved from MEMORY\.md to topic \[\[deploy\]\]/)
+  assert.deepEqual(parseMemory(read('bots', 'b2', 'MEMORY.md')).entries, [])
+  assert.equal(read('bots', 'b2', 'deploy.md'), `# deploy\n\n${line}\n`)
+  // The call the model would make next: the entry is in the topic, so nothing is left to do.
+  assert.match(await tool('move', { entry: 'Deploys on Friday', topic: 'deploy' }, 'b2'), /^"Deploys on Friday" is already in your memory, in topic \[\[deploy\]\], and no longer in MEMORY\.md; nothing to move\.$/)
+})
+
+test('a move reports the length MEMORY.md had before it started', async (t) => {
+  const { tool, read, stop } = start()
+  t.after(() => stop())
+  await tool('remember', { text: 'The user prefers short replies', kind: 'howto' }, 'b2')
+  const before = read('bots', 'b2', 'MEMORY.md').length
+  const answer = await tool('move', { entry: 'short replies', topic: 'style' }, 'b2')
+  const after = read('bots', 'b2', 'MEMORY.md').length
+  // The number is the file as it was, not the one that briefly held the new [[style]] link.
+  assert.match(answer, new RegExp(`\\(MEMORY\\.md ${before} → ${after} characters\\)`))
+})
+
 test('a move that would not leave MEMORY.md shorter is refused, and nothing is written', async (t) => {
   const { tool, home, read, stop } = start()
   t.after(() => stop())
