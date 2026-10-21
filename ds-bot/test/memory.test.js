@@ -537,6 +537,24 @@ test('"ask or update" puts an add in a topic, and a name that cannot be one is r
   assert.doesNotMatch(read('bots', 'b2', 'MEMORY.md'), /Likes tea/)
 })
 
+test('"ask or update" says an add was not saved when the entry already sits in another file', async (t) => {
+  const replies = [JSON.stringify({ reply: 'Done.', changes: [
+    { op: 'add', text: 'Likes tea', topic: 'travel' },
+  ] })]
+  const { tool, call, home, read, journal, stop } = start({ replies })
+  t.after(() => stop())
+  await tool('remember', { text: 'Likes tea' }, 'b2')
+  const answer = (await call('memory-ask', { botId: 'b2', text: 'I like tea. Put it under travel' })).value
+  // The entry is already in MEMORY.md, so nothing is written: the panel says so and
+  // names where it is, instead of claiming a save that never happened.
+  assert.deepEqual([answer.changes[0].op, answer.changes[0].ok], ['add', false])
+  assert.match(answer.changes[0].error, /^Already in Writer's memory \(MEMORY\.md\): "Likes tea"\. Nothing changed\.$/)
+  assert.equal(answer.changes[0].topic, undefined)
+  assert.equal(existsSync(join(home, 'memory', 'bots', 'b2', 'travel.md')), false)
+  assert.doesNotMatch(read('bots', 'b2', 'MEMORY.md'), /\[\[travel\]\]/)
+  assert.equal(journal().filter(record => record.file === 'travel.md').length, 0)
+})
+
 test('a host that only reads the team shows memory but changes none of it', async (t) => {
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-'))
   writeFileSync(join(home, 'state.lock'), JSON.stringify({ pid: process.ppid, host: hostname(), token: 'other' }))

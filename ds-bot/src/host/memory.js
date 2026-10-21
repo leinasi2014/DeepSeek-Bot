@@ -1094,11 +1094,14 @@ export function install(rt) {
           const problem = entryProblem(next)
           if (problem) throw new Error(problem)
         }
-        if (op === 'add') await addEntry({ scope, topic, text: next, meta, actor: USER, label })
-        else if (op === 'edit') await replaceEntry({ scope, topic: target.file.topic, match: target.text, text: next, meta, actor: USER, label })
+        // An add that duplicates an entry already in the scope writes nothing, so the
+        // panel must not report it as saved: it says where the entry is instead.
+        const landed = op === 'add' ? await addEntry({ scope, topic, text: next, meta, actor: USER, label }) : undefined
+        if (landed !== undefined && !landed.changed) throw new Error(landed.message)
+        if (op === 'edit') await replaceEntry({ scope, topic: target.file.topic, match: target.text, text: next, meta, actor: USER, label })
         else if (op === 'remove') await removeEntry({ scope, topic: target.file.topic, match: target.text, actor: USER, label })
-        else continue
-        changes.push({ op, scope: scope.kind === 'team' ? 'team' : 'own', text: op === 'remove' ? target.text : next, ...(op === 'add' && topic !== undefined ? { topic } : {}), ...(op === 'edit' ? { before: target.text } : {}), ok: true })
+        else if (op !== 'add') continue
+        changes.push({ op, scope: scope.kind === 'team' ? 'team' : 'own', text: op === 'remove' ? target.text : next, ...(landed?.file.topic !== undefined ? { topic: landed.file.topic } : {}), ...(op === 'edit' ? { before: target.text } : {}), ok: true })
       } catch (failure) {
         changes.push({ op, scope: scope.kind === 'team' ? 'team' : 'own', text: next || target?.text || '', ok: false, error: failure.message })
       }
