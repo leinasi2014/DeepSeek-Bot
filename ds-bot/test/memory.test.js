@@ -1411,14 +1411,23 @@ test('three unreadable reviews in a row give the batch up, with the lines kept',
 
 test('one readable review clears the count, so two more bad ones do not give the batch up', async (t) => {
   const replies = ['bad', 'bad', JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }] }), 'bad', 'bad']
-  const { ctx, call, read, stop } = start({ replies, config: { memoryReviewDelayMs: 0 } })
+  const lines = [
+    { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Please remember this' }] } } },
+    { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Saved.' }] } } } },
+  ]
+  const { ctx, call, read, requests, stop } = start({ home: undefined, replies, history: { b2: lines }, config: { memoryReviewDelayMs: 0 } })
   t.after(() => stop())
   await call('state', {})
   for (let tries = 0; tries < 5; tries += 1) {
+    // A new line every turn, or the review returns early for having nothing to read.
+    lines.push({ event: { seq: 12 + tries, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: `line ${tries}` }] } } })
+    ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'working' })
     ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
-    try { await reviewed(call) } catch { /* the bad answers are refused */ }
+    try { await reviewed(call) } catch (error) { if (!/not a list of changes/.test(String(error))) throw error }
   }
   const journal = read('journal.jsonl').split('\n').filter(Boolean).map(line => JSON.parse(line))
   assert.equal(journal.filter(entry => entry.reason === 'invalid-review').length, 0, 'two bads after a success never reach three')
   assert.deepEqual(parseMemory(read('bots', 'b2', 'MEMORY.md')).entries.map(entry => entry.text), ['The user likes tea'])
+  // Every queued answer was really sent, so "two bads after a success" means something.
+  assert.equal(requests.length, 5, 'a review ran on every turn')
 })

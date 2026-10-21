@@ -1465,8 +1465,13 @@ export function install(rt) {
         if (count >= REJECTIONS_MAX) {
           // Three in a row is not a slip: give the batch up and move the cursor past it.
           // The lines are kept so a person can recover them by hand, but a line that holds
-          // a secret is not written to the log — the same rule the entries follow.
-          const kept = read.map(line => (secretEntry(line.text) ? `${line.who}: (left out: looks like a secret)` : `${line.who}: ${line.text}`)).join('\n')
+          // a secret is not written to the log — the same rule the entries follow. The text
+          // is collapsed first: a secret split over lines ("password\nis DEMO_ONLY") would
+          // otherwise look like ordinary prose.
+          const kept = read.map((line) => {
+            const one = line.text.replace(/\s+/g, ' ').trim()
+            return secretEntry(one) ? `${line.who}: (left out: looks like a secret)` : `${line.who}: ${one}`
+          }).join('\n')
           await journal({
             op: 'skip',
             scope: key,
