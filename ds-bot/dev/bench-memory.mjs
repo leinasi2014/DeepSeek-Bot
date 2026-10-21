@@ -127,7 +127,6 @@ const WRITE_OPS = new Set(['add', 'replace', 'move'])
 const isSave = event => WRITE_OPS.has(event.op)
 
 const say = line => console.log(line)
-const botNamed = async name => (await api('state')).bots.find(bot => bot.name === name)
 async function mainBot() {
   const view = await api('state')
   return view.bots.find(bot => bot.id === view.mainBotId)
@@ -324,7 +323,6 @@ async function roundA2(round) {
     reviews += result.calls.filter(call => call.kind === 'review').length
     writes.push(...result.writes)
   }
-  const after = teamContent()
   report.endStats = scopeStats(chief)
   report.endEntries = report.endStats.team.body
   report.endChars = report.endStats.team.chars
