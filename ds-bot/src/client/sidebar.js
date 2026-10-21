@@ -11,7 +11,7 @@ import { Shimmer, workPhrase } from './cells.js'
 import { springEasing, SPRING_SHAPE } from './motion.js'
 import { hostText, t } from './i18n.js'
 import { showsDshRow } from './dsh-offer.js'
-import { groupEntries, readSections, sectionCounts, writeSections } from './sidebar-sections.js'
+import { readSections, sectionCounts, writeSections } from './sidebar-sections.js'
 
 // -------------------------------------------------------------------------
 // Sidebar
@@ -290,7 +290,6 @@ export function TeamSidebar(props) {
   }, [roster, updated])
   const main = roster.byId[roster.mainBotId]
   const [sections, setSections] = useState(() => readSections())
-  const grouped = useMemo(() => groupEntries(order), [order])
   // What the folded headers say: the same signals the rows show, over the rows a section really
   // displays. A Bot's chat Session is not its id once it has moved to a fresh part, an Agent
   // keeps one Session per conversation, and a row with a pending answer is as much a signal as
@@ -307,22 +306,29 @@ export function TeamSidebar(props) {
     ? props.useSessionStatus(map => JSON.stringify(partsOf.map(parts => parts.map(part => [map.get(part)?.completionUnread === true, map.get(part)?.pendingInteraction !== undefined]))))
     : '[]')
   const approvals = (props.useWork ? props.useWork(work => work?.approvals ?? []) : [])
-  const numbers = useMemo(() => {
+  // A hidden conversation is still drawn while it is the one that is open, so the headers use
+  // the same rule the rows do: visible means not hidden, or hidden but now open.
+  const activeParts = (props.useSessions
+    ? props.useSessions(list => Object.entries(list.byId ?? {}).filter(([, session]) => (session?.retainedBy?.mainView ?? 0) > 0).map(([part]) => part).join(','))
+    : '')
+  const activeSet = useMemo(() => new Set(activeParts.split(',').filter(Boolean)), [activeParts])
+  const view = useMemo(() => {
     const flags = JSON.parse(statusFlags)
     const unread = new Set()
     const asks = new Set()
-    const visible = { rooms: [], bots: [] }
+    const rooms = []
+    const bots = []
     order.forEach((entry, at) => {
       const item = entry.item
-      if (item.hidden === true) return
       const parts = partsOf[at] ?? []
       const rows = flags[at] ?? []
+      if (item.hidden === true && !parts.some(part => activeSet.has(part))) return
       if (markedUnread[item.id] === true || rows.some(([isUnread, waiting]) => isUnread || waiting)) unread.add(item.id)
       if (parts.some(part => roster.questions?.[part] !== undefined)) asks.add(item.id)
-      ;(entry.kind === 'room' ? visible.rooms : visible.bots).push(item)
+      ;(entry.kind === 'room' ? rooms : bots).push(entry)
     })
-    return sectionCounts({ rooms: visible.rooms, bots: visible.bots, unread, asks, approvals })
-  }, [order, partsOf, statusFlags, markedUnread, roster.questions, approvals])
+    return { rooms, bots, numbers: sectionCounts({ rooms: rooms.map(entry => entry.item), bots: bots.map(entry => entry.item), unread, asks, approvals }) }
+  }, [order, partsOf, statusFlags, activeSet, markedUnread, roster.questions, approvals])
   // The narrow rail is icons only: folding there would leave nothing to open a chat with.
   const open = wide ? sections : { rooms: true, bots: true }
   const toggle = (id) => {
@@ -353,10 +359,10 @@ export function TeamSidebar(props) {
     wide && roster.readOnly ? h('div', { className: 'bt-hint bt-read-only', role: 'status' }, hostText(roster.readOnly)) : null,
     h('div', { ref: listRef, className: 'bt-list', role: 'region', 'aria-label': t('Bot list') },
       main ? h(BotRow, { ...rowProps, bot: main, marked: markedUnread[main.id] === true }) : roster.ready ? null : h('div', { className: 'bt-hint' }, t('Setting up your Main Bot…')),
-      h(Section, { key: 'rooms', name: wide ? t('Group chats') : undefined, numbers: numbers.rooms, open: open.rooms, onToggle: () => toggle('rooms') },
-        grouped.rooms.map(entry => h(RoomRow, { key: entry.item.id, ...rowProps, room: entry.item, marked: markedUnread[entry.item.id] === true }))),
-      h(Section, { key: 'bots', name: wide ? t('Bots') : undefined, numbers: numbers.bots, open: open.bots, onToggle: () => toggle('bots') },
-        grouped.bots.map(entry => (entry.kind === 'bot'
+      h(Section, { key: 'rooms', name: wide ? t('Group chats') : undefined, numbers: view.numbers.rooms, open: open.rooms, onToggle: () => toggle('rooms') },
+        view.rooms.map(entry => h(RoomRow, { key: entry.item.id, ...rowProps, room: entry.item, marked: markedUnread[entry.item.id] === true }))),
+      h(Section, { key: 'bots', name: wide ? t('Bots') : undefined, numbers: view.numbers.bots, open: open.bots, onToggle: () => toggle('bots') },
+        view.bots.map(entry => (entry.kind === 'bot'
           ? h(BotRow, { key: entry.item.id, ...rowProps, bot: entry.item, marked: markedUnread[entry.item.id] === true })
           : h(AgentRow, { key: entry.item.id, ...rowProps, agent: entry.item, marked: markedUnread[entry.item.id] === true }))))))
 }

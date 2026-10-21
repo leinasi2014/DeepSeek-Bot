@@ -358,7 +358,7 @@ export function apply(ctx) {
       const target = partFor(id)
       // A Bot that moved to a fresh part keeps its mark under the Bot id, and a search result
       // hands the opening action the current part: clear every name the conversation holds.
-      clearUnread(...unreadNames([id, target], Object.values(roster.getSnapshot().byId)))
+      clearUnread(...unreadNames([id, target], roster.getSnapshot().bots))
       expected = target
       ctx.uiWorkspace.openSession(target)
     },

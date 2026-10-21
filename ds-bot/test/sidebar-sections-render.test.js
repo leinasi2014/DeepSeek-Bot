@@ -137,3 +137,15 @@ test('a hidden Bot is not counted, and a Bot waiting on an answer is', () => {
   const labels = nodesWithClass(tree, 'bt-row').map(node => node.props['aria-label'].split(',')[0])
   assert.equal(labels.includes('Ghost'), false)
 })
+
+test('a hidden conversation is shown and counted while it is the one open', () => {
+  const secret = { id: 'r2', name: 'Secret', hidden: true, members: [], createdAt: 1 }
+  const roster = { ...team, rooms: [...team.rooms, secret], roomsById: { ...team.roomsById, r2: secret } }
+  // The rows keep a hidden room visible while it is the main view; the header must agree.
+  const sessions = { ids: ['r2'], byId: { r2: { id: 'r2', retainedBy: { mainView: 1 } } } }
+  const tree = TeamSidebar({ ...props(true), useRoster: store(roster), useSessions: store(sessions), useSessionRetainInfo: (id, selector) => selector(sessions.byId[id]) })
+  const counts = nodesWithClass(tree, 'bt-side-section-count').map(node => node.props.children.join(''))
+  assert.deepEqual(counts, ['2', '3'])
+  const labels = nodesWithClass(tree, 'bt-row').map(node => node.props['aria-label'].split(',')[0])
+  assert.equal(labels.includes('Secret'), true)
+})

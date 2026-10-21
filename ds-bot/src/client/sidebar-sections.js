@@ -67,8 +67,9 @@ export function sectionCounts({ rooms, bots, unread, asks, approvals = [] }) {
       approvals: approvals.filter(entry => entry.roomId !== undefined && ids.has(entry.roomId)).length,
     }
   }
+  const botIds = new Set(bots.map(item => item.id))
   const botCounts = counts(bots)
-  botCounts.approvals = approvals.filter(entry => entry.roomId === undefined && bots.some(item => item.id === entry.botId)).length
+  botCounts.approvals = approvals.filter(entry => entry.roomId === undefined && botIds.has(entry.botId)).length
   return { rooms: counts(rooms), bots: botCounts }
 }
 

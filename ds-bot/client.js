@@ -5055,8 +5055,9 @@ function sectionCounts({ rooms, bots, unread, asks, approvals = [] }) {
       approvals: approvals.filter((entry) => entry.roomId !== void 0 && ids.has(entry.roomId)).length
     };
   };
+  const botIds = new Set(bots.map((item) => item.id));
   const botCounts = counts2(bots);
-  botCounts.approvals = approvals.filter((entry) => entry.roomId === void 0 && bots.some((item) => item.id === entry.botId)).length;
+  botCounts.approvals = approvals.filter((entry) => entry.roomId === void 0 && botIds.has(entry.botId)).length;
   return { rooms: counts2(rooms), bots: botCounts };
 }
 function unreadNames(ids, bots) {
@@ -5407,7 +5408,6 @@ function TeamSidebar(props) {
   }, [roster, updated]);
   const main = roster.byId[roster.mainBotId];
   const [sections, setSections] = (0, import_react9.useState)(() => readSections());
-  const grouped = (0, import_react9.useMemo)(() => groupEntries(order), [order]);
   const partsOf = (0, import_react9.useMemo)(() => order.map((entry) => {
     const item = entry.item;
     if (entry.kind === "room") return [item.id];
@@ -5416,22 +5416,25 @@ function TeamSidebar(props) {
   }), [order]);
   const statusFlags = props.useSessionStatus ? props.useSessionStatus((map) => JSON.stringify(partsOf.map((parts) => parts.map((part) => [map.get(part)?.completionUnread === true, map.get(part)?.pendingInteraction !== void 0])))) : "[]";
   const approvals = props.useWork ? props.useWork((work) => work?.approvals ?? []) : [];
-  const numbers = (0, import_react9.useMemo)(() => {
+  const activeParts = props.useSessions ? props.useSessions((list) => Object.entries(list.byId ?? {}).filter(([, session]) => (session?.retainedBy?.mainView ?? 0) > 0).map(([part]) => part).join(",")) : "";
+  const activeSet = (0, import_react9.useMemo)(() => new Set(activeParts.split(",").filter(Boolean)), [activeParts]);
+  const view = (0, import_react9.useMemo)(() => {
     const flags = JSON.parse(statusFlags);
     const unread = /* @__PURE__ */ new Set();
     const asks = /* @__PURE__ */ new Set();
-    const visible = { rooms: [], bots: [] };
+    const rooms = [];
+    const bots = [];
     order.forEach((entry, at) => {
       const item = entry.item;
-      if (item.hidden === true) return;
       const parts = partsOf[at] ?? [];
       const rows = flags[at] ?? [];
+      if (item.hidden === true && !parts.some((part) => activeSet.has(part))) return;
       if (markedUnread[item.id] === true || rows.some(([isUnread, waiting]) => isUnread || waiting)) unread.add(item.id);
       if (parts.some((part) => roster.questions?.[part] !== void 0)) asks.add(item.id);
-      (entry.kind === "room" ? visible.rooms : visible.bots).push(item);
+      (entry.kind === "room" ? rooms : bots).push(entry);
     });
-    return sectionCounts({ rooms: visible.rooms, bots: visible.bots, unread, asks, approvals });
-  }, [order, partsOf, statusFlags, markedUnread, roster.questions, approvals]);
+    return { rooms, bots, numbers: sectionCounts({ rooms: rooms.map((entry) => entry.item), bots: bots.map((entry) => entry.item), unread, asks, approvals }) };
+  }, [order, partsOf, statusFlags, activeSet, markedUnread, roster.questions, approvals]);
   const open = wide ? sections : { rooms: true, bots: true };
   const toggle = (id) => {
     const next = { ...sections, [id]: !sections[id] };
@@ -5471,13 +5474,13 @@ function TeamSidebar(props) {
       main ? (0, import_react9.createElement)(BotRow, { ...rowProps, bot: main, marked: markedUnread[main.id] === true }) : roster.ready ? null : (0, import_react9.createElement)("div", { className: "bt-hint" }, t("Setting up your Main Bot…")),
       (0, import_react9.createElement)(
         Section,
-        { key: "rooms", name: wide ? t("Group chats") : void 0, numbers: numbers.rooms, open: open.rooms, onToggle: () => toggle("rooms") },
-        grouped.rooms.map((entry) => (0, import_react9.createElement)(RoomRow, { key: entry.item.id, ...rowProps, room: entry.item, marked: markedUnread[entry.item.id] === true }))
+        { key: "rooms", name: wide ? t("Group chats") : void 0, numbers: view.numbers.rooms, open: open.rooms, onToggle: () => toggle("rooms") },
+        view.rooms.map((entry) => (0, import_react9.createElement)(RoomRow, { key: entry.item.id, ...rowProps, room: entry.item, marked: markedUnread[entry.item.id] === true }))
       ),
       (0, import_react9.createElement)(
         Section,
-        { key: "bots", name: wide ? t("Bots") : void 0, numbers: numbers.bots, open: open.bots, onToggle: () => toggle("bots") },
-        grouped.bots.map((entry) => entry.kind === "bot" ? (0, import_react9.createElement)(BotRow, { key: entry.item.id, ...rowProps, bot: entry.item, marked: markedUnread[entry.item.id] === true }) : (0, import_react9.createElement)(AgentRow, { key: entry.item.id, ...rowProps, agent: entry.item, marked: markedUnread[entry.item.id] === true }))
+        { key: "bots", name: wide ? t("Bots") : void 0, numbers: view.numbers.bots, open: open.bots, onToggle: () => toggle("bots") },
+        view.bots.map((entry) => entry.kind === "bot" ? (0, import_react9.createElement)(BotRow, { key: entry.item.id, ...rowProps, bot: entry.item, marked: markedUnread[entry.item.id] === true }) : (0, import_react9.createElement)(AgentRow, { key: entry.item.id, ...rowProps, agent: entry.item, marked: markedUnread[entry.item.id] === true }))
       )
     )
   );
@@ -14060,7 +14063,7 @@ function apply(ctx) {
       ui2.set((state) => state.newChat || state.exchange || state.menu || state.palette ? { ...state, newChat: null, exchange: null, menu: null, palette: null } : state);
       setPlain(false);
       const target = partFor(id);
-      clearUnread(...unreadNames([id, target], Object.values(roster.getSnapshot().byId)));
+      clearUnread(...unreadNames([id, target], roster.getSnapshot().bots));
       expected = target;
       ctx.uiWorkspace.openSession(target);
     },
