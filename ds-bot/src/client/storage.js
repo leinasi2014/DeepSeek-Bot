@@ -10,6 +10,7 @@ export const STORAGE = {
   agentSessions: 'ds-bot:agent-sessions',
   browserWidth: 'ds-bot:browser-width',
   browsers: 'ds-bot.browser.v2',
+  ui: 'ds-bot:ui',
 }
 
 // Newest legacy name first: when both exist, the more recent value wins.
