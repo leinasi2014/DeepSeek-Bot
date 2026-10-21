@@ -1018,7 +1018,8 @@ export function install(rt) {
       if (error) return error
       if (topic === undefined) return 'Name the topic to move the entry into, such as "travel".'
       const session = exec?.sessionId ?? context.caller.sessionId
-      const now = Date.now()
+      // A monotonic clock: the wall clock can jump forward and hand out a fresh window.
+      const now = performance.now()
       const held = moveBudgetOf(session, now)
       if (held.count >= MOVES_PER_WINDOW) {
         // Say it, do not just refuse: a silent drop makes the model retry the same batch.

@@ -1401,14 +1401,19 @@ test('two moves inside the window, and the third is refused', async (t) => {
 // The window comes from the plugin config, so a test can make it zero: then every call opens
 // a fresh window and nothing is refused. That is what proves the cap is time based and not
 // tied to a turn boundary the tool cannot see.
-test('a zero move window means the budget never binds', async (t) => {
+test('a short window really expires, so the third move succeeds afterwards', async (t) => {
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-move-window-'))
-  const { tool, read, stop } = start({ home, config: { memoryReviewDelayMs: 0, memoryMoveWindowMs: 0 } })
+  const { tool, read, stop } = start({ home, config: { memoryReviewDelayMs: 0, memoryMoveWindowMs: 50 } })
   t.after(() => stop())
   for (const text of ['Alpha one', 'Bravo two', 'Charlie three']) await tool('remember', { text }, 'b2')
-  for (const entry of ['Alpha one', 'Bravo two', 'Charlie three']) {
+  await tool('move', { entry: 'Alpha one', topic: 'ops' }, 'b2')
+  await tool('move', { entry: 'Bravo two', topic: 'ops' }, 'b2')
+  const refused = await tool('move', { entry: 'Charlie three', topic: 'ops' }, 'b2')
+  assert.match(String(refused), /Moved 2 entries just now/, 'two inside a 50ms window bind')
+  await new Promise(resolve => setTimeout(resolve, 70))
+  for (const entry of ['Charlie three']) {
     const answer = await tool('move', { entry, topic: 'ops' }, 'b2')
-    assert.doesNotMatch(String(answer), /Moved 2 entries just now/, 'nothing is refused when the window does not hold')
+    assert.doesNotMatch(String(answer), /Moved 2 entries just now/, 'the window really expired, no fake clock reset')
   }
   assert.equal(parseMemory(read('bots', 'b2', 'MEMORY.md')).entries.length, 0, 'all three moved')
 })
