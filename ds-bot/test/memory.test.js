@@ -877,12 +877,13 @@ test('an answer with a malformed change, an unlisted entry, an entry too long, o
     JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }, { op: 'remove', entry: 7 }] }),
     JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }, { op: 'add', text: `The user tells ${'a long story '.repeat(30)}` }] }),
     JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }, { op: 'add', text: 'The user writes C++', topic: 'C++' }] }),
+    JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }, { op: 'edit', entry: 1, text: 'The user likes green tea', kind: 'fact' }] }),
     JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }, { op: 'add', text: 'I use hunter2 as my password' }] }),
   ]
   const { ctx, call, read, requests, stop } = start({ replies, config: { memoryReviewDelayMs: 0 } })
   t.after(() => stop())
   await call('state', {})
-  for (let tries = 0; tries < 4; tries += 1) {
+  for (let tries = 0; tries < 5; tries += 1) {
     ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
     await reviewed(call)
     assert.throws(() => read('bots', 'b2', 'MEMORY.md'), { code: 'ENOENT' })
@@ -891,7 +892,7 @@ test('an answer with a malformed change, an unlisted entry, an entry too long, o
   ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
   await reviewed(call)
   // A password is only left out: the rest is written and the place moves on.
-  assert.equal(requests.length, 5)
+  assert.equal(requests.length, 6)
   assert.deepEqual(parseMemory(read('bots', 'b2', 'MEMORY.md')).entries.map(entry => entry.text), ['The user likes tea'])
   assert.deepEqual(JSON.parse(read('reviewed.json')), { 'chat:b2': 11 })
 })
