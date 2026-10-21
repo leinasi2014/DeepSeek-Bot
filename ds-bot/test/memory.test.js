@@ -1378,3 +1378,99 @@ test('kind: howto lives in the meta, and an edit keeps it', async (t) => {
   }
   assert.equal(entries().length, 1, 'a refused write changes nothing')
 })
+
+// One turn may move two entries. A model that moves ten per call can empty MEMORY.md in one
+// turn (70 entries measured), so the cap sits on the tool path and refuses out loud.
+test('two moves inside the window, and the third is refused', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-move-budget-'))
+  const { tool, read, stop } = start({ home })
+  t.after(() => stop())
+  for (const text of ['Alpha one', 'Bravo two', 'Charlie three']) await tool('remember', { text }, 'b2')
+  const mainEntries = () => parseMemory(read('bots', 'b2', 'MEMORY.md')).entries.map(entry => entry.text)
+  assert.equal(mainEntries().length, 3, 'three entries to move')
+
+  await tool('move', { entry: 'Alpha one', topic: 'ops' }, 'b2')
+  await tool('move', { entry: 'Bravo two', topic: 'ops' }, 'b2')
+  assert.deepEqual(mainEntries(), ['Charlie three'], 'two moves took two entries out of MEMORY.md')
+
+  const refused = await tool('move', { entry: 'Charlie three', topic: 'ops' }, 'b2')
+  assert.match(String(refused), /Moved 2 entries just now/, 'the third move is refused, and says why')
+  assert.deepEqual(mainEntries(), ['Charlie three'], 'a refused move changes nothing')
+})
+
+// The window comes from the plugin config, so a test can make it zero: then every call opens
+// a fresh window and nothing is refused. That is what proves the cap is time based and not
+// tied to a turn boundary the tool cannot see.
+test('a short window really expires, so the third move succeeds afterwards', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-move-window-'))
+  const { tool, read, stop } = start({ home, config: { memoryReviewDelayMs: 0, memoryMoveWindowMs: 50 } })
+  t.after(() => stop())
+  for (const text of ['Alpha one', 'Bravo two', 'Charlie three']) await tool('remember', { text }, 'b2')
+  await tool('move', { entry: 'Alpha one', topic: 'ops' }, 'b2')
+  await tool('move', { entry: 'Bravo two', topic: 'ops' }, 'b2')
+  const refused = await tool('move', { entry: 'Charlie three', topic: 'ops' }, 'b2')
+  assert.match(String(refused), /Moved 2 entries just now/, 'two inside a 50ms window bind')
+  await new Promise(resolve => setTimeout(resolve, 70))
+  for (const entry of ['Charlie three']) {
+    const answer = await tool('move', { entry, topic: 'ops' }, 'b2')
+    assert.doesNotMatch(String(answer), /Moved 2 entries just now/, 'the window really expired, no fake clock reset')
+  }
+  assert.equal(parseMemory(read('bots', 'b2', 'MEMORY.md')).entries.length, 0, 'all three moved')
+})
+
+// Three refusals in a row, with a new user line before each retry: the review returns early
+// only when nothing new arrived, so the new line is what makes it read the same batch again.
+test('three unreadable reviews in a row give the batch up, with the lines kept', async (t) => {
+  const lines = [
+    { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Please remember this' }] } } },
+    { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Saved.' }] } } } },
+  ]
+  const replies = ['not json', 'still not json', 'nope']
+  const { ctx, call, read, stop } = start({ replies, history: { b2: lines }, config: { memoryReviewDelayMs: 0 } })
+  t.after(() => stop())
+  await call('state', {})
+  for (let tries = 0; tries < 3; tries += 1) {
+    lines.push({ event: { seq: 12 + tries, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: tries === 0 ? 'the password\nis DEMO_ONLY' : `retry ${tries}` }] } } })
+    // A non-idle status in between: the listener debounces, so a second `idle` would only
+    // clear the first one's timer and no second review would run at all.
+    ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'working' })
+    ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
+    try { await reviewed(call) } catch (error) { if (!/not a list of changes/.test(String(error))) throw error }
+  }
+  // The third refusal gives the batch up: the lines are recorded, the cursor moves past
+  // them, and the counter for this conversation is cleared.
+  const journal = read('journal.jsonl').split('\n').filter(Boolean).map(line => JSON.parse(line))
+  const skip = journal.find(entry => entry.op === 'skip' && entry.reason === 'invalid-review')
+  assert.ok(skip, 'the batch is recorded as given up')
+  assert.equal(skip.intendedOp, 'review')
+  assert.match(String(skip.after), /user:/i, 'the lines themselves are kept, not a count')
+  // A secret split over two lines must not reach the log: the text is collapsed before the
+  // check, so the placeholder stands in for the whole line.
+  assert.doesNotMatch(String(skip.after), /DEMO_ONLY/, 'the secret never reaches the log')
+  assert.match(String(skip.after), /left out: looks like a secret/, 'the line is recorded as left out')
+  assert.ok(JSON.parse(read('reviewed.json'))['chat:b2'] > 9, 'the cursor moved past the batch it gave up on')
+  assert.equal(JSON.parse(read('rejections.json'))['chat:b2'], undefined, 'the counter is cleared')
+})
+
+test('one readable review clears the count, so two more bad ones do not give the batch up', async (t) => {
+  const replies = ['bad', 'bad', JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }] }), 'bad', 'bad']
+  const lines = [
+    { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Please remember this' }] } } },
+    { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Saved.' }] } } } },
+  ]
+  const { ctx, call, read, requests, stop } = start({ home: undefined, replies, history: { b2: lines }, config: { memoryReviewDelayMs: 0 } })
+  t.after(() => stop())
+  await call('state', {})
+  for (let tries = 0; tries < 5; tries += 1) {
+    // A new line every turn, or the review returns early for having nothing to read.
+    lines.push({ event: { seq: 12 + tries, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: `line ${tries}` }] } } })
+    ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'working' })
+    ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
+    try { await reviewed(call) } catch (error) { if (!/not a list of changes/.test(String(error))) throw error }
+  }
+  const journal = read('journal.jsonl').split('\n').filter(Boolean).map(line => JSON.parse(line))
+  assert.equal(journal.filter(entry => entry.reason === 'invalid-review').length, 0, 'two bads after a success never reach three')
+  assert.deepEqual(parseMemory(read('bots', 'b2', 'MEMORY.md')).entries.map(entry => entry.text), ['The user likes tea'])
+  // Every queued answer was really sent, so "two bads after a success" means something.
+  assert.equal(requests.length, 5, 'a review ran on every turn')
+})
