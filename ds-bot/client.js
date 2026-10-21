@@ -11259,7 +11259,8 @@ var STORAGE = {
   surface: "ds-bot:surface",
   agentSessions: "ds-bot:agent-sessions",
   browserWidth: "ds-bot:browser-width",
-  browsers: "ds-bot.browser.v2"
+  browsers: "ds-bot.browser.v2",
+  ui: "ds-bot:ui"
 };
 var LEGACY_PREFIXES = ["dsh-bot:", "dsh-bot-team:"];
 var LEGACY_BROWSER_KEYS = ["ds-bot.browser.v1", "dsh-bot.browser.v1"];
