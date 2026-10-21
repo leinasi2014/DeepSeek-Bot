@@ -372,6 +372,7 @@ const reviewSystem = teamWrites => [
   'Merge before adding. When the new messages are about something already saved and only part of it changed — a date, a place, a person, a number, a status — change that entry with edit: it is the same fact, not a new one. When two saved entries say the same thing, keep one, edit it to hold what both said, and remove the other. Add only when nothing saved is about it.',
   '  saved: "The team trip to Hangzhou is 20–22 October" · the user now says 26–28 October → {"op": "edit", "entry": 4, "text": "The team trip to Hangzhou is 26–28 October"}',
   '  saved twice, as "Deploys are on weekday evenings" and a copy with another number → keep one with edit and remove the copy',
+  'Change an entry with edit, never by removing it and adding the new text back: the entry keeps its place and its source that way. When two entries say the same thing, edit the one that stays and remove the other; never remove both and add a third.',
   'Put a detail in a topic that already fits it, named in the list above; make a new topic only when none does.',
   'Each change is one of',
   '  {"op": "add", "text": "…"}',
