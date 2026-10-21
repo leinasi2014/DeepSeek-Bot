@@ -1387,7 +1387,7 @@ test('three unreadable reviews in a row give the batch up, with the lines kept',
     { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Saved.' }] } } } },
   ]
   const replies = ['not json', 'still not json', 'nope']
-  const { ctx, call, read, stop } = start({ replies, history: { 'chat:b2': lines }, config: { memoryReviewDelayMs: 0 } })
+  const { ctx, call, read, stop } = start({ replies, history: { b2: lines }, config: { memoryReviewDelayMs: 0 } })
   t.after(() => stop())
   await call('state', {})
   for (let tries = 0; tries < 3; tries += 1) {
@@ -1396,7 +1396,7 @@ test('three unreadable reviews in a row give the batch up, with the lines kept',
     // clear the first one's timer and no second review would run at all.
     ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'working' })
     ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
-    try { await reviewed(call) } catch { /* a refused answer is expected */ }
+    try { await reviewed(call) } catch (error) { if (!/not a list of changes/.test(String(error))) throw error }
   }
   // The third refusal gives the batch up: the lines are recorded, the cursor moves past
   // them, and the counter for this conversation is cleared.

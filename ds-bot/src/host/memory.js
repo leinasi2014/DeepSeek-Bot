@@ -1480,14 +1480,20 @@ export function install(rt) {
           })
           // The cursor first: if that write fails the counter stays, so the next review
           // starts from the same place instead of silently skipping lines nobody read.
-          cursorsNow()[key] = through
-          await writeText(cursorsPath, JSON.stringify(cursors))
-          delete rejections[key]
-          await saveRejections(rejections)
-          rt.warn('ds-bot: memory review of %s gave up on three unreadable answers in a row', bot.name)
-          // More of this conversation has not been read yet: hand the rest on, or it is
-          // never reviewed because the cursor no longer moves on its own.
+          // Hand the rest over before anything below can fail: a failed write must not
+          // leave the remaining lines unread for good.
           if (more) queueReview(sessionId, room === undefined ? seen : { botId: bot.id, roomId: room.id, room })
+          // Disk first, then memory: if the write fails, memory keeps the old cursor and the
+          // batch is retried rather than skipped in name only.
+          await writeText(cursorsPath, JSON.stringify({ ...cursorsNow(), [key]: through }))
+          cursorsNow()[key] = through
+          try {
+            delete rejections[key]
+            await saveRejections(rejections)
+          } catch (error) {
+            rt.warn('ds-bot: could not clear the review rejection count: %s', error)
+          }
+          rt.warn('ds-bot: memory review of %s gave up on three unreadable answers in a row', bot.name)
           return
         }
         throw new Error(`the model's answer is not a list of changes: ${clip(reply.replace(/\s+/g, ' '), 120)}`)
