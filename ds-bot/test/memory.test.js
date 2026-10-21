@@ -1379,6 +1379,45 @@ test('kind: howto lives in the meta, and an edit keeps it', async (t) => {
   assert.equal(entries().length, 1, 'a refused write changes nothing')
 })
 
+// One turn may move two entries. A model that moves ten per call can empty MEMORY.md in one
+// turn (70 entries measured), so the cap sits on the tool path and refuses out loud.
+test('two moves inside the window, and the third is refused', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-move-budget-'))
+  const { tool, read, stop } = start({ home })
+  t.after(() => stop())
+  for (const text of ['Alpha one', 'Bravo two', 'Charlie three']) await tool('remember', { text }, 'b2')
+  const mainEntries = () => parseMemory(read('bots', 'b2', 'MEMORY.md')).entries.map(entry => entry.text)
+  assert.equal(mainEntries().length, 3, 'three entries to move')
+
+  await tool('move', { entry: 'Alpha one', topic: 'ops' }, 'b2')
+  await tool('move', { entry: 'Bravo two', topic: 'ops' }, 'b2')
+  assert.deepEqual(mainEntries(), ['Charlie three'], 'two moves took two entries out of MEMORY.md')
+
+  const refused = await tool('move', { entry: 'Charlie three', topic: 'ops' }, 'b2')
+  assert.match(String(refused), /Moved 2 entries just now/, 'the third move is refused, and says why')
+  assert.deepEqual(mainEntries(), ['Charlie three'], 'a refused move changes nothing')
+})
+
+// The window comes from the plugin config, so a test can make it zero: then every call opens
+// a fresh window and nothing is refused. That is what proves the cap is time based and not
+// tied to a turn boundary the tool cannot see.
+test('a short window really expires, so the third move succeeds afterwards', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-move-window-'))
+  const { tool, read, stop } = start({ home, config: { memoryReviewDelayMs: 0, memoryMoveWindowMs: 50 } })
+  t.after(() => stop())
+  for (const text of ['Alpha one', 'Bravo two', 'Charlie three']) await tool('remember', { text }, 'b2')
+  await tool('move', { entry: 'Alpha one', topic: 'ops' }, 'b2')
+  await tool('move', { entry: 'Bravo two', topic: 'ops' }, 'b2')
+  const refused = await tool('move', { entry: 'Charlie three', topic: 'ops' }, 'b2')
+  assert.match(String(refused), /Moved 2 entries just now/, 'two inside a 50ms window bind')
+  await new Promise(resolve => setTimeout(resolve, 70))
+  for (const entry of ['Charlie three']) {
+    const answer = await tool('move', { entry, topic: 'ops' }, 'b2')
+    assert.doesNotMatch(String(answer), /Moved 2 entries just now/, 'the window really expired, no fake clock reset')
+  }
+  assert.equal(parseMemory(read('bots', 'b2', 'MEMORY.md')).entries.length, 0, 'all three moved')
+})
+
 // Three refusals in a row, with a new user line before each retry: the review returns early
 // only when nothing new arrived, so the new line is what makes it read the same batch again.
 test('three unreadable reviews in a row give the batch up, with the lines kept', async (t) => {

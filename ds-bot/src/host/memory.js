@@ -40,6 +40,12 @@ export const MEMORY_LIMITS = { entry: 300, main: 4_000, topic: 16_000, topics: 4
 export const readers = { readText: path => readFileSync(path, 'utf8') }
 
 const MAIN = 'MEMORY.md'
+// At most this many moves inside one window. Measured bursts are 9-10 entries per call and 70
+// in one run (3,931 -> 547 characters), which takes away what every conversation reads. A tool
+// cannot see a turn boundary — exec carries a per-call id, and two turns can run back to back
+// with no idle between them — so the cap is a time window, not a turn.
+const MOVES_PER_WINDOW = 2
+const MOVE_WINDOW_MS = 30_000
 // How many unreadable review answers in a row on the same batch before the review gives
 // the batch up and moves on. One or two are treated as a slip.
 const REJECTIONS_MAX = 3
@@ -463,6 +469,23 @@ const askRequest = ({ name, numbered, language, text }) => [
 
 export function install(rt) {
   const { ctx, config, home, state } = rt
+  // Moves made in the window now open, per Session. Expiry is a timer, so nothing here
+  // depends on status events (which a session with memoryReview off never gets). The window
+  // length comes from the plugin config, the same place as memoryReviewDelayMs.
+  const moveWindowMs = config.memoryMoveWindowMs ?? MOVE_WINDOW_MS
+  const moveSpent = new Map()
+  const moveBudgetOf = (session, now) => {
+    const held = moveSpent.get(session)
+    if (held !== undefined && now < held.until) return held
+    const fresh = { count: 0, until: now + moveWindowMs }
+    moveSpent.set(session, fresh)
+    const timer = setTimeout(() => {
+      const current = moveSpent.get(session)
+      if (current === fresh) moveSpent.delete(session)
+    }, moveWindowMs + 1000)
+    timer.unref?.()
+    return fresh
+  }
 
   if (config.memory === false) {
     Object.assign(rt, {
@@ -997,9 +1020,23 @@ export function install(rt) {
       const { topic, error } = topicArg(args.topic)
       if (error) return error
       if (topic === undefined) return 'Name the topic to move the entry into, such as "travel".'
+      const session = exec?.sessionId ?? context.caller.sessionId
+      // A monotonic clock: the wall clock can jump forward and hand out a fresh window.
+      const now = performance.now()
+      const held = moveBudgetOf(session, now)
+      if (held.count >= MOVES_PER_WINDOW) {
+        // Say it, do not just refuse: a silent drop makes the model retry the same batch.
+        return `Moved ${MOVES_PER_WINDOW} entries just now, so nothing was moved: wait ${Math.ceil(moveWindowMs / 1000)} seconds before moving more. Do not call move again in this run; forget what no longer matters, or make room later.`
+      }
+      // Take the slot before awaiting: three calls in one answer all see the same count
+      // otherwise, and a burst would slip through.
+      held.count += 1
       try {
-        return (await moveEntry({ ...context, topic, match: args.entry })).message
+        const moved = await moveEntry({ ...context, topic, match: args.entry })
+        if (!moved.changed) held.count -= 1
+        return moved.message
       } catch (failure) {
+        held.count -= 1
         return failure.message
       }
     },
