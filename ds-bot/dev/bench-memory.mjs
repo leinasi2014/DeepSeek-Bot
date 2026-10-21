@@ -127,6 +127,7 @@ const WRITE_OPS = new Set(['add', 'replace', 'move'])
 const isSave = event => WRITE_OPS.has(event.op)
 
 const say = line => console.log(line)
+const botNamed = async name => (await api('state')).bots.find(bot => bot.name === name)
 async function mainBot() {
   const view = await api('state')
   return view.bots.find(bot => bot.id === view.mainBotId)
@@ -224,7 +225,7 @@ async function roundA1(round) {
   //   repeatWrites— the turn made two or more write calls (remember/forget). A retry after
   //                 a refusal looks like this, but so does any turn that wrote twice, so it
   //                 is a proxy for "wrote more than once", not proof of a cleanup.
-  const report = { scenario: 'A1', round, attempted: 0, landed: 0, refused: 0, repeatWrites: 0, skips: 0, replaces: 0, moves: 0, details: [] }
+  const report = { scenario: 'A1', round, attempted: 0, landed: 0, landedAny: 0, refused: 0, repeatWrites: 0, skips: 0, replaces: 0, moves: 0, details: [] }
   if (args['team-source']) {
     mkdirSync(writeHere(join(MEM, 'team')), { recursive: true })
     copyFileSync(args['team-source'], writeHere(TEAM_MAIN))
@@ -239,23 +240,26 @@ async function roundA1(round) {
   for (const [index, fact] of FACTS.entries()) {
     report.attempted += 1
     const charsBefore = teamChars()
-    const result = await step(`remember ${index + 1}`, () => send(chief.id, `把这条记进长期记忆，很重要：${fact}`))
+    const result = await step(`remember ${index + 1}`, () => send(chief.id, `把这条记进团队记忆（remember 带 scope: "team"），很重要：${fact}`))
     const charsAfter = teamChars()
     const answer = result.calls.filter(call => call.text).map(call => call.text).join('\n')
     const refused = /would have \d+ of its \d+ characters/.test(answer)
-    // Mechanical only: did this turn save anything (add/replace/move), and where. Whether
-    // the saved text means what the fact meant is the manual spot-check, not a string test.
+    // Mechanical only: did this turn save anything (add/replace/move), and where. The team
+    // scope is what this scenario measures: the full file is team/MEMORY.md, and a write to
+    // the Bot's own memory would never meet its limit.
     const wrote = result.writes.some(isSave)
+    const wroteTeam = result.writes.some(change => isSave(change) && String(change.scope ?? '') === 'team')
     const writeCalls = result.tools.filter(name => name === 'remember' || name === 'forget').length
-    const ops = result.writes.map(change => change.file ? `${change.op}@${change.file}` : change.op ?? '?')
+    const ops = result.writes.map(change => `${change.op}@${String(change.scope ?? '?')}:${change.file ?? '?'}`)
     for (const op of ops) report.ops[op] = (report.ops[op] ?? 0) + 1
     report.skips += opCount(result.writes, 'skip')
     report.replaces += opCount(result.writes, 'replace')
     report.moves += opCount(result.writes, 'move')
-    if (wrote) report.landed += 1
+    if (wrote) report.landedAny += 1
+    if (wroteTeam) report.landed += 1
     if (refused) report.refused += 1
     if (writeCalls > 1) report.repeatWrites += 1
-    report.details.push({ fact: fact.slice(0, 12), refused, wrote, writeCalls, ops, chars: [charsBefore, charsAfter], tools: result.tools })
+    report.details.push({ fact: fact.slice(0, 12), refused, wrote, wroteTeam, writeCalls, ops, chars: [charsBefore, charsAfter], tools: result.tools })
     table.push(`    ${String(index + 1).padStart(2)} ${(ops.join(' ') || 'no write').padEnd(30)} ${charsBefore} -> ${charsAfter}`)
   }
   say('  per write (from journal.jsonl):')
@@ -266,7 +270,7 @@ async function roundA1(round) {
   report.entries = report.endStats.team.body
   report.index = report.endStats.team.index
   report.pass = report.landed >= 10
-  say(`  A1 r${round}: landed ${report.landed}/12, refused ${report.refused}, skips ${report.skips}, replace ${report.replaces}, move ${report.moves}, ${statLine(report.endStats)} ${report.pass ? 'PASS' : 'FAIL'}`)
+  say(`  A1 r${round}: landed team ${report.landed}/12 (any scope ${report.landedAny}/12), refused ${report.refused}, skips ${report.skips}, replace ${report.replaces}, move ${report.moves}, ${statLine(report.endStats)} ${report.pass ? 'PASS' : 'FAIL'}`)
   return report
 }
 
@@ -308,6 +312,9 @@ async function roundA2(round) {
   const cursorBefore = reviewed()
   let reviews = 0
   const writes = []
+  // The team file is the one that fills up, so this round asks for team writes first; own is
+  // the control. The review still chooses the scope, and both are reported.
+  await step('scope primer', () => send(chief.id, '以后团队相关的事请写进团队记忆（remember 带 scope: "team"）；个人偏好可以写我自己的记忆。'))
   // Batches of four keep the turn count, and the cost, bounded.
   for (let index = 0; index < REVIEW_INPUT.length; index += 4) {
     const batch = REVIEW_INPUT.slice(index, index + 4)
@@ -317,6 +324,7 @@ async function roundA2(round) {
     reviews += result.calls.filter(call => call.kind === 'review').length
     writes.push(...result.writes)
   }
+  const after = teamContent()
   report.endStats = scopeStats(chief)
   report.endEntries = report.endStats.team.body
   report.endChars = report.endStats.team.chars
@@ -333,6 +341,8 @@ async function roundA2(round) {
   report.ownDelta = report.endStats.own.body - report.startStats.own.body
   report.overLimit = [report.startStats.team, report.endStats.team, report.startStats.own, report.endStats.own].some(scope => scope.chars > 4_000)
   report.replaces = opCount(writes, 'replace')
+  report.teamReplaces = writes.filter(event => event.op === 'replace' && String(event.scope ?? '') === 'team').length
+  report.ownReplaces = writes.filter(event => event.op === 'replace' && String(event.scope ?? '') !== 'team').length
   report.skips = opCount(writes, 'skip')
   report.moves = opCount(writes, 'move')
   // Raw writes for the manual spot-check: whether a replace merged the right entries is
@@ -342,14 +352,16 @@ async function roundA2(round) {
     round,
     kind: 'write',
     op: event.op ?? null,
+    scope: String(event.scope ?? ''),
     file: event.file ?? null,
     text: event.after ?? event.text ?? event.before ?? '',
   })).filter(sample => sample.text !== '')
-  // Mechanical only: a review ran, the cursor strictly advanced without going backwards,
-  // both files stayed under their limits at start and end, and at least one replace
-  // happened. Whether a replace merged the right entries is the manual spot-check.
-  report.pass = report.delta <= 14 && report.ownDelta <= 14 && !report.overLimit && report.cursorMoved && reviews >= 1 && report.replaces >= 1
-  say(`  A2 r${round}: team Δ${report.delta}, own Δ${report.ownDelta}, reviews ${reviews}, replace ${report.replaces}, skip ${report.skips}, move ${report.moves}, cursor ${report.cursorMoved} (${advancedKeys.length} advanced, ${regressedKeys.length} regressed), ${statLine(report.endStats)} ${report.pass ? 'PASS' : 'FAIL'}`)
+  // Team is the primary criterion: the review had to run, the team cursor strictly advanced
+  // without going backwards, the team file stayed under its limit at start and end, team
+  // growth stayed within +14, and at least one replace happened on the team memory. Own is
+  // reported as a control.
+  report.pass = report.delta <= 14 && !report.overLimit && report.cursorMoved && reviews >= 1 && report.teamReplaces >= 1
+  say(`  A2 r${round}: team Δ${report.delta} (replace ${report.teamReplaces}), own Δ${report.ownDelta} (replace ${report.ownReplaces}), reviews ${reviews}, skip ${report.skips}, move ${report.moves}, cursor ${report.cursorMoved} (${advancedKeys.length} advanced, ${regressedKeys.length} regressed), ${statLine(report.endStats)} ${report.pass ? 'PASS' : 'FAIL'}`)
   return report
 }
 
@@ -490,7 +502,7 @@ const shown = samples.slice(0, 5)
 const sampleNote = samples.length < 5 ? `only ${samples.length}, not 5` : `first 5 of ${samples.length}`
 say(`\nmanual spot-check: ${sampleNote}`)
 for (const [index, sample] of shown.entries()) {
-  say(`  ${index + 1}. [${sample.scenario} r${sample.round} ${sample.kind}] op=${sample.op ?? '-'} file=${sample.file ?? '-'} query=${sample.query ?? '-'}`)
+  say(`  ${index + 1}. [${sample.scenario} r${sample.round} ${sample.kind}] op=${sample.op ?? '-'} scope=${sample.scope ?? '-'} file=${sample.file ?? '-'} query=${sample.query ?? '-'}`)
   say(`     ${String(sample.text).replace(/\n/g, '\n     ')}`)
 }
 report.manualSamples = samples
