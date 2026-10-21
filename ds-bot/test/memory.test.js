@@ -1488,6 +1488,12 @@ test('after a cleared count, the next reviews each read their own new lines', as
   t.after(() => stop())
   await call('state', {})
   for (let tries = 0; tries < 5; tries += 1) {
+    // Right after the readable answer (turn 3, index 2) has consumed its batch: the
+    // counter for this conversation must already be gone, before any later cursor
+    // movement could mask a clear that never happened.
+    if (tries === 3) {
+      assert.equal(JSON.parse(read('rejections.json'))['chat:b2'], undefined, 'the count is cleared the moment the readable answer lands')
+    }
     lines.push({ event: { seq: 12 + tries, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: `line ${tries}` }] } } })
     ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'working' })
     ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
@@ -1497,6 +1503,7 @@ test('after a cleared count, the next reviews each read their own new lines', as
   // Only the "New in" block is the batch this review reads; the "Earlier" block above it
   // is context from before, and legitimately repeats older lines.
   const freshOf = request => promptOf(request).split(/New in [^\n]*\n/)[1] ?? ''
+  const userLines = request => (freshOf(request).match(/^User: .*$/gm) ?? [])
   assert.equal(requests.length, 5, 'a review ran on every turn')
   // The first three attempts share one batch (the two failures reread it), and the
   // readable answer consumes it.
@@ -1504,9 +1511,9 @@ test('after a cleared count, the next reviews each read their own new lines', as
   assert.match(freshOf(requests[2]), /User: line 2/, 'the readable review reads the batch grown to line 2')
   // After the cleared count the cursor is past that batch: the next reviews read only
   // what arrived since, never the lines the readable answer already consumed.
-  assert.match(freshOf(requests[3]), /User: line 3/, 'the first review after the clear runs on the new batch')
+  assert.deepEqual(userLines(requests[3]), ['User: line 3'], 'the first review after the clear reads exactly line 3, nothing else')
   assert.doesNotMatch(freshOf(requests[3]), /User: line 2/, 'the consumed batch is not reread')
-  assert.match(freshOf(requests[4]), /User: line 4/, 'the second review after the clear runs too, and rereads only its own pending batch')
+  assert.deepEqual(userLines(requests[4]), ['User: line 3', 'User: line 4'], 'the second review after the clear rereads exactly its pending batch: line 3 and line 4')
   // This scenario writes nothing on purpose (the readable answer has no changes), so the
   // journal may not exist at all — which is itself the absence of any give-up record.
   const journal = existsSync(join(home, 'memory', 'journal.jsonl')) ? read('journal.jsonl').split('\n').filter(Boolean).map(line => JSON.parse(line)) : []
