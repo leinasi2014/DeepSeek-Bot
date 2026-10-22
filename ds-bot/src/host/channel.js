@@ -262,6 +262,7 @@ export function install(rt) {
         case 'memory-view':
         case 'memory-ask':
         case 'memory-forget':
+        case 'memory-task-retry':
           await rt.load()
           return ok(await rt.memoryEndpoint(endpoint, body))
         case 'answer-question': {

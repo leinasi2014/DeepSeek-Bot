@@ -32,7 +32,7 @@ import { speakerOf } from '../shared/mentions.js'
 import { output } from './tools.js'
 import { memoryFiles } from './memory-files.js'
 import { memoryIndex } from './memory-index.js'
-import { taskReview as createTaskReview } from './task-review.js'
+import { STATUS as TASK_STATUS, taskReview as createTaskReview } from './task-review.js'
 import { within } from './folders.js'
 
 // Fixed sizes, in characters. Both MEMORY.md files ride in every request of every
@@ -661,7 +661,11 @@ export function install(rt) {
       const file = realpathSync(path)
       const root = realpathSync(folder)
       if (!within(file, root)) return undefined
-      return readFileSync(file, 'utf8').slice(0, TASK_FILE_MAX)
+      const text = readFileSync(file, 'utf8').slice(0, TASK_FILE_MAX)
+      // The read must have come from the same real path the containment check proved: if
+      // the link or the file changed under the check, nothing here is proven.
+      if (realpathSync(file) !== file) return undefined
+      return text
     } catch {
       return undefined
     }
@@ -707,20 +711,34 @@ export function install(rt) {
       // rather than falling back to the conversation.
       const named = claim.kind === 'file' && isAbsolute(String(claim.ref ?? '').trim())
       let supported
+      let context = ''
       if (named) {
         const file = taskClaimFile(record, claim.ref)
         supported = file !== undefined && file.includes(evidence)
+        context = supported ? `file ${claim.ref}` : ''
       } else {
-        supported = lines.some((line) => String(line.text ?? '').replace(/\r\n/g, '\n').includes(evidence))
+        const line = lines.find(candidate => String(candidate.text ?? '').replace(/\r\n/g, '\n').includes(evidence))
+        supported = line !== undefined
+        context = supported ? String(line.text ?? '').slice(0, 300) : ''
       }
       if (!supported) { drop('evidence-unsupported', { claim: claim.index, text, evidence: evidence.slice(0, 120) }); continue }
-      candidates.push({ claim: claim.index, topic: cleanTopic(item?.topic) ?? '', text, outcome, evidence })
+      // A command or test result carries its own failure markers in the text the tool
+      // rendered; the semantic check is told about them rather than left to guess.
+      const toolFailed = claim.kind === 'command' || claim.kind === 'test'
+        ? /\[exit code: [1-9]\d*\]|\[timed out|\[killed by signal|\[stderr\]/.test(context)
+        : undefined
+      candidates.push({ claim: claim.index, topic: cleanTopic(item?.topic) ?? '', text, outcome, evidence, context, toolFailed })
     }
     if (candidates.length === 0) return { items: [], dropped }
     // Gate two: the model judges whether each quote really supports its claim, and its
-    // answer is recorded with the entry.
+    // answer is recorded with the entry. It reads the surrounding line too, so a negation
+    // just outside the quote is not cut away.
     const verdict = await botShot(bot, TASK_VERIFY_SYSTEM, candidates.map(entry => JSON.stringify({
-      claim: claims[entry.claim].statement, evidence: entry.evidence,
+      claim: claims[entry.claim].statement,
+      kind: claims[entry.claim].kind,
+      evidence: entry.evidence,
+      context: entry.context,
+      ...(entry.toolFailed === undefined ? {} : { toolReportedFailure: entry.toolFailed }),
     })).join('\n'), { sessionId: record.sessionId, kind: 'memory' })
     const support = parseTaskJson(verdict)?.support
     if (!Array.isArray(support)) return { invalid: 'the model did not answer with support' }
@@ -2182,6 +2200,15 @@ export function install(rt) {
     if (endpoint === 'memory-view') return memoryView(body)
     if (endpoint === 'memory-ask') return memoryAsk(body)
     if (endpoint === 'memory-forget') return memoryForget(body)
+    // The explicit way back for a task whose lessons the evidence gates refused: nothing
+    // retries by itself, and a frozen plan is never extracted again.
+    if (endpoint === 'memory-task-retry') {
+      const id = String(body?.candidateId ?? '')
+      const record = await taskReview.retry(id)
+      if (record === undefined) return { ok: false, error: 'No such task candidate.' }
+      if (record.status === TASK_STATUS.pending) void runSessionTasks(record.sessionId)
+      return { ok: true, status: record.status, unverified: record.unverified ?? [] }
+    }
     throw new Error(`Unknown endpoint ${endpoint}`)
   }
 

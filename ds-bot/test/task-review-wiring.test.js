@@ -34,6 +34,8 @@ const HISTORY = {
 // The three model calls are answered by their system prompt, so the order in which the
 // idle handlers happen to run does not matter.
 function start({ items = [], support = [], memory = '{"changes":[]}' } = {}) {
+  // Each verify call takes the next list, so a retry can be answered differently.
+  const supportQueue = Array.isArray(support[0]) ? [...support] : undefined
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-task-review-wiring-'))
   writeFileSync(join(home, 'state.json'), JSON.stringify(TEAM))
   const ctx = fakeContext()
@@ -49,7 +51,7 @@ function start({ items = [], support = [], memory = '{"changes":[]}' } = {}) {
         let reply = ''
         if (system.startsWith('You keep the long-term memory')) reply = memory
         else if (system.startsWith('You turn a reported finished task')) reply = JSON.stringify({ items })
-        else if (system.startsWith('You check whether')) reply = JSON.stringify({ support })
+        else if (system.startsWith('You check whether')) reply = JSON.stringify({ support: supportQueue === undefined ? support : (supportQueue.shift() ?? []) })
         yield { type: 'text-delta', index: 0, text: reply }
         yield { type: 'finish', reason: { kind: 'stop' } }
       },
@@ -66,8 +68,15 @@ function start({ items = [], support = [], memory = '{"changes":[]}' } = {}) {
     sessions: { messageProjections: [] },
     workspaceRegistry: { archiveSession: async () => {} },
   })
+  let route
+  const register = ctx.connection.fetch.register
+  ctx.connection.fetch.register = (options) => { route = options; return register(options) }
   apply(ctx, { home, memoryReviewDelayMs: 0 })
   const tool = (name, args, sessionId, callId) => ctx.registeredTools.get(name).execute(args, { agent: { id: sessionId }, callId })
+  const json = async (endpoint, payload) => {
+    const response = await route.fetch(new Request('http://localhost/api/bot', { method: 'POST', body: JSON.stringify({ endpoint, payload }) }))
+    return response.json()
+  }
   const memoryFile = () => join(home, 'memory', 'bots', 'b2', 'MEMORY.md')
   const planDir = () => join(home, 'memory', 'task-plans')
   const plans = () => (existsSync(planDir())
@@ -77,7 +86,7 @@ function start({ items = [], support = [], memory = '{"changes":[]}' } = {}) {
     await ctx.dispose()
     rmSync(home, { recursive: true, force: true, maxRetries: 5 })
   }
-  return { ctx, home, tool, memoryFile, planDir, plans, requests, stop }
+  return { ctx, home, tool, json, memoryFile, planDir, plans, requests, stop }
 }
 
 const settle = () => new Promise(resolve => setTimeout(resolve, 20))
@@ -107,9 +116,9 @@ test('a report whose evidence is not in the conversation writes no memory', asyn
   assert.match(await s.tool('complete_task', { ...report, claims: [forged] }, 'b2', 'c1'), /Recorded as a candidate/)
   idle(s.ctx)
   await until(() => s.plans().length === 1)
-  await until(() => s.plans()[0].status === 'DONE')
+  await until(() => s.plans()[0].status === 'HELD')
   assert.equal(existsSync(s.memoryFile()), false, 'nothing was written to memory')
-  assert.equal(s.plans()[0].plan.items.length, 0, 'the mechanical gate dropped the item')
+  assert.equal(s.plans()[0].plan, null, 'no plan is frozen when every lesson was refused')
   // What the gate refused stays with the candidate, never in the Markdown.
   assert.equal(s.plans()[0].unverified[0].reason, 'evidence-unsupported')
 })
@@ -141,9 +150,9 @@ test('a file claim outside the Session folder is refused even when the words mat
   await s.tool('complete_task', { ...report, claims: [claim] }, 'b2', 'call-file')
   idle(s.ctx)
   await until(() => s.plans().length === 1)
-  await until(() => s.plans()[0].status === 'DONE')
+  await until(() => s.plans()[0].status === 'HELD')
   assert.equal(existsSync(s.memoryFile()), false)
-  assert.equal(s.plans()[0].plan.items.length, 0)
+  assert.equal(s.plans()[0].plan, null)
   assert.equal(s.plans()[0].unverified[0].reason, 'evidence-unsupported')
 })
 
@@ -153,8 +162,9 @@ test('a model that does not support the claim writes no memory', async t => {
   await s.tool('complete_task', report, 'b2', 'call-2')
   idle(s.ctx)
   await until(() => s.plans().length === 1)
-  await until(() => s.plans()[0].status === 'DONE')
+  await until(() => s.plans()[0].status === 'HELD')
   assert.equal(existsSync(s.memoryFile()), false)
+  assert.equal(s.plans()[0].unverified[0].reason, 'model-unsupported')
 })
 
 test('a done candidate never asks the model again', async t => {
@@ -170,4 +180,36 @@ test('a done candidate never asks the model again', async t => {
   await settle()
   assert.equal(s.requests.length, calls, 'a done candidate is not extracted again')
   assert.equal(parseMemory(readFileSync(s.memoryFile(), 'utf8')).entries.length, 1)
+})
+
+test('an explicit retry reopens a held task, and a frozen one is never extracted again', async t => {
+  // The first check says no, so nothing is written and the candidate is held; the retry
+  // asks once more and the second answer supports the claim.
+  const s = start({ items: ONE_ITEM, support: [['no'], ['yes']] })
+  t.after(() => s.stop())
+  await s.tool('complete_task', report, 'b2', 'call-retry')
+  idle(s.ctx)
+  await until(() => s.plans().length === 1)
+  await until(() => s.plans()[0].status === 'HELD')
+  assert.equal(existsSync(s.memoryFile()), false, 'a held task wrote nothing')
+  assert.equal(s.plans()[0].unverified[0].reason, 'model-unsupported')
+  // Idle alone must not look again.
+  const before = s.requests.filter(request => String(request.system).startsWith('You turn a reported')).length
+  idle(s.ctx)
+  await settle()
+  await settle()
+  const afterIdle = s.requests.filter(request => String(request.system).startsWith('You turn a reported')).length
+  assert.equal(afterIdle, before, 'nothing retries by itself')
+  const id = s.plans()[0].candidateId
+  const retried = await s.json('memory-task-retry', { candidateId: id })
+  assert.equal(retried.value.ok, true)
+  assert.equal(retried.value.status, 'PENDING')
+  idle(s.ctx)
+  await until(() => s.plans().some(record => record.candidateId === id && record.status === 'DONE'))
+  assert.equal(parseMemory(readFileSync(s.memoryFile(), 'utf8')).entries.length, 1)
+  // A frozen plan is never extracted again, even when asked.
+  const extraction = s.requests.filter(request => String(request.system).startsWith('You turn a reported')).length
+  await s.json('memory-task-retry', { candidateId: id })
+  await settle()
+  assert.equal(s.requests.filter(request => String(request.system).startsWith('You turn a reported')).length, extraction)
 })

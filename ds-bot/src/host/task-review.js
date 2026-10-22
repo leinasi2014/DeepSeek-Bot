@@ -33,6 +33,10 @@ export const STATUS = {
   conflict: 'CONFLICT',
   corrupt: 'CORRUPT',
   capacity: 'CAPACITY',
+  // The gates refused every lesson this task offered. Nothing is written and nothing is
+  // retried on its own: the candidate waits for an explicit retry, which is the only way
+  // the task is looked at again.
+  held: 'HELD',
 }
 
 // A candidate is identified by the tool call that reported it: replaying the same log
@@ -258,6 +262,7 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
     if (record === undefined) return undefined
     if (record.status === STATUS.done || record.status === STATUS.skipped || record.status === STATUS.dropped) return record
     if (record.status === STATUS.conflict || record.status === STATUS.corrupt || record.status === STATUS.capacity) return record
+    if (record.status === STATUS.held) return record
     const verdict = await check(record)
     if (verdict?.ok !== true) {
       record.status = verdict?.waiting === true ? STATUS.waiting : STATUS.dropped
@@ -283,6 +288,14 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
       // What the gates refused stays in this file for a person to look at; it never
       // reaches the Markdown.
       record.unverified = Array.isArray(extracted.dropped) ? extracted.dropped.slice(0, CLAIMS_MAX * 2) : []
+      if (extracted.items.length === 0 && record.unverified.length > 0) {
+        // Nothing the gates accept: no plan is frozen, and nothing looks at this task
+        // again by itself. Only an explicit retry reopens it.
+        record.status = STATUS.held
+        record.heldAt = now()
+        await write(record)
+        return record
+      }
       record.plan = freeze(record, extracted.items)
       record.status = STATUS.planned
       await write(record)
@@ -290,6 +303,21 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
     record.status = STATUS.applying
     await write(record)
     await applyPlan(record)
+    return record
+  }
+
+  // The explicit way back for a candidate the gates held. A frozen plan is never
+  // re-extracted, so only a candidate that never got one can be reopened; everything
+  // else is left exactly as it is.
+  async function retry(id) {
+    const record = await read(id)
+    if (record === undefined) return undefined
+    if (record.plan !== null || (record.status !== STATUS.held && record.status !== STATUS.skipped && record.status !== STATUS.retry)) return record
+    record.status = STATUS.pending
+    record.invalid = 0
+    record.retry = 0
+    record.retriedAt = now()
+    await write(record)
     return record
   }
 
@@ -310,5 +338,5 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
     return results.filter(Boolean)
   }
 
-  return { enqueue, process, recover, read, save: write, list, freeze, entriesOf, dir }
+  return { enqueue, process, recover, retry, read, save: write, list, freeze, entriesOf, dir }
 }

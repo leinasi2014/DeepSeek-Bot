@@ -217,3 +217,35 @@ test('a candidate whose project changed is dropped, never written to the new sco
   assert.equal(record.droppedReason, 'project-changed')
   assert.equal(h.calls.apply.length, 0)
 })
+
+test('a task whose lessons are all refused waits for an explicit retry', async t => {
+  let refusals = 1
+  const h = harness(t, {
+    extract: () => (refusals > 0
+      ? (refusals -= 1, { items: [], dropped: [{ reason: 'evidence-unsupported' }] })
+      : { items: [{ scope: 'project:a', text: '第二次的教训', outcome: 'verified' }] }),
+  })
+  const { candidateId } = await h.review.enqueue(candidate)
+  const held = await h.review.process(candidateId)
+  assert.equal(held.status, STATUS.held)
+  assert.equal(held.plan, null, 'no plan is frozen for a task with nothing to write')
+  assert.equal(h.calls.extract, 1)
+  // Nothing looks at it again by itself.
+  await h.review.process(candidateId)
+  assert.equal(h.calls.extract, 1)
+  const retried = await h.review.retry(candidateId)
+  assert.equal(retried.status, STATUS.pending)
+  const after = await h.review.process(candidateId)
+  assert.equal(h.calls.extract, 2, 'the explicit retry looks once more')
+  assert.equal(after.status, STATUS.done)
+})
+
+test('a candidate with a frozen plan ignores the explicit retry', async t => {
+  const h = harness(t)
+  const { candidateId } = await h.review.enqueue(candidate)
+  const done = await h.review.process(candidateId)
+  assert.equal(done.status, STATUS.done)
+  const retried = await h.review.retry(candidateId)
+  assert.equal(retried.status, STATUS.done)
+  assert.equal(h.calls.extract, 1, 'a frozen plan is never extracted again')
+})
