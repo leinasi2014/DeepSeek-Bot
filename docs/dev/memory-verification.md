@@ -15,7 +15,9 @@
 | 项 | 状态 | 证据 | 备注 |
 |---|---|---|---|
 | 既有代码基线（未合并新功能时） | 实测 | `npm test` 727/727 | 只证明基线没坏 |
-| #52 单测与行为测试 | 实测 | **无 team 拒写态（最终定稿）**：内容树 `048340de…`（`4db72d4`/`27e599b` 同树），`team-write-denied` 命中 **0**，项目用例 7 条，全量 **746/746 pass / 0 fail**（我在 `4db72d4` 上实测）。带该行为的 `49e9801`/`b6379c8`（树 `44e60ac9…`）实测 747/747，已被 revert | **该行 hash 待补**：定稿动作是「在 `49e9801` 上再 revert 一次」，但截至本次核对，本地与缓存的远端头仍是 `b6379c8`（team 命中 1），新撤销提交尚未产生；网络 `github.com:443` 超时，无法实时确认。**新 hash 出现前，本行的 746 对应的是内容态（树 `048340de…`），不是某个已确认的分支头**。历史链：`5542df2`(实现)→`edb6345`→`27e599b`(撤)→`e604034`(恢复)→`4db72d4`(撤)→`49e9801`(恢复)→`ed06b97`→`b6379c8`→(待)新撤销提交。全程线性追加，无 force-push |
+| #52 单测与行为测试 | 实测 | **最终头 `ed06b97`**（`49e9801` 之上的撤销提交，线性推送、无 force-push）：树哈希 `048340de6976f94ceae30dca7b66553837ed7948`，与 `27e599b`/`4db72d4` **逐字节相同**；`team-write-denied` 命中 **0**，项目用例 7 条；全量 **746/746 pass / 0 fail / 0 skip**（我本机 detached worktree 干净树实测） | 历史链：`5542df2`(实现)→`edb6345`→`27e599b`(撤)→`e604034`(恢复)→`4db72d4`(撤)→`49e9801`(恢复)→**`ed06b97`(撤，最终头)**。带该行为的 `49e9801`/`b6379c8`（树 `44e60ac9…`）实测 747/747，仅作对照 |
+| #53 接线后全量测试 | 实测 | **`3383ef8`**（`Keep the team-write refusal out of this change, by the maintainer's ruling`）：**757/757 pass / 0 fail / 0 skip**，`team-write-denied` 命中 0；check 0、lint 0 | 比含该行为的 758 少 1 条用例，正是被移出的 team 那一条 |
+| #54 接线后全量测试 | 实测 | **`dbf545d`**（`Merge the memory index branch with the team-write refusal kept out`）：**781/781 pass / 0 fail / 0 skip**（连跑 3 次全绿），命中 0；check 0、lint 0。演进：761→762→773→776→779→782（含该行为）→781（移出后） | 该竞态用例根因：产品先写 Markdown、之后才落 `DONE`（`task-review.js:230-257`），用例等文件出现即断言、撞在两次写之间；**`APPLYING` 是崩溃恢复的合法中间态**，属用例竞态而非产品缺陷 |
 | #53 接线后全量测试 | 实测 | **757/757 pass / 0 fail / 0 skip**（`3383ef8`，`Keep the team-write refusal out of this change, by the maintainer's ruling`；`team-write-denied` 命中 0）；check 0、lint 0 | 比含该行为的 758 少 1 条用例，正是被移出的 team 那一条 |
 | #54 接线后全量测试 | 实测 | **781/781 pass / 0 fail / 0 skip**（`dbf545d`，`Merge the memory index branch with the team-write refusal kept out`；命中 0；连跑 3 次全绿）；check 0、lint 0。演进：761→762→773→776→779→782（含该行为）→781（移出后） | 该竞态用例根因：产品先写 Markdown、之后才落 `DONE`（`task-review.js:230-257`），用例等文件出现即断言、撞在两次写之间；**`APPLYING` 是崩溃恢复的合法中间态**，属用例竞态而非产品缺陷 |
 | `node:sqlite` + FTS5 trigram 在 Node 侧可用 | 实测 | 设计 §8 记录的探针：建表、长中文 MATCH、短中文 LIKE、scope 过滤均通过 | 只覆盖 Node/Web 侧 |
@@ -35,7 +37,7 @@
 | 显式 `team:true` 但 Bot 无 team 写权限时落到 own | **既有行为，本次不改**（`5542df2` 实现 → 最终 revert 移除，历史留痕） | 结构 `change.team === true && teamWrites ? TEAM : ownScope`，与项目隔离无关。`5542df2` 曾实现 skip + `journal({reason:'team-write-denied'})`，此后经 `27e599b`/`4db72d4`/最终 revert 多次撤除，当前 `memory.js` 中该分支命中 **0** | 定稿：**无 team 拒写**。设计 §2 第 40 行只要求「显式 own/team 须通过原有授权」，未规定授权失败后落 own 还是 skip，属未覆盖项；如需改为 skip + journal，另开 issue 走 maintainer 决策，不在本 PR 内翻转。`legacy` 用例「keeps what the user said」维持原期望（team 条目落 own） |
 
 
-**结论：上表中「实测」的项只覆盖测试套件与静态检查；新功能的隔离 smoke、UI 截图、桌面端探针都还没有跑。不要把本文件里的测试数读成新功能验收通过——按最终定稿（无 team 拒写）：#52 **746**（内容态，分支头待补）、#53 `3383ef8` **757**、#54 `dbf545d` **781**，均我实测。这些只是各分支的全量测试数，且都在本机临时目录里跑；各分支尚未合入 `dev`，合入后数字还会变。**
+**结论：上表中「实测」的项只覆盖测试套件与静态检查；新功能的隔离 smoke、UI 截图、桌面端探针都还没有跑。不要把本文件里的测试数读成新功能验收通过——按最终定稿（无 team 拒写）：#52 `ed06b97` **746**、#53 `3383ef8` **757**、#54 `dbf545d` **781**，均我本机 detached worktree 干净树实测。这些只是各分支当前头的全量测试数；各分支尚未合入 `dev`，合入后数字还会变。**
 
 ## 怎么自己复核
 
