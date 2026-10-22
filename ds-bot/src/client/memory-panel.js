@@ -123,7 +123,11 @@ const projectNameOf = project => project.name ?? project.root ?? '?'
 
 // The projects this Bot works in, as the host counts them; naming one shows and
 // changes its memory. "No project" is the Bot's own and the team's alone.
-function ProjectPicker({ view, session, onSession }) {
+//
+// Exported so the tabs can be rendered in a test: the dialog only reaches this page
+// through an effect, which the render harness does not run. It is the same component the
+// dialog draws, not a copy of it.
+export function ProjectPicker({ view, session, onSession }) {
   const projects = view.projects ?? []
   if (projects.length === 0) return null
   return h('div', { className: 'bt-mem-projects', role: 'tablist', 'aria-label': t('Project memory') },
