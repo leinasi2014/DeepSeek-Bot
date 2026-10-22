@@ -93,7 +93,16 @@ async function settle({ quiet = 5000, timeout = 300_000 } = {}) {
 }
 
 const readJsonLines = path => (existsSync(path) ? readFileSync(path, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line)) : [])
-const tapLines = () => readJsonLines(args.tap)
+// The tap can come from dev/llm-tap.mjs (status and text per line) or straight from
+// dev/mock-llm.mjs (an `out` block list, no status). Both are normalized here so the
+// probe and the round checks read one shape; a mock line only counts as answered when
+// it really replied (not one of its injected auth/overflow failures).
+const tapLines = () => readJsonLines(args.tap).map(call => {
+  if (call.status !== undefined || call.out === undefined) return call
+  const failed = call.auth === true || call.fail === true || call.overflow === true || call.rejectedImages === true
+  const text = call.out.filter(block => block?.type === 'text').map(block => block.text).join('\n')
+  return { ...call, status: failed ? 400 : 200, text: text === '' ? undefined : text }
+})
 const journal = () => readJsonLines(join(MEM, 'journal.jsonl'))
 const reviewed = () => (existsSync(REVIEWED) ? JSON.parse(readFileSync(REVIEWED, 'utf8')) : {})
 const teamChars = () => (existsSync(TEAM_MAIN) ? charsOf(readFileSync(TEAM_MAIN, 'utf8')) : 0)
