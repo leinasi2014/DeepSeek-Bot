@@ -22,9 +22,9 @@
 // provider's prefix cache holds; a fresh part, or a checkpoint (which breaks the cache
 // anyway), freezes it anew.
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { mkdir, readdir, rename, unlink, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 import { BlockAssembler } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { splitRef, unquote } from './text.js'
@@ -32,6 +32,7 @@ import { speakerOf } from '../shared/mentions.js'
 import { output } from './tools.js'
 import { memoryFiles } from './memory-files.js'
 import { taskReview as createTaskReview } from './task-review.js'
+import { within } from './folders.js'
 
 // Fixed sizes, in characters. Both MEMORY.md files ride in every request of every
 // part, so together they stay near 8,000 characters, a few thousand tokens. A topic is
@@ -599,6 +600,7 @@ export function install(rt) {
   }
   const TASK_CLAIMS_MAX = 8
   const TASK_EXCERPT_LINES = 40
+  const TASK_FILE_MAX = 200_000
   const TASK_EXTRACT_SYSTEM = [
     'You turn a reported finished task into long-term memory for one Bot team.',
     'Use only the claims and the conversation lines given. Never invent a result.',
@@ -645,15 +647,37 @@ export function install(rt) {
     return { ok: true, project: current }
   }
 
+  // A claim about a file is checked against that file, and only inside the reporting
+  // Session's own working folder: both sides are resolved to their real path and compared
+  // with a directory separator, so `../`, a same-prefix folder and a junction cannot reach
+  // outside. The file is opened only after both checks pass.
+  function taskClaimFile(record, ref) {
+    const path = String(ref ?? '').trim()
+    if (path === '' || !isAbsolute(path)) return undefined
+    const session = sessionRecord(record.sessionId)
+    const folder = session === undefined ? undefined : rt.sessionFolder(session)
+    if (folder === undefined) return undefined
+    try {
+      const file = realpathSync(path)
+      const root = realpathSync(folder)
+      if (!within(file, root)) return undefined
+      return readFileSync(file, 'utf8').slice(0, TASK_FILE_MAX)
+    } catch {
+      return undefined
+    }
+  }
+
   // Two model calls at most: one extraction, one batch check. The mechanical gate runs
   // first and is decisive: an evidence quote that is not a verbatim substring of an
-  // authorized line cannot support anything.
+  // authorized line (or of the named file) cannot support anything. Whatever the gates
+  // reject stays in the candidate file for a person to look at; it never reaches the
+  // Markdown.
   async function taskReviewExtract(record) {
     const bot = rt.botOf(record.botId)
     if (bot === undefined) return { invalid: 'the Bot is gone' }
     const lines = await taskLines(record.sessionId)
     const excerpt = lines.slice(-TASK_EXCERPT_LINES).map(line => `${line.who}: ${line.text}`.replace(/\s+/g, ' ').slice(0, 400))
-    const claims = record.claims.map((claim, index) => ({ index, kind: claim.kind, statement: claim.statement, evidence: claim.evidence }))
+    const claims = record.claims.map((claim, index) => ({ index, kind: claim.kind, statement: claim.statement, evidence: claim.evidence, ref: claim.ref }))
     const reply = await botShot(bot, TASK_EXTRACT_SYSTEM, [
       `The Bot reported: ${record.result}`,
       `Notes: ${record.notes}`,
@@ -665,19 +689,34 @@ export function install(rt) {
     if (parsed === undefined || !Array.isArray(parsed.items)) return { invalid: 'the model did not answer with items' }
     const scope = taskScopeOf(record)
     const candidates = []
+    const dropped = []
+    const drop = (reason, detail) => dropped.push({ reason, ...detail })
     for (const item of parsed.items) {
       const claim = claims[Number(item?.claim)]
+      if (claim === undefined) { drop('claim-missing', { claim: item?.claim }); continue }
       const text = cleanEntry(item?.text)
+      if (text === '') { drop('empty-text', { claim: claim.index }); continue }
+      if (entryProblem(text) !== undefined) { drop('entry-problem', { claim: claim.index, problem: entryProblem(text) }); continue }
+      if (secretEntry(text)) { drop('secret', { claim: claim.index }); continue }
       const outcome = item?.outcome === 'failed' ? 'failed' : 'verified'
-      if (claim === undefined || text === '' || entryProblem(text) !== undefined || secretEntry(text)) continue
       const evidence = String(claim.evidence ?? '').replace(/\r\n/g, '\n').trim()
-      if (evidence === '' || evidence.length > 500) continue
-      // Gate one: the quote must appear in the authorized lines, verbatim.
-      const supported = lines.some((line) => String(line.text ?? '').replace(/\r\n/g, '\n').includes(evidence))
-      if (!supported) continue
-      candidates.push({ claim: Number(item.claim), topic: cleanTopic(item?.topic) ?? '', text, outcome, evidence })
+      if (evidence === '' || evidence.length > 500) { drop('evidence-missing', { claim: claim.index }); continue }
+      // Gate one: the quote must appear verbatim in an authorized line. A claim that names
+      // an absolute path is checked against that file instead, and only when the file is
+      // inside the Session's folder: a path that cannot be proven to be inside is refused
+      // rather than falling back to the conversation.
+      const named = claim.kind === 'file' && isAbsolute(String(claim.ref ?? '').trim())
+      let supported
+      if (named) {
+        const file = taskClaimFile(record, claim.ref)
+        supported = file !== undefined && file.includes(evidence)
+      } else {
+        supported = lines.some((line) => String(line.text ?? '').replace(/\r\n/g, '\n').includes(evidence))
+      }
+      if (!supported) { drop('evidence-unsupported', { claim: claim.index, text, evidence: evidence.slice(0, 120) }); continue }
+      candidates.push({ claim: claim.index, topic: cleanTopic(item?.topic) ?? '', text, outcome, evidence })
     }
-    if (candidates.length === 0) return { items: [] }
+    if (candidates.length === 0) return { items: [], dropped }
     // Gate two: the model judges whether each quote really supports its claim, and its
     // answer is recorded with the entry.
     const verdict = await botShot(bot, TASK_VERIFY_SYSTEM, candidates.map(entry => JSON.stringify({
@@ -685,17 +724,19 @@ export function install(rt) {
     })).join('\n'), { sessionId: record.sessionId, kind: 'memory' })
     const support = parseTaskJson(verdict)?.support
     if (!Array.isArray(support)) return { invalid: 'the model did not answer with support' }
-    const items = candidates
-      .filter((_entry, index) => support[index] === 'yes')
-      .map(entry => ({
+    const items = []
+    candidates.forEach((entry, index) => {
+      if (support[index] !== 'yes') { drop('model-unsupported', { claim: entry.claim, text: entry.text }); return }
+      items.push({
         scope: scopeKey(scope),
         topic: entry.topic,
         text: entry.text,
         outcome: entry.outcome,
         source: String(claims[entry.claim].ref ?? 'the conversation'),
         meta: { kind: 'howto', claim: entry.claim, evidence: entry.evidence.slice(0, 200) },
-      }))
-    return { items }
+      })
+    })
+    return { items, dropped }
   }
 
   // One item, written through the queue exactly as planned: the frozen line and its

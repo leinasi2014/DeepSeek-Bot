@@ -110,6 +110,8 @@ test('a report whose evidence is not in the conversation writes no memory', asyn
   await until(() => s.plans()[0].status === 'DONE')
   assert.equal(existsSync(s.memoryFile()), false, 'nothing was written to memory')
   assert.equal(s.plans()[0].plan.items.length, 0, 'the mechanical gate dropped the item')
+  // What the gate refused stays with the candidate, never in the Markdown.
+  assert.equal(s.plans()[0].unverified[0].reason, 'evidence-unsupported')
 })
 
 test('a verified claim writes one entry with its review id, and the plan is kept', async t => {
@@ -127,6 +129,22 @@ test('a verified claim writes one entry with its review id, and the plan is kept
   assert.equal(record.status, 'DONE')
   assert.equal(record.plan.items[0].text, '发布用 scripts/ship.sh，测试通过后再发布')
   assert.deepEqual(record.progress.done.map(done => done.reviewId), [record.plan.items[0].reviewId])
+})
+
+test('a file claim outside the Session folder is refused even when the words match', async t => {
+  const outside = join(tmpdir(), 'ds-bot-outside.txt')
+  writeFileSync(outside, 'tests 12/12 passed in another project')
+  t.after(() => rmSync(outside, { force: true }))
+  const s = start({ items: [{ claim: 0, topic: '', text: '来自别处文件的教训', outcome: 'verified' }], support: ['yes'] })
+  t.after(() => s.stop())
+  const claim = { kind: 'file', statement: '测试通过', evidence: 'tests 12/12', ref: outside }
+  await s.tool('complete_task', { ...report, claims: [claim] }, 'b2', 'call-file')
+  idle(s.ctx)
+  await until(() => s.plans().length === 1)
+  await until(() => s.plans()[0].status === 'DONE')
+  assert.equal(existsSync(s.memoryFile()), false)
+  assert.equal(s.plans()[0].plan.items.length, 0)
+  assert.equal(s.plans()[0].unverified[0].reason, 'evidence-unsupported')
 })
 
 test('a model that does not support the claim writes no memory', async t => {

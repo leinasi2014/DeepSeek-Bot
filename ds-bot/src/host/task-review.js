@@ -280,6 +280,9 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
         await write(record)
         return record
       }
+      // What the gates refused stays in this file for a person to look at; it never
+      // reaches the Markdown.
+      record.unverified = Array.isArray(extracted.dropped) ? extracted.dropped.slice(0, CLAIMS_MAX * 2) : []
       record.plan = freeze(record, extracted.items)
       record.status = STATUS.planned
       await write(record)
