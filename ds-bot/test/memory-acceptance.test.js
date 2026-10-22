@@ -162,8 +162,10 @@ test('scope: the automatic review defaults to project and rejects unresolved', a
     assert.match(log, /"reason":"project-unresolved"/)
     assert.match(log, /The deploy window is 8pm/)
   }
-  // An explicit team add by a Bot that may not write the team: skipped and
-  // journaled, never redirected to its own memory (fix 5542df2).
+  // Out of scope, by the maintainer's ruling (2026-10-22): a review add with
+  // team:true that the Bot may not write is not refused; with the project work it
+  // falls to the session's project (own, before this work, when there is none).
+  // This pins today's behavior so any later change is a visible decision, not drift.
   {
     const teamReply = JSON.stringify({ changes: [{ op: 'add', text: 'Ship on Friday', team: true }] })
     const s = startReview(scopeSessions.sA, [teamReply])
@@ -171,11 +173,10 @@ test('scope: the automatic review defaults to project and rejects unresolved', a
     t.after(async () => { await s.ctx.dispose(); rmSync(s.home, { recursive: true, force: true }) })
     s.ctx.emit('agent/status', { agent: { id: 'sA', session: scopeSessions.sA }, status: 'idle' })
     await new Promise(resolve => setTimeout(resolve, 50))
-    assert.equal(existsSync(join(s.home, 'memory', 'bots', 'b2')), false, 'own not written')
-    assert.equal(existsSync(join(s.home, 'memory', 'team')), false, 'team not written')
-    const log = readFileSync(join(s.home, 'memory', 'journal.jsonl'), 'utf8')
-    assert.match(log, /"reason":"team-write-denied"/)
-    assert.match(log, /Ship on Friday/)
+    assert.equal(existsSync(join(s.home, 'memory', 'team')), false, 'team not written without permission')
+    const alpha = s.rt.projectScope.resolve(scopeSessions.sA)
+    assert.match(readFileSync(join(s.home, 'memory', 'projects', alpha.hash, 'MEMORY.md'), 'utf8'), /Ship on Friday/, 'the add lands in the session project, the ruled-in fallback')
+    assert.equal(existsSync(join(s.home, 'memory', 'bots', 'b2')), false)
   }
 })
 
