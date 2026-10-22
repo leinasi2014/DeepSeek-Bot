@@ -6,30 +6,101 @@
 // model only, and never the real DSH_HOME.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-const testHome = () => mkdtempSync(join(tmpdir(), '.dsh-test-memory-'))
+// --- scope: real assertions over the merged #52 (design §7 rows not covered by
+// test/memory-project.test.js: the panel write path, the project list of a Bot,
+// and the never-fall-back-to-own rule at the tool and panel entries). The fixture
+// mirrors memory-project.test.js: two .git folders are two projects, a folder
+// that no longer exists makes its session's project unresolved.
+import { fakeContext } from './fake-ctx.js'
+import { install as installProjectScope } from '../src/host/project-scope.js'
+import { install as installMemory } from '../src/host/memory.js'
 
-// --- identity (waits for #52: src/host/project-scope.js) ---------------------
-test.skip('identity: repo root equals teamFolder is still a project, not none', () => { assert.ok(testHome()) })
-test.skip('identity: ds-bot subdir resolves to the parent git root', () => {})
-test.skip('identity: a marker file inside a git repo does not split a monorepo', () => {})
-test.skip('identity: two worktrees of one repo share one project id', () => {})
-test.skip('identity: a plain submodule gets its own id (different common dir)', () => {})
-test.skip('identity: absolute and relative gitdir, with and without commondir', () => {})
-test.skip('identity: deep non-git directory stays one root regardless of depth', () => {})
-test.skip('identity: none/unresolved recovers after .git appears (cache expiry)', () => {})
-test.skip('identity: real casing is kept, no folding; UNC paths', () => {})
-test.skip('identity: hash collision is refused, not merged', () => {})
+const scopeWork = mkdtempSync(join(tmpdir(), '.dsh-test-memory-scope-'))
+const projectA = join(scopeWork, 'alpha')
+const projectB = join(scopeWork, 'beta')
+mkdirSync(join(projectA, '.git'), { recursive: true })
+mkdirSync(join(projectB, '.git'), { recursive: true })
+const scopeSessions = {
+  sA: { id: 'sA', header: { cwd: projectA } },
+  sB: { id: 'sB', header: { cwd: projectB } },
+  sLost: { id: 'sLost', header: { cwd: join(scopeWork, 'gone', 'x') } },
+}
+const scopeBots = { b2: { id: 'b2', name: 'Writer' }, b3: { id: 'b3', name: 'Reader' } }
 
-// --- scope (waits for #52: writeScopeOf) -------------------------------------
-test.skip('scope: project A entries are invisible to a project B session', () => {})
-test.skip('scope: every first-party write path defaults to project when one exists', () => {})
-test.skip('scope: unresolved never falls back to own silently', () => {})
-test.skip('scope: Main Bot cross-bot power does not reach project memory', () => {})
-test.skip('scope: panel rejects fake hash / wrong session / disabled config', () => {})
+function startScoped(t, replies = []) {
+  const ctx = fakeContext()
+  // The panel ask path calls the model once; a canned reply drives it, the way
+  // test/memory.test.js fakes llm.stream for its panel tests.
+  Object.assign(ctx, {
+    llm: {
+      listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }],
+      resolveModelInfo: async () => ({ reasoning: { efforts: [{ id: 'off' }] } }),
+      async* stream() {
+        const reply = await replies.shift()
+        if (reply instanceof Error) throw reply
+        yield { type: 'text-delta', index: 0, text: reply ?? '' }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    },
+  })
+  const home = mkdtempSync(join(tmpdir(), '.dsh-test-memory-rt-'))
+  const rt = {
+    ctx, home, config: { memoryReview: false }, state: { rooms: {} },
+    load: async () => {}, readOnly: () => undefined, warn: () => {},
+    desiredModel: async () => undefined, defaultModel: async () => 'deepseek/v4',
+    botOf: id => scopeBots[id], findBot: name => Object.values(scopeBots).find(bot => bot.name === name),
+    selfOf: id => (id === 'sB' ? 'b3' : 'b2'), isMain: () => false,
+    chatOf: botId => `chat-${botId}`, groupSessionsOf: () => [],
+    sessionsOfBot: () => ['sA', 'sLost'],
+    groupOwners: new Map(), roomOf: () => undefined, partsOf: id => [{ sessionId: id }],
+    clock: () => '12:00', teamFolder: () => join(scopeWork, 'team'),
+    sessionFolder: session => scopeSessions[session?.id ?? session]?.header?.cwd,
+    async* eventsBackwards() {},
+  }
+  installProjectScope(rt)
+  installMemory(rt)
+  t.after(async () => { await ctx.dispose(); rmSync(home, { recursive: true, force: true }) })
+  return {
+    home, rt,
+    tool: (name, args, sessionId) => ctx.registeredTools.get(name).execute(args, { agent: { id: sessionId, session: scopeSessions[sessionId] } }),
+    endpoint: (endpoint, body) => rt.memoryEndpoint(endpoint, body),
+    read: (...path) => readFileSync(join(home, 'memory', ...path), 'utf8'),
+  }
+}
+
+test('scope: the panel writes a project entry only through a session that works in it', async t => {
+  const answer = '```json\n{"reply": "Saved.", "changes": [{"op": "add", "text": "Alpha deploys with a script"}]}\n```'
+  const s = startScoped(t, [answer])
+  await s.endpoint('memory-ask', { botId: 'b2', session: 'sA', scope: 'project', op: 'add', text: 'Add: Alpha deploys with a script' })
+  const alpha = s.rt.projectScope.resolve(scopeSessions.sA)
+  assert.match(s.read('projects', alpha.hash, 'MEMORY.md'), /Alpha deploys with a script/)
+  // A foreign session is not a way into another Bot's project.
+  await assert.rejects(() => s.endpoint('memory-ask', { botId: 'b2', session: 'sB', scope: 'project', op: 'add', text: 'Nope' }), /does not belong to this Bot/)
+})
+
+test('scope: an unresolved project never falls back to own, tool or panel', async t => {
+  const s = startScoped(t)
+  assert.match(await s.tool('remember', { text: 'Anything' }, 'sLost'), /Cannot tell which project/)
+  await assert.rejects(() => s.endpoint('memory-ask', { botId: 'b2', session: 'sLost', scope: 'project', op: 'add', text: 'Anything' }), /cannot be told apart/)
+  assert.equal(existsSync(join(s.home, 'memory', 'bots', 'b2', 'MEMORY.md')), false)
+})
+
+test('scope: the panel project list is server-computed from the Bot\'s own sessions', async t => {
+  const s = startScoped(t)
+  const view = await s.endpoint('memory-view', { botId: 'b2', session: 'sA' })
+  const alpha = s.rt.projectScope.resolve(scopeSessions.sA)
+  assert.deepEqual(view.projects, [{ hash: alpha.hash, root: alpha.root, session: 'sA' }])
+  // sLost resolves to nothing, so it never appears as a project choice.
+})
+
+// Waiting on a fix: applyReview (memory.js:1560-1563) does not go through
+// writeScopeOf and falls back to ownScope when the session's project is
+// unresolved — reported to Chief for #52, asserted here once fixed.
+test.skip('scope: the automatic review defaults to project and rejects unresolved', () => {})
 
 // --- caches (waits for #52: snapshot v2 + panel keys) ------------------------
 test.skip('cache: old snapshots invalidate; scope or teamRule change rebuilds', () => {})
