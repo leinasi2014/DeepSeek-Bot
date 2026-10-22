@@ -623,6 +623,10 @@ var ZH = {
   "{name} has not saved anything yet": "{name} 还没有记住任何内容",
   "Bots keep lasting preferences, decisions, and what you ask them to remember. Tell {name} below, or in its chat.": "Bot 会记住长期的偏好、做过的决定，以及你让它记住的事。可以在下面告诉 {name}，也可以在对话里说。",
   "Team memory": "团队记忆",
+  "Project memory": "项目记忆",
+  "No project": "不选项目",
+  "Added to project memory: {text}": "已存入项目记忆：{text}",
+  "Removed from project memory: {text}": "已从项目记忆删除：{text}",
   "Every Bot reads it": "所有 Bot 都会读",
   "MEMORY.md, which every conversation reads": "MEMORY.md，每次对话都会读",
   "{used} of {limit} characters": "{used} / {limit} 字符",
@@ -2585,6 +2589,9 @@ body[data-ds-dark-theme] .bt-theme-chip i{background:var(--da)}
 .bt-mem-failed{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:12px;background:var(--bt-hover);font-size:13px;line-height:18px;color:var(--bt-ink-2)}
 .bt-mem-failed>span{flex:1;min-width:0;overflow-wrap:anywhere}
 .bt-mem-entries{display:flex;flex-direction:column;gap:28px;animation:bt-page-in ${SPRING_SHAPE.duration}ms ${SPRING_SHAPE.easing},bt-veil-in .22s ease-out}
+.bt-mem-projects{display:flex;gap:6px;flex-wrap:wrap}
+.bt-mem-projects button{border:.5px solid var(--bt-line);border-radius:999px;background:none;color:var(--bt-ink-2);font:inherit;font-size:12px;line-height:16px;padding:5px 12px;cursor:pointer;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bt-mem-projects button[aria-selected=true]{background:var(--bt-hover);color:var(--bt-ink);border-color:transparent}
 .bt-mem-section-head{display:flex;align-items:baseline;gap:8px;margin-bottom:4px}
 .bt-mem-section-head h3{margin:0;font-size:15px;line-height:22px;font-weight:600}
 .bt-mem-section-head span{font-size:12px;line-height:16px;color:var(--bt-ink-3)}
@@ -7941,11 +7948,30 @@ function EntryRow({ entry, remove }) {
     }, confirming ? t("Remove") : (0, import_react18.createElement)(TrashIcon))
   );
 }
+var projectNameOf = (root) => String(root ?? "").split(/[\\/]/).filter(Boolean).at(-1) ?? "?";
+function ProjectPicker({ view, session, onSession }) {
+  const projects = view.projects ?? [];
+  if (projects.length === 0) return null;
+  return (0, import_react18.createElement)(
+    "div",
+    { className: "bt-mem-projects", role: "tablist", "aria-label": t("Project memory") },
+    (0, import_react18.createElement)("button", { type: "button", role: "tab", "aria-selected": session === "" || void 0, onClick: () => onSession("") }, t("No project")),
+    projects.map((project) => (0, import_react18.createElement)("button", {
+      key: project.hash,
+      type: "button",
+      role: "tab",
+      title: project.root,
+      "aria-selected": session === project.session || void 0,
+      onClick: () => onSession(project.session)
+    }, projectNameOf(project.root)))
+  );
+}
 function Entries({ bot, view, remove }) {
   const groups = groupEntries2(view.entries);
   const sections = [
     { scope: "own", title: t("{name}'s memory", { name: bot.name }), size: view.sizes.own },
-    { scope: "team", title: t("Team memory"), hint: t("Every Bot reads it"), size: view.sizes.team }
+    { scope: "team", title: t("Team memory"), hint: t("Every Bot reads it"), size: view.sizes.team },
+    ...view.sizes.project === void 0 ? [] : [{ scope: "project", title: t("Project memory"), hint: view.project?.root, size: view.sizes.project }]
   ];
   return (0, import_react18.createElement)(
     "div",
@@ -7972,9 +7998,9 @@ function Entries({ bot, view, remove }) {
 function changeLine(change) {
   const text = change.text.length > 120 ? `${change.text.slice(0, 120)}…` : change.text;
   if (!change.ok) return t("Not changed: {text} ({reason})", { text, reason: hostText(change.error ?? "") });
-  if (change.op === "remove") return change.scope === "team" ? t("Removed from team memory: {text}", { text }) : t("Removed: {text}", { text });
+  if (change.op === "remove") return change.scope === "team" ? t("Removed from team memory: {text}", { text }) : change.scope === "project" ? t("Removed from project memory: {text}", { text }) : t("Removed: {text}", { text });
   if (change.op === "edit") return t("Updated: {text}", { text });
-  return change.scope === "team" ? t("Added to team memory: {text}", { text }) : t("Added: {text}", { text });
+  return change.scope === "team" ? t("Added to team memory: {text}", { text }) : change.scope === "project" ? t("Added to project memory: {text}", { text }) : t("Added: {text}", { text });
 }
 function Reply({ answer, dismiss }) {
   return (0, import_react18.createElement)(
@@ -7999,7 +8025,7 @@ function Reply({ answer, dismiss }) {
     )
   );
 }
-function useMemoryView(botId, actions) {
+function useMemoryView(botId, actions, session) {
   const [view, setView] = (0, import_react18.useState)(null);
   const [error, setError] = (0, import_react18.useState)("");
   const timer = (0, import_react18.useRef)(0);
@@ -8014,14 +8040,14 @@ function useMemoryView(botId, actions) {
     clearTimeout(timer.current);
     const ticket = ++latest.current;
     try {
-      const next = await actions.memoryView(botId, flags);
+      const next = await actions.memoryView(botId, { ...flags, ...session ? { session } : {} });
       if (!alive.current || ticket !== latest.current) return;
       show(next);
       if (next.summarizing) timer.current = setTimeout(() => void load({ summarize: flags.summarize || flags.regenerate }), POLL_MS2);
     } catch (failure) {
       if (alive.current && ticket === latest.current) setError(failure?.message ?? String(failure));
     }
-  }, [botId]);
+  }, [botId, session]);
   (0, import_react18.useEffect)(() => {
     alive.current = true;
     void load({ summarize: true });
@@ -8029,7 +8055,7 @@ function useMemoryView(botId, actions) {
       alive.current = false;
       clearTimeout(timer.current);
     };
-  }, [botId]);
+  }, [load]);
   return { view, error, load, show };
 }
 function useNow(every) {
@@ -8041,7 +8067,8 @@ function useNow(every) {
   return now;
 }
 function MemoryDialog({ bot, actions, leaving = false }) {
-  const { view, error, load, show } = useMemoryView(bot.id, actions);
+  const [session, setSession] = (0, import_react18.useState)("");
+  const { view, error, load, show } = useMemoryView(bot.id, actions, session);
   const [page, setPage] = (0, import_react18.useState)("summary");
   const [menu, setMenu] = (0, import_react18.useState)(false);
   const [menuShown, menuLeaving] = useLinger(menu, MENU_EXIT_MS2);
@@ -8088,7 +8115,7 @@ function MemoryDialog({ bot, actions, leaving = false }) {
   };
   const remove = async (entry) => {
     try {
-      show(await actions.memoryForget(bot.id, entry));
+      show(await actions.memoryForget(bot.id, entry, session));
       return true;
     } catch (failure) {
       setAnswer({ asked: entry.text, error: failure?.message ?? String(failure) });
@@ -8102,7 +8129,7 @@ function MemoryDialog({ bot, actions, leaving = false }) {
     setText("");
     setAnswer({ asked, pending: true });
     try {
-      const result = await actions.memoryAsk(bot.id, asked);
+      const result = await actions.memoryAsk(bot.id, asked, session);
       setAnswer({ asked, reply: result.reply, changes: result.changes });
       show(result.view);
       if (result.changes.some((change) => change.ok)) void load({ summarize: page === "summary" });
@@ -8151,7 +8178,12 @@ function MemoryDialog({ bot, actions, leaving = false }) {
         "div",
         { className: "bt-mem-body" },
         error ? (0, import_react18.createElement)("div", { className: "bt-error", role: "alert", style: { padding: 0 } }, hostText(error)) : null,
-        view === null ? error ? null : (0, import_react18.createElement)(Skeleton) : page === "entries" ? (0, import_react18.createElement)(Entries, { bot, view, remove }) : (0, import_react18.createElement)(Summary, { bot, view, regenerate })
+        view === null ? error ? null : (0, import_react18.createElement)(Skeleton) : page === "entries" ? (0, import_react18.createElement)(
+          import_react18.Fragment,
+          null,
+          (0, import_react18.createElement)(ProjectPicker, { view, session, onSession: setSession }),
+          (0, import_react18.createElement)(Entries, { bot, view, remove })
+        ) : (0, import_react18.createElement)(Summary, { bot, view, regenerate })
       ),
       (0, import_react18.createElement)(
         "div",
@@ -14303,9 +14335,11 @@ function apply(ctx) {
     // Hours come back in this browser's time zone, so days start at local midnight.
     usage: () => call("usage", { timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone }),
     // `summarize` starts a summary when the entries changed; `regenerate` always does.
+    // `session` names one of the Bot's conversations, and with it the project it
+    // works in — the server decides which project that is.
     memoryView: (botId, flags = {}) => call("memory-view", { botId, ...flags }),
-    memoryAsk: (botId, text) => call("memory-ask", { botId, text }),
-    memoryForget: (botId, entry) => call("memory-forget", { botId, scope: entry.scope, topic: entry.topic, text: entry.text }),
+    memoryAsk: (botId, text, session) => call("memory-ask", { botId, text, ...session ? { session } : {} }),
+    memoryForget: (botId, entry, session) => call("memory-forget", { botId, scope: entry.scope, topic: entry.topic, text: entry.text, ...session ? { session } : {} }),
     diagnostics: (payload) => call("diagnostics", payload),
     diagnosticsLog: () => call("diagnostics-log"),
     diagnosticsClear: () => call("diagnostics-clear"),

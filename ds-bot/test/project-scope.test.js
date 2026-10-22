@@ -96,7 +96,6 @@ test('the team workspace with nothing in it is no project; a folder of its own i
   assert.equal(resolve(team).status, 'none')
   // Below the team folder, the marker walk stops at the team folder: no marker
   // there means the folder stands on its own, not that the walk goes above.
-  const plain = folder(join('team', 'plain'))
   const notes = folder(join('team', 'plain', 'notes'))
   const found = resolve(notes)
   assert.equal(found.status, 'ok')
