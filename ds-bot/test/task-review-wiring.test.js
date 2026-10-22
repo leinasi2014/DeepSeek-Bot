@@ -33,12 +33,18 @@ const HISTORY = {
 
 // The three model calls are answered by their system prompt, so the order in which the
 // idle handlers happen to run does not matter.
-function start({ items = [], support = [], memory = '{"changes":[]}', cwd } = {}) {
+function start({ items = [], support = [], memory = '{"changes":[]}', cwd, works, questions } = {}) {
   // Each verify call takes the next list, so a retry can be answered differently.
   const supportQueue = Array.isArray(support[0]) ? [...support] : undefined
   let folder = cwd
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-task-review-wiring-'))
-  writeFileSync(join(home, 'state.json'), JSON.stringify(TEAM))
+  // Work still open when the report is made, and the question card on screen: both are
+  // what WAITING must consult, and neither is derived from the Bot id.
+  writeFileSync(join(home, 'state.json'), JSON.stringify({
+    ...TEAM,
+    works: works ?? {},
+    questions: questions ?? {},
+  }))
   const ctx = fakeContext()
   const requests = []
   Object.assign(ctx, {

@@ -642,6 +642,25 @@ export function install(rt) {
     }
   }
 
+  // The work the calling turn does: the request it answers, and the requests that joined
+  // it (tools.js:107 `worksOf`). Read through `rt` because handoffs installs before memory.
+  const worksOfTurn = (exec) => {
+    const turn = rt.live.get(exec?.agent?.id)
+    return [rt.workOf(turn?.info), ...(turn?.joined ?? []).map(joined => rt.workOf(joined.info))].filter(Boolean)
+  }
+
+  // The questions this Session has open, by id. `ask_user` keeps one per Session, and a
+  // part switch moves it to the fresh Session under the same id (parts.js:805-808), so the
+  // id is what a candidate must remember, not the Session it was asked in.
+  const openQuestionsOf = (sessionId) => {
+    const question = state.questions?.[sessionId]
+    return question?.id === undefined ? [] : [question.id]
+  }
+
+  // The ids of every question still open anywhere: a card moved to the next part is no
+  // longer under the Session that asked it, and the candidate must still wait for it.
+  const openQuestionIds = () => new Set(Object.values(state.questions ?? {}).map(question => question?.id).filter(id => typeof id === 'string'))
+
   async function taskReviewCheck(record) {
     if (!reviewOn) return { ok: false, waiting: true }
     if (rt.botOf(record.botId) === undefined) return { ok: false, reason: 'bot-gone' }
@@ -649,6 +668,17 @@ export function install(rt) {
     const project = projectOf(record.sessionId)
     const current = project.status === 'ok' ? `project:${project.hash}` : null
     if (record.project !== null && current !== record.project) return { ok: false, waiting: true }
+    // Only the work and the questions this candidate recorded. Asking about anything the
+    // Bot happens to be doing would let a busy group chat stall a report from another one;
+    // a work that is gone from the map (answered, dropped, or gone with a restart of the
+    // handoff book) simply stops blocking.
+    const work = Array.isArray(record.work) ? record.work : []
+    if (work.some(id => rt.waitsWork?.(id) === true)) return { ok: false, waiting: true }
+    const questions = Array.isArray(record.questions) ? record.questions : []
+    if (questions.length > 0) {
+      const open = openQuestionIds()
+      if (questions.some(id => open.has(id))) return { ok: false, waiting: true }
+    }
     return { ok: true, project: current }
   }
 
@@ -845,13 +875,18 @@ export function install(rt) {
   // disk; a candidate with a frozen plan never asks the model again.
   const taskRecovery = () => (rt.readOnly() === undefined ? taskReview.recover().catch(error => rt.warn('ds-bot: task review recovery failed: %s', error)) : Promise.resolve([]))
   const taskRunning = new Map()
+  // Candidates are woken by whoever is idle now, compared by the Bot that speaks, not by
+  // the Session id: a conversation that changed part has a new Session id, and a candidate
+  // recorded under the old one would otherwise never be looked at again. The candidate's
+  // own `check` still decides whether anything happens — this only picks the moment.
   function runSessionTasks(sessionId) {
     if (taskRunning.has(sessionId)) return taskRunning.get(sessionId)
+    const who = rt.selfOf(sessionId)
     const job = (async () => {
       const ids = await taskReview.list()
       for (const id of ids) {
         const record = await taskReview.read(id)
-        if (record === undefined || record.sessionId !== sessionId) continue
+        if (record === undefined || rt.selfOf(record.sessionId) !== who) continue
         await taskReview.process(id)
       }
     })().catch(error => rt.warn('ds-bot: task review of %s failed: %s', sessionId, error?.message ?? error))
@@ -1578,6 +1613,8 @@ export function install(rt) {
         result,
         claims,
         notes: String(args.notes ?? '').trim().slice(0, 4000),
+        work: worksOfTurn(exec),
+        questions: openQuestionsOf(caller.sessionId),
       })
       return `Recorded as a candidate (${record.candidateId.slice(0, 8)}). After this turn the host checks the evidence and keeps only what it supports; your memory has not changed yet.`
     },

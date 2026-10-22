@@ -130,7 +130,13 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
 
   // Persisted before the tool call returns, so a candidate that was accepted is never
   // lost by a restart.
-  async function enqueue({ botId, sessionId, roomId, project, cwd, callId, result, claims, notes }) {
+  //
+  // `work` and `questions` are what this candidate is bound to, captured when the report
+  // is made: the work the reporting turn was doing (and the requests that joined it), and
+  // the question the Bot had asked and not had answered. They are the only things WAITING
+  // may look at. Checking the Bot's other work instead would let one busy group chat stall
+  // a report made in another, which is the point of keeping this list per candidate.
+  async function enqueue({ botId, sessionId, roomId, project, cwd, callId, result, claims, notes, work, questions }) {
     if (typeof sessionId !== 'string' || typeof callId !== 'string') throw new Error('A candidate needs the session and the tool call')
     const candidateId = candidateIdOf(sessionId, callId)
     const existing = await read(candidateId).catch(() => undefined)
@@ -152,6 +158,12 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
       result: String(result ?? '').slice(0, 2000),
       claims: (Array.isArray(claims) ? claims : []).slice(0, CLAIMS_MAX),
       notes: String(notes ?? '').slice(0, 4000),
+      // Work ids, not bot ids: `waitsWork` answers for one piece of work. A request that
+      // was answered and dropped is gone from the map, so it stops blocking by itself.
+      work: (Array.isArray(work) ? work : []).filter(id => typeof id === 'string' && id !== '').slice(0, CLAIMS_MAX),
+      // Question ids, not Session ids: a question moves to the next Session when the
+      // conversation changes part, and its id stays the same.
+      questions: (Array.isArray(questions) ? questions : []).filter(id => typeof id === 'string' && id !== '').slice(0, CLAIMS_MAX),
       plan: null,
       progress: { done: [], conflicts: [] },
     }
