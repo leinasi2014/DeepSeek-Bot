@@ -31,6 +31,7 @@ import { splitRef, unquote } from './text.js'
 import { speakerOf } from '../shared/mentions.js'
 import { output } from './tools.js'
 import { memoryFiles } from './memory-files.js'
+import { memoryIndex } from './memory-index.js'
 import { taskReview as createTaskReview } from './task-review.js'
 import { within } from './folders.js'
 
@@ -58,7 +59,6 @@ const INDEX = /^##\s+index\s*$/i
 const HEADING = /^#{1,6}\s/
 const META = /\s*\[([A-Za-z][\w-]*:[^\];]*(?:;\s*[A-Za-z][\w-]*:[^\];]*)*)\]\s*$/
 const RECALL_MAX = 30
-const QUERY_TERMS_MAX = 6
 const SOURCE_READ_MS = 5_000
 const MODEL_TIMEOUT_MS = 120_000
 const SUMMARY_MAX_TOKENS = 2_048
@@ -821,6 +821,34 @@ export function install(rt) {
   rt.load().then(taskRecovery).catch(() => {})
 
   // ---------------------------------------------------------------------------
+  // The local full-text index (#53). Everything it needs is injected here: the
+  // committed reader (through loadScope), the entry format, and a place in this
+  // module's own write queue. It must not look for the queue itself, and the
+  // collection it runs inside a queued job is synchronous, so a move's two writes
+  // (memory.js:767/771) are never seen apart.
+
+  const memorySearch = memoryIndex({
+    root,
+    readScopes: keys => keys.map((key) => {
+      const scope = scopeOfKey(key)
+      return { scope: key, files: loadScope(scope).map(file => ({ file: file.file, topic: file.topic ?? '', content: file.content })) }
+    }),
+    parse: parseMemory,
+    format: formatEntry,
+    runInMemoryQueue: queued,
+    readOnly: () => rt.readOnly() !== undefined,
+    warn: rt.warn,
+  })
+  const liveBotIds = () => Object.keys(state.bots ?? {})
+  // A deleted Bot's scope never enters a whitelist again, so its index rows are dropped
+  // explicitly: once the team is loaded, and again after every archive.
+  const cleanIndex = () => memorySearch.cleanup(liveBotIds()).catch(error => rt.warn('ds-bot: memory index cleanup failed: %s', error))
+  if (rt.readOnly() === undefined) rt.load().then(cleanIndex).catch(() => {})
+  // The index file is open while the plugin runs: it must close before the data folder
+  // can be moved or removed, as the chat index does.
+  ctx.effect(() => () => memorySearch.close(), 'ds-bot: memory index')
+
+  // ---------------------------------------------------------------------------
   // Who may do what. A Bot reads and writes its own memory and reads the team's;
   // Main Bots and the admins of a group also write the team's; Main Bots read and
   // write every Bot's. The user may do everything from the memory panel.
@@ -1089,6 +1117,9 @@ export function install(rt) {
       await mkdir(join(root, 'archive'), { recursive: true })
       await rename(dir, join(root, 'archive', name))
       await journal({ op: 'archive', scope: scopeKey(ownScope(botId)), actor: 'user', actorName: 'user', botName: bot?.name, to: `archive/${name}` })
+      // The archived scope is gone from disk and will never be read again, so its rows
+      // would otherwise sit in the index forever.
+      await cleanIndex()
     }).catch(error => rt.warn('ds-bot: memory of %s not archived: %s', bot?.name ?? botId, error))
   }
 
@@ -1393,9 +1424,12 @@ export function install(rt) {
       const self = caller.bot.id
       const { scopes, error } = readScopes(args.scope, self, exec?.agent?.session ?? caller.sessionId)
       if (error) return error
-      const loaded = scopes.map(scope => ({ scope, tag: tagOf(scope, self), label: labelOf(scope, self), files: loadScope(scope) }))
+      // Reading the Markdown is only needed by the two paths that show it whole; the
+      // search path gets the same files from the index, inside the write queue.
+      const loadedNow = () => scopes.map(scope => ({ scope, tag: tagOf(scope, self), label: labelOf(scope, self), files: loadScope(scope) }))
       if (args.topic !== undefined && String(args.topic).trim() !== '') {
         const topic = cleanTopic(args.topic)
+        const loaded = loadedNow()
         for (const { label, files } of loaded) {
           const file = files.find(item => item.topic === topic)
           if (file !== undefined) return `Topic [[${topic}]] in ${label} (${sizeNote(file, file.content.length)}):\n${file.content.trim() || '(empty)'}`
@@ -1403,29 +1437,29 @@ export function install(rt) {
         const known = loaded.flatMap(({ tag, files }) => files.filter(file => file.topic).map(file => `[[${file.topic}]] (${tag})`))
         return `No topic [[${String(args.topic).slice(0, 60)}]] there. Topics: ${known.join(', ') || 'none yet'}.`
       }
-      const where = (tag, file) => `${tag} · ${file.topic === undefined ? MAIN : `[[${file.topic}]]`}`
+      const where = (tag, topic) => `${tag} · ${topic === '' ? MAIN : `[[${topic}]]`}`
       const query = String(args.query ?? '').trim().slice(0, 120)
       if (query === '') {
-        return loaded.map(({ tag, label, files }) => {
+        return loadedNow().map(({ tag, label, files }) => {
           const [main, ...topics] = files
           return [
             `${capital(label)}: ${MAIN} has ${main.entries.length} entries (${sizeNote(main, main.content.length)})${topics.length > 0 ? `; topics ${topics.map(file => `[[${file.topic}]] (${file.entries.length})`).join(', ')}` : '; no topics'}.`,
-            ...main.entries.map(entry => `[${where(tag, main)}] ${formatEntry(entry.text, entry.meta).slice(2)}`),
+            ...main.entries.map(entry => `[${where(tag, main.topic ?? '')}] ${formatEntry(entry.text, entry.meta).slice(2)}`),
           ].join('\n')
         }).join('\n\n')
       }
-      const terms = [...new Set(squash(query).split(' ').filter(Boolean))].slice(0, QUERY_TERMS_MAX)
-      const scored = loaded.flatMap(({ tag, files }) => allEntries(files).map((entry) => {
-        const hay = squash(`${entry.text} ${entry.file.topic ?? ''}`)
-        return { entry, tag, count: terms.filter(term => hay.includes(term)).length }
-      })).filter(hit => hit.count > 0)
-      const every = scored.filter(hit => hit.count === terms.length)
-      const hits = (every.length > 0 ? every : scored.sort((a, b) => b.count - a.count)).slice(0, RECALL_MAX)
-      const labels = loaded.map(item => item.label).join(' and ')
-      if (hits.length === 0) return `Nothing in ${labels} mentions "${query}". read_own_chat searches what was said.`
+      const labels = scopes.map(scope => labelOf(scope, self)).join(' and ')
+      const found = await memorySearch.query({ scopes: scopes.map(scopeKey), ownScope: scopeKey(ownScope(self)), query, limit: RECALL_MAX })
+      if (found.ok !== true) {
+        // A scan that cannot read the files either is an error the caller must see; an
+        // empty answer would read as "there is no memory".
+        return `Memory search is unavailable right now (${found.error?.message ?? found.error}). The saved files are unchanged; try again.`
+      }
+      if (found.rows.length === 0) return `Nothing in ${labels} mentions "${query}". read_own_chat searches what was said.`
+      const tags = new Map(scopes.map(scope => [scopeKey(scope), tagOf(scope, self)]))
       return [
-        every.length > 0 ? `Entries with "${query}" in ${labels}:` : `No entry has all of "${query}"; entries with the most of these words:`,
-        ...hits.map(({ entry, tag }) => `[${where(tag, entry.file)}] ${formatEntry(entry.text, entry.meta).slice(2)}`),
+        found.matchedAll ? `Entries with "${query}" in ${labels}:` : `No entry has all of "${query}"; entries with the most of these words:`,
+        ...found.rows.map(row => `[${where(tags.get(row.scope) ?? '?', row.topic)}] ${row.entry.slice(2)}`),
       ].join('\n')
     },
   }))
