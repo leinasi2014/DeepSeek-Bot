@@ -36,7 +36,7 @@
 | 显式 `team:true` 但 Bot 无 team 写权限时落到 own | **已修复（X 定稿，`5542df2` 实现）** | `memory.js` 中 `if (op === 'add' && change.team === true && !teamWrites)`（`teamWrites = writesTeam(bot.id)`）：#52 `b6379c8` 在 `:1565`、#53 `4b6f1eb` 在 `:1613`、#54 `114a4a0` 在 `:1922`（行号随各支接线不同，判据与文案相同）→ `rt.warn(...)` + `journal({op:'skip', scope:'team', reason:'team-write-denied', after: 全文, intendedOp: op})` + `continue`，不再落 own。用例「the memory review refuses a team write the Bot may not make, instead of saving it to own」用非 Main Bot fixture，断言 own 与 team 目录均未创建、journal 带该 reason 与全文，为项目用例 8 条之一 | 与设计 §2 第 40 行「显式 own/team 仍须通过原有授权」一致。`legacy` 用例「keeps what the user said」的改写（team 条目不再进 own、journal 序列变 `add/skip/replace`）属**预期的行为变更**、非回归。历史上该点被 revert 过多次，全部线性留痕、无 force-push |
 
 
-**结论：上表中「实测」的项只覆盖测试套件、静态检查，以及一次云机**加载 + 记忆基线** smoke（SMOKE-PASS）；**桌面 Electron 端的 `node:sqlite` 与 UI 截图仍未验证**，新功能 acceptance 尚未在云机上跑。不要把本文件里的测试数读成新功能验收通过——按 **X 定稿（保留 team 拒写）**，三支口径：#52 **`b6379c8`**（该支远端当前头 `26be576`，同 747、同树同一产品代码）**747**、#53 `4b6f1eb` **758**、#54 `114a4a0` **782**，均我本机 detached worktree 干净树实测，三者 `team-write-denied` 命中均为 1，**语义一致**。`4b6f1eb`/`114a4a0` 与远端 ref `2e3e9b2`/`0d8dac0` 同树（`eee4328d…`/`6d011389…`）且为祖先（`merge-base --is-ancestor` exit 0），引用哪个都不改变结论。各分支尚未合入 `dev`，合入后数字还会变。**
+**结论：上表中「实测」的项只覆盖测试套件、静态检查，以及一次云机**加载 + 记忆基线** smoke（SMOKE-PASS）；**桌面 Electron 端的 `node:sqlite` 与 UI 截图仍未验证**，新功能 acceptance 尚未在云机上跑。不要把本文件里的测试数读成新功能验收通过——按 **X 定稿（保留 team 拒写）**，三支口径（远端真值用 `ls-remote` 实测，不是本地 reflog）：#52 **`26be576`**（恢复提交 `b6379c8` 已在它里面）**747**、#53 **`2e3e9b2`**（≡`4b6f1eb`）**758**、#54 **`0d8dac0`**（≡`114a4a0`）**782**，均我本机 detached worktree 干净树实测，三者 `team-write-denied` 命中均为 1，**语义一致**。三组等价头的树哈希分别为 `44e60ac9…`（#52 恢复态，远端头另有两条 test-only 提交）/ `eee4328d…` / `6d011389…`，`merge-base --is-ancestor` 全 exit 0，引用哪个都不改变结论。**feat-55 已把 `26be576` 并入**（当前 806/788/0/18，连跑 2 次），但该分支**远端仍不存在**，尚未合入 `dev`；合入后数字还会变。**
 
 ## 怎么自己复核
 
@@ -93,7 +93,7 @@ node --experimental-test-module-mocks --import ./test/harness-resolve.mjs --test
 - 但 `2102c8a` **不是当前头**：它之后的 `e7e82f1`（删 `retrieval:` 5 + `consistency:` 4 条 skip、改为映射注记）、`13154bc`（`permissions:` 3 条 → 2 条真断言 + 1 条映射）、`cf3e5b7`、`b86ab48`（守卫恢复）、`6177f6f`、以及我的文档提交，把 skip 从 30 降到 **18**、真用例从 4 增到 **6**。
 - `cb0468d`（**含** team 守卫，命中 1，8 例）：**806 / 788 pass / 0 fail / 18 skip**（exit 0），`npm run build` exit 0、`npm run lint` exit 0（仅 warning）。
 - `e9da76a`（守卫被 `d0acd7b` 删掉时的头，命中 **0**、7 例）：**805 / 787 pass / 0 fail / 18 skip**（exit 0）。与 X 定稿相反，**不可作为验收头**，留作对照。
-- **当前头（`b86ab48` 之后）：X 内容已在代码里**——`git show HEAD:` 逐文件数 `team-write-denied`：`src/host/memory.js` **1**、`test/memory-project.test.js` **1**、`test/memory.test.js` **1**、`test/memory-acceptance.test.js` **1**；`memory-project.test.js` 回到 **8 例**。我 `npm test` 连跑 **2 次都是 806 tests / 788 pass / 0 fail / 18 skip**（exit 0），`npm run build` exit 0、`npm run lint` exit 0（仅 warning）。
+- **当前头（`5d14aa6` 把远端 #52 终头 `26be576` 并进来之后，再一个文档提交 `29aa6c0` 之后；当前 `29aa6c0`）：X 内容在代码里，且远端 #52 终头已成为 feat-55 的祖先**（`merge-base --is-ancestor 26be576 feat/55-acceptance` = 0）。`git show HEAD:` 逐文件数 `team-write-denied`：`src/host/memory.js` **1**、`test/memory-project.test.js` **1**、`test/memory.test.js` **1**、`test/memory-acceptance.test.js` **1**；`memory-project.test.js` **8 例**、skip **18 条**。我在并入 `26be576` 之后连跑 **2 次都是 806 tests / 788 pass / 0 fail / 18 skip**（exit 0）。
 
 **所以「816/786/30」与「806/788/18」都对，但属于不同头**：前者是 `2102c8a`，后者是当前头。对外引用必须带 hash，否则会出现「数字对不上」的假分歧。当前头之所以 tests 更少而 pass 更多，是因为 12 条 skip 被删（映射到既有用例）或转成真断言，不是丢了覆盖。
 
