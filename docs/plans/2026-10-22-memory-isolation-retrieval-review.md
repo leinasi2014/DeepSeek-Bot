@@ -156,7 +156,7 @@ PENDING --证据成立--> WRITTEN
 
 - 条目稳定标识 = `entryId = sha256(candidateId + claimIndex)` 前 16 位，写进 journal 的 `op:'task-review'` 记录。
 - 恢复时逐条比对：**该 `entryId` 已有写入记录** → 跳过该条；没有 → 写入。因此崩溃在任何一条之后都能继续，不会重复也不会漏。
-- 另一个解法是整批原子提交（`memory-files.js:73` 的 `commit(changes[], record)` 本来就接受多个 change，一次 journal 记录）。**推荐用批量提交**：候选的全部条目放在同一次 `commit` 里，天然原子，`entryId` 只作校验用。两种都行，实现选一种并在代码注释里写明。
+- **选定：逐项稳定 ID 恢复**（`entryId`），不用「批量提交」当恢复机制。理由：`commit` 的原子性只是**进程内异常回滚**（备份 → 写文件 → 追加 journal → 失败则 rename 回滚），它不保证断电或 kill 后的原子性；把 catch-error 回滚误当断电原子性会直接导致条目丢失或重复。逐条恢复的协议是：先按 `entryId` 查 journal，未写过的才写，写完即记 `op:'task-review'` 带 `entryId`。崩溃点在哪都只影响「还没写的那几条」。
 - **二次提交去重边界**：`sessionId + callId` 只能覆盖**同一次工具调用的重放**（同一 turn 内重试、进程重启后重放日志）。换段后 Bot 重新调用 `complete_task` 会得到新的 `callId`，候选 id 不同——这段去重靠内容：现有 `matchEntries` 整句比对在 `memory.js:646-647` 返回 `changed:false`，不会写出第二条同文条目。**但同义不同措辞的重复提交不会被发现**，这是明确边界，不承诺。为避免这类重复，提醒提示词：同一任务只调用一次 `complete_task`。
 
 ### 4. 存储与数据模型
@@ -224,8 +224,16 @@ CREATE TABLE files (
 | `complete_task`（新工具） | 只记录候选与主张，不写记忆 |
 | `recall` | 默认范围加 project；输出加 `project` 标签与 `outcome`；新增可选 `scope: "project"` |
 | `remember` / `forget` / `move` | 签名不变；`scope` 接受 `"project"`；有项目时默认目标为 project |
-| 记忆面板 | 显示条目 `outcome` 与证据；新增「重建索引」动作 |
+| 记忆面板 | 显示条目 `outcome` 与证据；新增「重建索引」动作；**项目记忆以显式项目上下文操作**（见下） |
 | 配置 | 只加一项 `projectMemory`（默认开）。理由是回退开关：出错时能整体关掉项目范围而不影响现有记忆 |
+
+**面板的 project 操作必须显式带项目上下文，并由服务器校验**
+
+面板以「某个 Bot」为对象，而项目身份属于会话；靠「猜当前会话」会在多窗口、换段、会话已关闭时错判。因此定为：
+
+- 面板请求携带 `project`（`project:<hash>`）作为显式参数；不带就是 own / team，不隐式推断。
+- 服务器校验三件事后落库：① `project` 格式合法且 `projects/` 下确实存在该目录；② 请求者携带的 Bot **确有或曾有**落在该项目内的会话（用 `projects.json` 记录的路径与 `sessionFolder` 历史比对）；③ 该 scope 未被 `projectMemory: false` 关闭。任一不满足即拒绝并说明原因，不静默改写到 own。
+- 这条同时消除了此前「面板按当前会话解析项目」的实现期不确定项。
 
 不新增服务、不新增常驻进程、不改 DSH。
 
@@ -258,11 +266,20 @@ CREATE TABLE files (
 
 ## 分阶段实施顺序
 
-1. **P0 前置探针（阻塞项）**：在 DSH 桌面 Electron 端跑一个只 `await import('node:sqlite')` 的探针插件，确认可用或有降级。这是索引方案的前提假设，未验证前不进入 P2。
-2. **P1 项目隔离**：`project-scope.js` + project 存储 + `recall`/`remember` 的 scope + 提示词。此时仍用现有子串检索，功能可独立验收。
-3. **P2 全文索引**：`memory-index.js` + dirty/已提交视图 + 显式重建 + 面板动作。
-4. **P3 任务复盘**：`complete_task` + `task-review.js` + 证据核验 + 幂等。
-5. **P4 验收与文档**：补齐用例、`docs/plans` 定稿、README 行为说明（英文与中文同步）。
+**运行时可探测，不是人为授权阻塞。** 索引能力按运行时探测：启动时 `await import('node:sqlite')` 并试建一张 `fts5 ... trigram` 表，成功则启用索引，失败则**永久降级到扫 Markdown**（现有 `recall` 逻辑），本进程内不再重试。不需要用户批准，也不需要在用户的桌面环境加载探针。
+
+已实测（本轮，DSH Web 运行时）：
+
+- DSH Web 进程为 `node C:\Program Files\nodejs\node.exe ... dsh/lib/bin.js web`，Node **24.20.0**。
+- 同一运行时下 `require('node:sqlite')` 可用，SQLite **3.53.4**，`fts5 ... tokenize='trigram'` 建表与 `MATCH` 查询均正常。
+- 同一探针证实：两字中文词（`"记忆"`）在 trigram 下**命中 0**，四字词命中 1。**这独立验证了「两字以下回退 LIKE」不是冗余设计，而是必需项**（与 `chat-index.js:23-42` 的既有手法一致）。
+
+未验证的只有 **DSH 桌面 Electron 端**，它影响的是「已验证平台」列表，不影响架构成立：桌面端若不可用，自动走 Markdown 降级。
+
+1. **P1 项目隔离**：`project-scope.js` + project 存储 + `recall`/`remember` 的 scope + 提示词。此时仍用现有子串检索，功能可独立验收。
+2. **P2 全文索引**：`memory-index.js` + dirty/已提交视图 + 显式重建 + 面板动作 + 启动时能力探测。
+3. **P3 任务复盘**：`complete_task` + `task-review.js` + 证据核验 + 幂等。
+4. **P4 验收与文档**：补齐用例、`docs/plans` 定稿、README 行为说明（英文与中文同步）。
 
 每阶段单独 PR，指向 `dev`，不改 `CHANGELOG.md`。
 
@@ -311,7 +328,7 @@ CREATE TABLE files (
 - 风险：
   - 项目 id 随路径变化（搬动即新项目）——已定规则，靠提示而非自动合并。
   - 词面检索不覆盖同义改写——写进已知限制，不靠索引假装语义。
-  - 桌面端 sqlite 未验证——P0 探针卡口。
+  - 桌面端 sqlite 未实测——只影响「已验证平台」表述，失败时自动降级为扫 Markdown。
   - 历史 own/team 污染无法自动清理——人工整理。
 
 ## 已知限制
@@ -322,62 +339,71 @@ CREATE TABLE files (
 - 项目搬动会产生新 id，旧记忆需用户确认复用。
 - 历史 own/team 中的项目内容不会被自动隔离。
 
-## 尚未解决 / 未完成
+## 尚未解决 / 未完成（设计层面已无阻塞；以下为「已定但未实现/未验证」）
 
-1. **桌面 Electron 端 `node:sqlite`**：`chat-index.js:76`、`usage.js:241` 只证明了 Node/Web 侧；当前 `dev` 无 `app/` 目录（`git ls-tree -d dev` 仅 `.agents/.github/docker/docs/ds-bot/scripts`），无法查 Electron 版本。列为阻塞前提。
-2. **插件工程师核实未完成**：429 中断，未交完整报告。已由 Chief 复核并写入本稿的部分：`waits` 参数是 work id 而非 Bot id、`state.questions` 以 Session id 为键、`commit` 是唯一写漏斗、`archiveBotMemory` 走 `rename` 旁路、worktree 的 `.git`/`commondir` 实测格式。
-3. **测试注入点**：需在实现中预留，属实现验收项。
-4. **面板写入的 project 归属**：面板以「某个 Bot」为操作对象，而项目身份属于会话。本稿规定「按当前打开的会话解析项目，无明确会话时不写 project」，**这条是设计选择、尚未经过实现验证**，列为评审待确认项。
-5. **批量提交 vs 逐条恢复**：第 3 节给了两种幂等实现（整批 `commit` 原子提交 / 按 `entryId` 逐条恢复），未定选哪一个，属实现期决策。
+1. **插件工程师完整报告缺失**：429 中断，未交完整核实报告。已由 Chief 复核并写入本稿的部分：`waits` 参数是 work id 而非 Bot id、`state.questions` 以 Session id 为键、`commit` 是唯一写漏斗、`archiveBotMemory` 走 `rename` 旁路、worktree 的 `.git`/`commondir` 实测格式。**这不影响设计结论**，影响的是「哪些行号由多人独立复核」这一证据强度。
+2. **测试注入点**：需在实现中预留，属实现验收项。
+3. **DSH 桌面 Electron 端 `node:sqlite`**：未实测。运行时探测 + Markdown 降级已定死，故不阻塞设计；只影响「已验证平台」的表述范围。
+4. **JiuwenSwarm 分支对照**：资料员核对的是 `main`，此前参考是 `develop`，**未固定同一 commit**。因此「全仓没有项目/经验记忆」这一结论降级为「`main` 上未见，`develop` 待核」，**且本设计不依赖它**（见下节说明）。
 
-## 与 JiuwenSwarm 的关系（资料员核实结果）
+## 与 JiuwenSwarm 的关系
 
-资料员于本轮完成核实，结论**推翻本稿早先设想的引用基础**，故单列一节，并把引用降级。
+**结论：本设计不引用它作为依据。** 项目作用域与任务复盘按**原创补齐**处理；对外文档中不出现「他们已实现、我们照做」的表述。
 
-**事实（资料员给的行号，本轮未逐条复验）**
+**资料员的核对结果（分支未对齐，仅作参考，不作证据）**
 
-- 记忆模块 8 个文件（`agentserver/memory/`：`manager/config/internal/types/embeddings/summarizer/compaction/__init__`），**没有项目或仓库维度**。
-- 记忆作用域是 **agent 级单目录**：`utils.py get_agent_workspace_dir()` → `workspace/agent`；`config.py DEFAULT_WORKSPACE_DIR`；`docs/智能体.md` 写「记忆工作目录：workspace/agent」；`memory_tools._validate_memory_path` 只放行 `memory/` 前缀。**无按项目分区**。
-- 「任务经验」只有 `tools/todo_toolkits.py` 的 `TodoToolkit`：`workspace/session/<id>/todo.md`，`TaskStatus` = waiting/running/completed/cancelled，`result` 为模型自由文本；**不校验证据、不写回记忆、无复盘或晋升**。`docs/任务规划.md` 属宣传性描述。
-- `evolution/` 是技能自演进，**不是任务经验**，不可混用。
-- 曾当作「检索排除已注入层」依据的 `manager.py:788-789` 实为 `search()` 的 **docstring**；实现该意图的 `_is_recent_session_file`（L545）**定义后零调用**；真正的过滤只有 `_build_source_filter`（L1026-1035）按 `sources` 过滤。→ 那是「想做但没做完」，不是可用先例。
-- 另两处行号纠错：`minScore` 默认来自 `config.py` 的 `query.minScore=0.3`（`manager.py:803` 的 `0.7` 只是缺省兜底）；混合权重在 `manager.py:836-837`，此前引作 `:1061` 有误。
+资料员核对的是 `main`（默认分支 `develop`，两者未固定到同一 commit）。以下条目均应按「`main` 上所见」读，不得推广为「JiuwenSwarm 全仓没有」：
 
-**对本设计的处置**
+- `main` 的记忆模块为 8 个文件（`agentserver/memory/`），作用域是 agent 级单目录（`workspace/agent`），`_validate_memory_path` 只放行 `memory/` 前缀；未见项目/仓库维度。
+- `main` 的「任务经验」只有 `tools/todo_toolkits.py` 的 `TodoToolkit`（`workspace/session/<id>/todo.md`，`TaskStatus` = waiting/running/completed/cancelled，`result` 为模型自由文本）；未见证据校验、回写记忆或复盘晋升。`evolution/` 是技能自演进，不是任务经验。
+- 此前被当作「检索排除已注入层」依据的 `manager.py:788-789` 实为 `search()` 的 docstring；`_is_recent_session_file`（L545）定义后零调用；真正生效的是 `_build_source_filter`（L1026-1035）。这条本身与分支无关（是同一文件的实现细节），但**同样不构成可用先例**。
+- 行号纠错：`minScore` 默认来自 `config.py` 的 `query.minScore=0.3`（`manager.py:803` 的 `0.7` 只是缺省兜底）；混合权重在 `manager.py:836-837`。
 
-- 项目作用域与任务复盘在本设计中属于**原创补齐**，**不以 JiuwenSwarm 作为「已实现先例」**。文档中不再出现任何「他们已实现、我们照做」的表述。
-- 唯一保留的方向性借鉴是「以仓库/目录为项目边界」这一想法——而对方**自己也没有实现**，只能作为「该做而未做」的旁证，不作为可行性证据。
-- 这些内容本身不需要外部先例支撑：项目身份、索引、复盘各自的依据都在本仓库源码里（见各节行号），DSH 公开 API 的边界也已逐条核实。
-- **无代码或文本复制**。Chief 复核：`git grep` 与全树文件搜索 `MemoryIndexManager|chunks_vec|chunks_fts|build_fts_query|TodoToolkit|EMBEDDING_CACHE_TABLE|vector_to_blob|list_memory_files|is_memory_path` 均无命中（`docs/dev-artifacts/scratch/` 未入库，其中 `jiuwenswarm-memory.md:24` 只是引用表名做对比）。产品侧为 Apache-2.0 / Python，本插件为 JS，无共享代码。
+**即便 `develop` 上存在更完整的实现，也不改变本设计**：项目身份、索引、复盘各自的依据都在本仓库源码里（`folders.js`、`chat-index.js`、`memory-files.js`、`handoffs.js`），DSH 公开 API 的边界已逐条核实。借不借得到先例，可行性论证不变。
+
+**无代码或文本复制。** Chief 复核：`git grep` 与全树文件搜索 `MemoryIndexManager|chunks_vec|chunks_fts|build_fts_query|TodoToolkit|EMBEDDING_CACHE_TABLE|vector_to_blob|list_memory_files|is_memory_path` 均无命中（`docs/dev-artifacts/scratch/` 未入库，其中 `jiuwenswarm-memory.md:24` 只是引用表名做对比）。产品侧为 Apache-2.0 / Python，本插件为 JS，无共享代码。
 
 ## 评审状态
 
-**本次评审未全部通过。** 以下问题在本次修订中已解决，可按「已解决」计：
+**两种状态必须分开读：**
 
-| 问题 | 处理 |
-|---|---|
-| 存储根写成 `<DSH_HOME>/memory` | 改为 `<botHome>/memory`，默认 `<DSH_HOME>/bot/memory`（`index.js:52` + `memory.js:504`） |
-| 目录名用 `proj:<hash>`（Windows 非法） | scope key 用 `project:<hash>`，目录用纯 16 位 hex |
-| 同步与异步两套算法 | 合并为单一 `resolve(cwd)` 同步函数，读写同一入口 |
-| `.git` 文件无 `commondir` | 回落用 `gitdir` 本身 |
-| 自动 review / 面板绕过隔离 | 新增 `writeScopeOf(sessionId, requested)` 单一判定点，`memory.js:1259/1290/1417` 全部改走它 |
-| 多 claims 崩溃后漏写 | 按 `entryId = hash(candidateId + claimIndex)` 逐条恢复，或整批原子提交 |
-| `sessionId + callId` 的保证过强 | 限定为「同一次工具调用重放」，换段重调靠内容去重，并写明同义不同措辞的边界 |
-| 索引缺 `added` 字段 | 已补进 `entries` 表 |
-| 内容哈希无存放位置 | 已指定 `index-hashes.json` |
-| 「40 个主题 / 毫秒级」表述不准 | 40 是每 scope 上限（`memory.js:37/652`）；删除未测量的性能断言 |
+- **设计结论：通过。** 架构、边界、数据模型、状态机、权限规则、降级链已定死，不再有留给实现期猜的选择项。
+- **代码：尚未实现；运行测试：待实施。** 本稿是设计文档，不含任何已上线行为。
 
-**仍未通过、需后续处理的**：桌面端 sqlite 可用性（P0 阻塞）、面板 project 归属规则（第 4 条）、幂等实现二选一（第 5 条）、插件工程师的完整核实报告。
+### 逐项关闭记录
+
+| # | 评审问题 | 处置 | 状态 |
+|---|---|---|---|
+| 1 | 存储根写成 `<DSH_HOME>/memory` | 改为 `<botHome>/memory`，默认 `<DSH_HOME>/bot/memory`（`index.js:52` + `memory.js:504`） | 关闭 |
+| 2 | 目录名用 `proj:<hash>`（Windows 冒号非法） | scope key 用 `project:<hash>`，目录用纯 16 位 hex | 关闭 |
+| 3 | 同步与异步两套算法会产生不同 id | 合并为单一同步 `resolve(cwd)`，读写同一入口；结果按 cwd 缓存 | 关闭 |
+| 4 | 解析失败会把项目内容落进全局 own | `unresolved` 时拒绝隐式 project 写入并说明原因 | 关闭 |
+| 5 | `.git` 文件无 `commondir`（子模块/分离 gitdir） | 回落用 `gitdir` 本身，判定顺序固定 | 关闭 |
+| 6 | 自动 review / 面板绕过隔离 | 新增 `writeScopeOf(sessionId, requested)` 单一判定点，`memory.js:1259/1290/1417` 全部改走它 | 关闭 |
+| 7 | 面板 project 归属靠猜会话 | 面板显式携带 `project`，服务器校验三项后落库 | 关闭 |
+| 8 | 一个候选多条 claims，崩溃后漏写 | 选定**逐项 `entryId` 恢复**；提交粒度不参与恢复判定 | 关闭 |
+| 9 | `sessionId + callId` 的保证过强 | 限定为「同一次工具调用重放」，换段重调靠内容去重，并写明边界 | 关闭 |
+| 10 | 把 caught-error 回滚误当断电原子性 | 明确指出 `commit` 只保证进程内异常回滚；恢复不依赖它 | 关闭 |
+| 11 | 索引缺 `added` 字段 | 已补进 `entries` 表 | 关闭 |
+| 12 | 内容哈希无存放位置 | 已指定 `index-hashes.json` | 关闭 |
+| 13 | 「40 个主题 / 毫秒级」表述不准 | 40 是每 scope 上限（`memory.js:37/652`）；删除未测量的性能断言 | 关闭 |
+| 14 | 桌面端 sqlite 被当成 P0 授权阻塞 | 改为运行时能力探测 + Markdown 降级；已实测 DSH Web（Node 24.20.0 / SQLite 3.53.4 / FTS5 trigram 可用） | 关闭 |
+| 15 | 两字中文词在 trigram 下召回为 0 | 已实测确认，`LIKE` 回退为必需项（与 `chat-index.js:23-42` 一致） | 关闭 |
+| 16 | JiuwenSwarm 分支未对齐 | 「全仓没有」降级为「`main` 上未见，`develop` 待核」，且本设计不依赖该结论 | 关闭（降级处理） |
+| 17 | 插件工程师报告缺失 | 如实保留；已核部分以 Chief 复核名义写入，不影响设计结论 | 关闭（证据强度备注） |
+
+**未关闭的都不是设计问题**：测试注入点（实现期预留）、桌面端 sqlite 实测（只影响「已验证平台」表述）、`develop` 分支对照（外部资料，本设计不依赖）。
 
 ## 评审结论（四角色）
 
 - **架构师**：给出 V2 总体设计（三文件、三态状态机、scope 白名单、快照冻结共存）。Chief 采纳其模块划分与状态机，修正其证据闸（不再四条件 AND）、`waits` 签名、索引失效方式、非 Git 根判定。
 - **插件工程师**：核实到源码级并实测了 worktree 的 `.git`/`commondir` 格式；429 中断，未交完整报告；关键结论由 Chief 复核补入。
 - **测试工程师**：提出 T1–T5 与崩溃注入方案，指出 `isError` 与 `exitCode` 的判定缺口；按后续纠正，本稿改为**按主张逐条判定**（见第 3 节表格）。其 T2/T5 已被证伪并替换。
-- **资料员**：本轮完成。核实出 JiuwenSwarm **没有**项目维度的记忆、**没有**任务经验实现（只有 `TodoToolkit` 的会话待办，不校验证据、不回写记忆）；并纠正此前把 `manager.py:788-789` 的 docstring 当作可用机制的错误。据其结论，本稿把对外引用降级为「文档意图 / 未接线」，项目作用域与任务复盘按**原创补齐**处理。见「与 JiuwenSwarm 的关系」。
+- **资料员**：本轮交付。在 `main` 上未见项目维度的记忆、未见任务经验实现（只有 `TodoToolkit` 的会话待办）；并纠正此前把 `manager.py:788-789` 的 docstring 当作可用机制的错误。**分支未对齐**（参考用 `develop`，核对用 `main`），结论按「`main` 上未见，`develop` 待核」处理，且本设计不依赖它；项目作用域与任务复盘按**原创补齐**。
 
 ## 变更
 
 - 2026-10-22：初稿。按最终口径删除全部向量/embedding 内容；完成判定改为显式候选 + 按主张的证据核验；索引一致性改为已提交视图 + 写入漏斗标脏 + 显式重建。
 - 2026-10-22（修订 2）：按评审意见修正存储根、目录名、单一规范化算法、`.git` 无 `commondir` 的回落、第一方写入的 project 传递、多 claims 幂等、索引字段与哈希位置；删除未测量的性能断言；新增「评审状态」一节，明确本次评审**未全部通过**。
 - 2026-10-22（修订 3）：按资料员核实结果新增「与 JiuwenSwarm 的关系」，把对外引用降级为「文档意图 / 未接线」，项目作用域与任务复盘改为原创补齐；补记无代码复制的外部复核方式；「尚未解决」项相应减少一条。
+- 2026-10-22（修订 4）：收回桌面端探针这一人为授权阻塞，改为运行时能力探测 + Markdown 降级，并实测 DSH Web 的 Node/SQLite/FTS5 trigram 能力与两字中文词的召回缺口；面板改为显式项目上下文 + 服务器校验；幂等恢复定死为逐项 `entryId`，并澄清 `commit` 不是断电原子；JiuwenSwarm 结论按分支未对齐降级；评审状态改为「设计结论通过 / 代码未实现」两段式，并补逐项关闭表。
