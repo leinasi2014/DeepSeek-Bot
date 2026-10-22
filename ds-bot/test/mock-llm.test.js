@@ -92,3 +92,27 @@ test('a Bot message hands work on with 转告 and takes its time with 慢慢做'
   const back = await call(url, [{ role: 'user', content: '[Reply from Coder · for the work Chief asked you for; your answer goes to Chief once everything you handed on is back]\n做完了' }], tools)
   assert.deepEqual([back.text, back.tools], ['Coder 交回了，我把结果交给 Chief。', []])
 })
+
+// A fresh DSH home sends the user's message with its runtime context and a
+// <system-reminder> block after it. The memory commands are the first line, so the
+// whole-text match missed them and the reminder's words ("workspace", "team") fell
+// through to the free-text rules: the bench saw a plain answer where a remember call
+// belonged and called it a missing tool.
+test('a memory command under a system reminder still reaches the memory tools', async (t) => {
+  const url = await startMock(t)
+  const tools = ['list_bots', 'remember', 'forget', 'recall']
+  const reminder = '\n\n<system-reminder>\nThe following workspace instructions may be relevant to your work: keep the team in step.\n</system-reminder>'
+
+  const saved = await call(url, [{ role: 'user', content: `记住 Alpha uses pnpm${reminder}` }], tools)
+  assert.deepEqual(saved.tools.map(used => used.name), ['remember'])
+
+  const recalled = await call(url, [{ role: 'user', content: `回忆 Alpha${reminder}` }], tools)
+  assert.deepEqual(recalled.tools.map(used => used.name), ['recall'])
+
+  const forgotten = await call(url, [{ role: 'user', content: `忘掉 Alpha uses pnpm${reminder}` }], tools)
+  assert.deepEqual(forgotten.tools.map(used => used.name), ['forget'])
+
+  // A plain message that merely carries the reminder must not be answered with list_bots.
+  const plain = await call(url, [{ role: 'user', content: `今天天气怎么样${reminder}` }], tools)
+  assert.deepEqual(plain.tools, [])
+})

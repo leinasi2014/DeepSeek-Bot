@@ -269,6 +269,10 @@ function decide(body) {
   }
 
   const userText = textOf(last?.content).trim()
+  // DSH appends its runtime context and system reminders to the user's message, so a
+  // command is the first line, not the whole text: `^…$` against the whole text would
+  // miss `记住 …` followed by a reminder block and fall through to the free-text rules.
+  const firstLine = userText.split('\n')[0].trim()
   // "撑爆": the provider rejects the request as past its window.
   if (userText.startsWith('撑爆')) return 'overflow'
   // A file in the message (a long Bot message, a file the user sent): DSH gives its saved
@@ -408,11 +412,11 @@ function decide(body) {
   if ((order = /^叫停\s*(\S+?)\s*[:：]\s*(.+)$/.exec(userText))) return [tool('stop_bot', { bot: order[1], reason: order[2] })]
   if ((order = /^看群\s*(.+)$/.exec(userText))) return [tool('read_group_chat', { group: order[1].trim() })]
   // Memory: 记住[@话题] 事实 · 团队记住 事实 · 忘掉 事实 · 回忆 [词]
-  if ((order = /^(团队)?记住(?:@(\S+))?\s*[:：]?\s*(.+)$/.exec(userText)) && tools.has('remember')) {
+  if ((order = /^(团队)?记住(?:@(\S+))?\s*[:：]?\s*(.+)$/.exec(firstLine)) && tools.has('remember')) {
     return [tool('remember', { text: order[3].trim(), ...(order[2] ? { topic: order[2] } : {}), ...(order[1] ? { scope: 'team' } : {}) })]
   }
-  if ((order = /^忘掉\s*[:：]?\s*(.+)$/.exec(userText)) && tools.has('forget')) return [tool('forget', { entry: order[1].trim() })]
-  if ((order = /^回忆(?:\s+(.+))?$/.exec(userText)) && tools.has('recall')) return [tool('recall', order[1] ? { query: order[1].trim() } : {})]
+  if ((order = /^忘掉\s*[:：]?\s*(.+)$/.exec(firstLine)) && tools.has('forget')) return [tool('forget', { entry: order[1].trim() })]
+  if ((order = /^回忆(?:\s+(.+))?$/.exec(firstLine)) && tools.has('recall')) return [tool('recall', order[1] ? { query: order[1].trim() } : {})]
   if ((order = /^搜索\s*[:：]\s*([^\n]+)/.exec(userText)) && tools.has('web_search')) return [tool('web_search', { queries: order[1].trim().split(/\s*[|｜]\s*/) })]
   if (/^看(?:网页|页面)/.test(userText) && tools.has('read_browser')) return [tool('read_browser', {})]
   if (userText.startsWith('写成文字')) return [text(WRITTEN_CALL)]
@@ -474,7 +478,11 @@ function decide(body) {
   if (card && tools.has('ask_user')) {
     return [text(filler(Number(card[1] ?? 4) * 1000, '卡片前')), tool('ask_user', { question: '接下来先做哪个？', options: ['写正文', '改标题', '先停'] })]
   }
-  if (/团队|班底|team/i.test(userText) && tools.has('list_bots')) return [tool('list_bots', {})]
+  // The free-text fallbacks read the user's own words, not DSH's appended context: a
+  // system reminder can mention the team, and this rule would then answer a plain
+  // message with list_bots.
+  const bare = userText.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+  if (/团队|班底|team/i.test(bare) && tools.has('list_bots')) return [tool('list_bots', {})]
   if (/想想|思考|think/i.test(userText)) {
     return [think('用户想让我认真想一下。先拆成三件事：目标、约束、下一步。'), text('想了一下，建议分三步走：先定目标，再看约束，最后定下一步。')]
   }
