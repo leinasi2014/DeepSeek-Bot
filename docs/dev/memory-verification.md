@@ -87,7 +87,7 @@ node --experimental-test-module-mocks --import ./test/harness-resolve.mjs --test
 
 **当前 skip 总数**：`memory-acceptance.test.js` 里 **30 条**（缓存 3、检索 5、一致性 4、验收 3、权限 3、等待 3、恢复 7、上限 2；用 `Select-String -Pattern 'test\.skip\('` 实数为 30）。这些**一条都不算通过**。其中一部分的实质覆盖已在 #53/#54 的独立用例里（见上表「检索」「一致性」两行），但**在 feat-55 里它们仍是 skip**，要转成真断言才算关闭——Chief 已要求最终验收前不能留 30 条 skip。
 
-**feat-55 合并后实测**（`2102c8a`，已并入 #52 `e604034`、#53、#54 与 team 真断言）：`npm test` **816 tests / 786 pass / 0 fail / 30 skip**（我本机 `ds-bot` 目录实跑，`DSH_HARNESS` 指主 worktree 的 `dev/harness`）。786 是「已实现并跑过」的部分，30 skip 是尚未转真的条目，两者不相加冒充全绿。
+**feat-55 合并后实测**（`2102c8a`，已并入 #52 `e604034`、#53、#54 与 team 真断言）：`npm test` **816 tests / 786 pass / 0 fail / 30 skip**（我本机在独立 detached worktree 的干净树 `abb56cb` 上复跑；`DSH_HARNESS` 指主 worktree 的 `dev/harness`）。786 是「已实现并跑过」的部分，30 skip 是尚未转真的条目，两者不相加冒充全绿。**注意**：若在 feat-55 工作区里跑出不同的 fail 数，先看 `git status`——QA 正在把 `permissions:` 组转成真断言（`another session` 与 `junction` 两条），未提交状态下失败属在写用例，不是已提交头的回归。
 
 ## 外部参考的核实方式
 
