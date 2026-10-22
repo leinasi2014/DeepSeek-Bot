@@ -525,7 +525,10 @@ export function install(rt) {
   const topicNames = (scope) => {
     try {
       return readdirSync(dirOf(scope)).filter(name => name.endsWith('.md') && name !== MAIN).map(name => name.slice(0, -3)).sort()
-    } catch {
+    } catch (error) {
+      // Only a missing scope is empty: hiding an unreadable directory would let a
+      // later save replace an existing topic as if it were a new file.
+      if (error?.code !== 'ENOENT') throw error
       return []
     }
   }
