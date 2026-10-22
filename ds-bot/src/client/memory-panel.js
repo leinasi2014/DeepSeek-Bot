@@ -117,7 +117,9 @@ function EntryRow({ entry, remove }) {
     }, confirming ? t('Remove') : h(TrashIcon)))
 }
 
-const projectNameOf = root => String(root ?? '').split(/[\\/]/).filter(Boolean).at(-1) ?? '?'
+// The host names each project; the panel only shows that name. Two Git repositories both
+// end in `.git`, so deriving a name here is what rendered both tabs as ".git" (#61).
+const projectNameOf = project => project.name ?? project.root ?? '?'
 
 // The projects this Bot works in, as the host counts them; naming one shows and
 // changes its memory. "No project" is the Bot's own and the team's alone.
@@ -129,7 +131,7 @@ function ProjectPicker({ view, session, onSession }) {
     projects.map(project => h('button', {
       key: project.hash, type: 'button', role: 'tab', title: project.root,
       'aria-selected': session === project.session || undefined, onClick: () => onSession(project.session),
-    }, projectNameOf(project.root))))
+    }, projectNameOf(project))))
 }
 
 function Entries({ bot, view, remove }) {

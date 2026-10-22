@@ -7948,7 +7948,7 @@ function EntryRow({ entry, remove }) {
     }, confirming ? t("Remove") : (0, import_react18.createElement)(TrashIcon))
   );
 }
-var projectNameOf = (root) => String(root ?? "").split(/[\\/]/).filter(Boolean).at(-1) ?? "?";
+var projectNameOf = (project) => project.name ?? project.root ?? "?";
 function ProjectPicker({ view, session, onSession }) {
   const projects = view.projects ?? [];
   if (projects.length === 0) return null;
@@ -7963,7 +7963,7 @@ function ProjectPicker({ view, session, onSession }) {
       title: project.root,
       "aria-selected": session === project.session || void 0,
       onClick: () => onSession(project.session)
-    }, projectNameOf(project.root)))
+    }, projectNameOf(project)))
   );
 }
 function Entries({ bot, view, remove }) {
