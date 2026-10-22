@@ -153,6 +153,13 @@ async function probe() {
   const limited = calls.filter(call => call.status === 429)
   const answered = calls.some(call => call.status === 200 && call.text !== undefined)
   if (!answered) throw new RateLimited('the probe before the round got no answer')
+  // When the tap records tool names (MOCK_LOG_TOOLS=1), the first chat call must already
+  // carry the memory tools. A bench that answers without them is a broken bench, never a
+  // passing round — the fresh-home incident looked exactly like that.
+  const chat = calls.find(call => Array.isArray(call.toolNames) && call.toolNames.length > 0)
+  if (chat !== undefined && !chat.toolNames.includes('remember')) {
+    throw new Error(`the first chat call of this bench has ${chat.toolNames.length} tools but no 'remember' — the bench is not ready or the wrong session answered`)
+  }
   say(`  probe: ${calls.length} calls, ${limited.length} rate limited, no stop`)
 }
 async function send(target, text) {
