@@ -6,7 +6,7 @@
 // model only, and never the real DSH_HOME.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -24,6 +24,9 @@ const projectA = join(scopeWork, 'alpha')
 const projectB = join(scopeWork, 'beta')
 mkdirSync(join(projectA, '.git'), { recursive: true })
 mkdirSync(join(projectB, '.git'), { recursive: true })
+// A .git pointer to nowhere: the session's project is unresolved, not absent.
+mkdirSync(join(scopeWork, 'broken'))
+writeFileSync(join(scopeWork, 'broken', '.git'), 'gitdir: ../nowhere\n')
 const scopeSessions = {
   sA: { id: 'sA', header: { cwd: projectA } },
   sB: { id: 'sB', header: { cwd: projectB } },
@@ -97,10 +100,69 @@ test('scope: the panel project list is server-computed from the Bot\'s own sessi
   // sLost resolves to nothing, so it never appears as a project choice.
 })
 
-// Waiting on a fix: applyReview (memory.js:1560-1563) does not go through
-// writeScopeOf and falls back to ownScope when the session's project is
-// unresolved — reported to Chief for #52, asserted here once fixed.
-test.skip('scope: the automatic review defaults to project and rejects unresolved', () => {})
+// The review path over the fixed #52 (d4ca7d9): the architect's regression covers
+// the unresolved refusal; this one adds the other side — a review add in a session
+// with a healthy project lands in that project, not in the Bot's own memory.
+test('scope: the automatic review defaults to project and rejects unresolved', async t => {
+  const broken = join(scopeWork, 'broken')
+  const reply = JSON.stringify({ changes: [{ op: 'add', text: 'The deploy window is 8pm' }] })
+  const startReview = (session, modelReplies) => {
+    const ctx = fakeContext()
+    const home = mkdtempSync(join(tmpdir(), '.dsh-test-memory-rt-'))
+    const rt = {
+      ctx, home, config: { memoryReviewDelayMs: 0 }, state: { rooms: {} },
+      load: async () => {}, readOnly: () => undefined, warn: () => {},
+      botOf: id => scopeBots[id], findBot: () => undefined,
+      selfOf: () => 'b2', isMain: () => true, isBotSession: () => true,
+      chatOf: botId => `chat-${botId}`, groupSessionsOf: () => [],
+      sessionsOfBot: () => [session.id],
+      chatOwners: new Map([[session.id, 'b2']]), groupOwners: new Map(), pastOwners: new Map(),
+      roomOf: () => undefined, partsOf: id => [{ sessionId: id }],
+      clock: () => '12:00', teamFolder: () => join(scopeWork, 'team'),
+      sessionFolder: s => (s?.id ?? s) === session.id ? session.header.cwd : scopeSessions[s?.id ?? s]?.header?.cwd,
+      desiredModel: async () => undefined, defaultModel: async () => 'deepseek/v4',
+      async* eventsBackwards() {},
+      async* partLines() { yield { who: 'user', text: 'The deploy window is 8pm.', seq: 10 } },
+    }
+    Object.assign(ctx, {
+      llm: {
+        listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }],
+        resolveModelInfo: async () => ({ reasoning: { efforts: [{ id: 'off' }] } }),
+        async* stream() {
+          const out = modelReplies.shift()
+          yield { type: 'text-delta', index: 0, text: out ?? '' }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      },
+    })
+    installProjectScope(rt)
+    installMemory(rt)
+    return { ctx, home, rt }
+  }
+
+  // A healthy project session: the review add lands in the project memory.
+  {
+    const s = startReview(scopeSessions.sA, [reply])
+    t.after(async () => { await s.ctx.dispose(); rmSync(s.home, { recursive: true, force: true }) })
+    s.ctx.emit('agent/status', { agent: { id: 'sA', session: scopeSessions.sA }, status: 'idle' })
+    await new Promise(resolve => setTimeout(resolve, 50))
+    const alpha = s.rt.projectScope.resolve(scopeSessions.sA)
+    assert.match(readFileSync(join(s.home, 'memory', 'projects', alpha.hash, 'MEMORY.md'), 'utf8'), /The deploy window is 8pm/)
+    assert.equal(existsSync(join(s.home, 'memory', 'bots', 'b2')), false)
+  }
+  // A broken gitdir session: the same add is skipped and journaled, own stays empty.
+  {
+    const brokenSession = { id: 'sBroken', header: { cwd: broken } }
+    const s = startReview(brokenSession, [reply])
+    t.after(async () => { await s.ctx.dispose(); rmSync(s.home, { recursive: true, force: true }) })
+    s.ctx.emit('agent/status', { agent: { id: 'sBroken', session: brokenSession }, status: 'idle' })
+    await new Promise(resolve => setTimeout(resolve, 50))
+    assert.equal(existsSync(join(s.home, 'memory', 'bots', 'b2')), false)
+    const log = readFileSync(join(s.home, 'memory', 'journal.jsonl'), 'utf8')
+    assert.match(log, /"reason":"project-unresolved"/)
+    assert.match(log, /The deploy window is 8pm/)
+  }
+})
 
 // --- caches (waits for #52: snapshot v2 + panel keys) ------------------------
 test.skip('cache: old snapshots invalidate; scope or teamRule change rebuilds', () => {})
