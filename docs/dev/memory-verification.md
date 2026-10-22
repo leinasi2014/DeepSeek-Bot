@@ -15,9 +15,9 @@
 | 项 | 状态 | 证据 | 备注 |
 |---|---|---|---|
 | 既有代码基线（未合并新功能时） | 实测 | `npm test` 727/727 | 只证明基线没坏 |
-| #52 单测与行为测试 | 实测 | `memory-project.test.js` 单跑：`edb6345` **8/8**（含 team 与 edit/move/remove 两条）；当前头 `4db72d4` **7/7**（team 用例已随撤回删除）。全量 `npm test`：`edb6345` 时 747/747，`4db72d4` 时 **746/746 pass / 0 fail / 0 skip**（均我本机实测）。覆盖 A/B 项目零泄漏、worktree 同 id、子模块独立 id、unresolved 拒写、快照 scope 头、面板越权 session 拒绝、review skip + journal、project 目标 edit/move/remove | 该头历史：`5542df2`(team 修复) → `edb6345`(纯测试) → `27e599b`(revert) → `e604034`(恢复) → `4db72d4`(再次撤回)。**合并请以 `edb6345` 为准**（Chief 指定），它是 8/8 且含 team 修复 |
-| #53 接线后全量测试 | 实测 | `npm test` 755/755；`build-client --check` 退出 0；`npm run lint` 退出 0 | 见 `feat/53-memory-index` 的 `2943fc2` |
-| #54 接线后全量测试 | 实测 | `npm test` 761/761（`cd7bd21`）→ 762/762（`7c61fd7` 补 file 路径校验）→ 773/773（并入 `d4ca7d9`）→ **776/776**（`1eb28cc`，并入 #53 索引 11 例 + HELD/补证 3 例）；`lint` 0、`build-client --check` 0。我在本机对 `1eb28cc` 干净树复跑：**776 pass / 0 fail / 0 skip** | 工作区另有未提交改动时全量为 779/777/2 fail，失败项是 `a relative file claim is judged against the cwd frozen at enqueue`——属在补的功能，不是 `1eb28cc` 的回归 |
+| #52 单测与行为测试 | 实测 | Chief 指定的合并头 `edb6345`：`memory-project.test.js` **8/8**、全量 **747/747**（team 修复 `5542df2` + edit/move/remove 用例均在内）。我另行实测 `4db72d4`（一度是 origin 头）：单跑 **7/7**、全量 **746/746**——该头再次 revert 了 team 修复 | 头链：`5542df2`(team 修复) → `edb6345`(纯测试 +71) → `27e599b`(revert) → `e604034`(恢复) → `4db72d4`(再次撤回)。**以 `edb6345` 为登记基准**（Chief 2026-10-22 指定 747） |
+| #53 接线后全量测试 | 实测 | `2943fc2` 时 755/755；当前头 `46a9690`（并入 #52 的 `e604034`）我在本机实测 **758 pass / 0 fail / 0 skip**；`build-client --check` 0、`lint` 0 | `2943fc2` 是接线提交，`46a9690` 为并入修复后的合并提交 |
+| #54 接线后全量测试 | 实测 | 演进：761（`cd7bd21`）→ 762（`7c61fd7`）→ 773（并入 `d4ca7d9`）→ 776（`1eb28cc`）→ **779**（`754ffb5`，Chief 登记基准：cwd 冻结、相对 ref 越界、reverify 复用三条新用例）→ **782**（当前 origin 头 `5be01ab`，`bb896b0` 并入 #53、`46a9690` 并入 #52 的 `e604034`，再含 wiring 测试时序修复）。我在本机对 `5be01ab` 实测：**782 pass / 0 fail / 0 skip**；`lint` 0、`build-client --check` 0 | 与 Chief 登记的 779 差异来源已核：779 是 `754ffb5`，之后又并入了 #53/#52 与一条 wiring 修复，故当前头为 782，非回归 |
 | `node:sqlite` + FTS5 trigram 在 Node 侧可用 | 实测 | 设计 §8 记录的探针：建表、长中文 MATCH、短中文 LIKE、scope 过滤均通过 | 只覆盖 Node/Web 侧 |
 | **桌面 Electron 端的 `node:sqlite`** | **未验证** | 无 | 本机无 DSH 的 `app/` checkout，跑不了探针；桌面端必须走扫描回退 |
 | 原生 Windows 隔离 smoke | **未验证** | 无 | `dev/bench.sh` 需要 `deepseek-harness` checkout 与本机不符，尚未跑；不得计为通过 |
@@ -35,7 +35,7 @@
 | 显式 `team:true` 但 Bot 无 team 写权限时落到 own | 实测（`5542df2`，用例来自 `edb6345`） | `memory.js` 中 `op === 'add' && change.team === true && !writesTeam` → `journal({op:'skip', scope:'team', reason:'team-write-denied', after: 全文})` + `continue`，不再落 own。用例「the memory review refuses a team write the Bot may not make, instead of saving it to own」用非 Main Bot fixture，断言 own 与 team 目录均未创建、journal 带该 reason 与全文。在 `edb6345` 上为 8 条之一 | Chief 接受为**有意的行为变更**，legacy 用例「keeps what the user said」期望随之变为 `add/skip/replace`，属预期变更。**注意**：该修复在后续头 `27e599b`/`4db72d4` 被 revert 过两次，代码是否保留取决于最终合并的头 |
 
 
-**结论：上表中「实测」的项只覆盖测试套件与静态检查；新功能的隔离 smoke、UI 截图、桌面端探针都还没有跑。不要把本文件里的 745/755/762/773/776 读成新功能验收通过——它们只是各分支不同阶段的全量测试数，且都在本机临时目录里跑；各分支尚未合入 `dev`，合入后数字还会变。**
+**结论：上表中「实测」的项只覆盖测试套件与静态检查；新功能的隔离 smoke、UI 截图、桌面端探针都还没有跑。不要把本文件里的任何测试数（747 / 758 / 782 等）读成新功能验收通过——它们只是各分支不同阶段的全量测试数，且都在本机临时目录里跑；各分支尚未合入 `dev`，合入后数字还会变。**
 
 ## 怎么自己复核
 
