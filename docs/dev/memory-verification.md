@@ -17,20 +17,24 @@
 | 既有代码基线（未合并新功能时） | 实测 | `npm test` 727/727 | 只证明基线没坏 |
 | #52 单测与行为测试 | 实测 | `npm test` 744/744（修复前）→ **745/745**（`d4ca7d9` 后）；含 A/B 项目零泄漏、worktree 同 id、子模块独立 id、unresolved 拒写、快照 scope 头、面板越权 session 拒绝、review 路径 skip + journal | 见 #52 分支提交说明 |
 | #53 接线后全量测试 | 实测 | `npm test` 755/755；`build-client --check` 退出 0；`npm run lint` 退出 0 | 见 `feat/53-memory-index` 的 `2943fc2` |
-| #54 接线后全量测试 | 实测 | `npm test` 761/761，补 file 路径校验后 **762/762**，并入 `d4ca7d9` 后 **773/773**；`lint` 0、`build-client --check` 0 | 见 `feat/54-task-review` 的 `cd7bd21`、`7c61fd7` 及后续合并 |
+| #54 接线后全量测试 | 实测 | `npm test` 761/761（`cd7bd21`）→ 762/762（`7c61fd7` 补 file 路径校验）→ 773/773（并入 `d4ca7d9`）→ **776/776**（`1eb28cc`，并入 #53 索引 11 例 + HELD/补证 3 例）；`lint` 0、`build-client --check` 0。我在本机对 `1eb28cc` 干净树复跑：**776 pass / 0 fail / 0 skip** | 工作区另有未提交改动时全量为 779/777/2 fail，失败项是 `a relative file claim is judged against the cwd frozen at enqueue`——属在补的功能，不是 `1eb28cc` 的回归 |
 | `node:sqlite` + FTS5 trigram 在 Node 侧可用 | 实测 | 设计 §8 记录的探针：建表、长中文 MATCH、短中文 LIKE、scope 过滤均通过 | 只覆盖 Node/Web 侧 |
 | **桌面 Electron 端的 `node:sqlite`** | **未验证** | 无 | 本机无 DSH 的 `app/` checkout，跑不了探针；桌面端必须走扫描回退 |
 | 原生 Windows 隔离 smoke | **未验证** | 无 | `dev/bench.sh` 需要 `deepseek-harness` checkout 与本机不符，尚未跑；不得计为通过 |
 | 面板 UI 截图 | **未验证** | 无 | 依赖 UI 构建与真实界面，尚未截图 |
 | 同大小同 mtime 的手工改写可被发现 | 推断 | 设计 §4 规定以内容 hash 为唯一新鲜度依据，不用 mtime/size | 待 #53 用例实测 |
 | 归档后清理死 scope 的索引行 | 推断 | #53 实现里有显式回收，见 `memory-index.js` 与归档调用点 | 待用例实测 |
-| 强杀后逐项续写、每条恰好一次 | 推断 | 设计 §6 的逐项状态机与固定 `review_id` | 待 #54 故障注入实测 |
+| 强杀后逐项续写、每条恰好一次 | 推断 | 设计 §6 的逐项状态机与固定 `review_id`；`task-review.js` 有 `HELD` 与逐候选 `task-plans/<id>.json` | 仍待故障注入实测（强杀点尚未注入） |
+| 被闸门拒掉的教训只留候选、不进 Markdown | 实测 | `7c61fd7`：`record.unverified` 记 `reason`（`evidence-unsupported`/`evidence-missing`/`entry-problem`/`secret`/`model-unsupported`）与原文，只留在 `task-plans/<id>.json`。用例「the memory review…」（file 越界）断言 `unverified[0].reason === 'evidence-unsupported'` 且未写记忆；模型判 no 时断言 `model-unsupported` | — |
+| 拒掉的候选不冻结空计划、不标 DONE，空闲不自动重试 | 实测 | `1eb28cc` 引入 `HELD`（`task-review.js:39/268/297`）：`process` 对 `HELD` 直接返回，空闲不再烧模型调用。用例「a task whose lessons are all refused waits for an explicit retry」 | — |
+| 显式补证入口存在，且不复用已冻结计划重抽 | 实测 | `1eb28cc`：新 endpoint `memory-task-retry`（`channel.js` 放行），`retry(id)` 后只对该会话跑一次；`:318` 对已有 `plan !== null` 直接拒绝重抽。用例「an explicit retry reopens a held task, and a frozen one is never extracted again」「a candidate with a frozen plan ignores the explicit retry」 | — |
+| 任务完成的判定不依赖 `isError` 字段本身 | 推断（已定为边界） | 设计 §5 已写明 `isError:false` 本身不等于成功。现实现取「同会话 `partLines` 的 part/seq 日志 + 渲染文本里的 `[exit code: N]`/`[timed out`/`[killed by signal`/`[stderr]` 标记」+ `toolReportedFailure` 进语义核验；未直接从 `tool/result` 事件读结构化 `isError` | 按 Chief 2026-10-22 决定列为**已定边界**，不作未完成项；出现具体反例再改 |
 | 项目无法判定时不落 own（工具路径） | 实测 | #52 的 `memory-project.test.js`：unresolved 拒绝隐式写入 | 见 #52 分支 |
 | 项目无法判定时不落 own（自动复盘路径，add） | 实测 | `d4ca7d9`。skip 判定在 `memory.js:1566`：`op === 'add'` 且非显式 `team`，或 `target?.scope === 'project'`；命中即 `journal({op:'skip', scope:'project:unresolved', reason:'project-unresolved', problem})` 后 `continue`，不再走 `:1582-1583` 的 `ownScope` 回落。用例「the memory review skips project writes when the project is unresolved, and journals them」用 broken gitdir（`.git` 写 `gitdir: ../nowhere`）真走 review 通道，断言 `memory/bots/b2` 不存在、team 那条仍落盘、`problem` 含 `nowhere`、`after` 存全文 | — |
 | 项目无法判定时不落 own（自动复盘路径，edit/move/remove） | 实测 | `5542df2`。用例「review changes to project entries are skipped when the project breaks before they apply」：先经工具写入 project 的两条（MEMORY.md 一条 + topic 一条），在 review 已列出条目、回复未落之间把 `.git` 改成断链并 `clearCache()`，再一次性提交 edit/move/remove 三条，断言 project 的 MEMORY.md 与 topic **逐字未变**、`memory/bots/b2` 不存在、journal 里三条的 `(intendedOp, scope)` 恰为 `[['edit','project:unresolved'],['move','project:unresolved'],['remove','project:unresolved']]` | 三条 op 各自断言，不是抽样 |
 | 显式 team 无写权限时不落 own | 实测 | `5542df2`。`memory.js:1562-1576`：`op === 'add' && change.team === true && !teamWrites` → `journal({op:'skip', scope:'team', reason:'team-write-denied', after})` + `continue`。用例「the memory review refuses a team write the Bot may not make, instead of saving it to own」用 `isMain: () => false` 的非 Main Bot fixture，断言 team 目录与 `bots/b2` **都不存在**、journal 有 `reason:'team-write-denied'` 且 `scope:'team'`、`after` 存全文。`memory.test.js` 的 review 用例同步改为期望 `['skip','team-write-denied',…]` 而非旧行为「落到 own」 | — |
 
-**结论：上表中「实测」的项只覆盖测试套件与静态检查；新功能的隔离 smoke、UI 截图、桌面端探针都还没有跑。不要把本文件里的 745/755/762/773 读成新功能验收通过——它们只是不同阶段的全量测试数，且都在本机临时目录里跑。**
+**结论：上表中「实测」的项只覆盖测试套件与静态检查；新功能的隔离 smoke、UI 截图、桌面端探针都还没有跑。不要把本文件里的 745/755/762/773/776 读成新功能验收通过——它们只是各分支不同阶段的全量测试数，且都在本机临时目录里跑；各分支尚未合入 `dev`，合入后数字还会变。**
 
 ## 怎么自己复核
 
