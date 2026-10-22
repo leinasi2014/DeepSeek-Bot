@@ -617,6 +617,13 @@ export function install(rt) {
   const taskLabel = scope => labelOf(scope, scope.kind === 'bot' ? scope.botId : undefined)
   const taskScopeOf = record => (record.project === null ? ownScope(record.botId) : { kind: 'project', hash: record.project.slice('project:'.length) })
 
+  // Who wrote the entry, for the scopes `metaFor` names the writer in: a project's memory
+  // is shared by every Bot that works there, so a lesson kept by the review has to say
+  // which Bot it came from, exactly as `remember` does. A Bot's own memory says nothing:
+  // the scope already is that Bot. Frozen into the plan with the other fields, never
+  // recomputed at apply time.
+  const taskByOf = (record, scope) => (scope.kind === 'team' || scope.kind === 'project' || scope.botId !== record.botId ? { by: rt.botOf(record.botId)?.name } : {})
+
   const taskCwdOf = (sessionId) => {
     const session = sessionRecord(sessionId)
     return session === undefined ? null : rt.sessionFolder(session) ?? null
@@ -795,6 +802,7 @@ export function install(rt) {
           claim: entry.claim,
           evidence: entry.evidence.slice(0, 200),
           source: source.slice(0, 200),
+          ...taskByOf(record, scope),
           outcome: entry.outcome,
           added: today(),
         },
@@ -2381,6 +2389,7 @@ export function install(rt) {
             claim: entry.claim,
             evidence: String(entry.evidence ?? '').slice(0, 200),
             source: source.slice(0, 200),
+            ...taskByOf(record, taskScopeOf(record)),
             outcome,
             added: today(),
           },
