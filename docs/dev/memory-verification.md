@@ -15,9 +15,9 @@
 | 项 | 状态 | 证据 | 备注 |
 |---|---|---|---|
 | 既有代码基线（未合并新功能时） | 实测 | `npm test` 727/727 | 只证明基线没坏 |
-| #52 单测与行为测试 | 实测 | **最终头 `edb6345`**（含 team 用例，`memory-project.test.js` 8/8）：我在独立 detached worktree 干净树复跑，全量 **747/747 pass / 0 fail / 0 skip** | 头链曾反复：`5542df2`(team 修复) → `edb6345`(+71 测试) → `27e599b`(revert) → `e604034`(恢复) → `4db72d4`(撤回) → `49e9801`(恢复) → `ed06b97`(撤回)。Chief 2026-10-22 最终裁定以 `edb6345` 为准，须丢弃后续撤回提交 |
-| #53 接线后全量测试 | 实测 | **最终头 `c0a3f11`**（含 #52 的 `edb6345`）：**758/758 pass / 0 fail / 0 skip**（我本机 detached worktree 复跑）；`build-client --check` 0、`lint` 0 | `2943fc2` 为接线提交（755） |
-| #54 接线后全量测试 | 实测 | **最终头 `16ee6ae`**（含 #52 `edb6345` + #53 `c0a3f11`）：**782/782 pass / 0 fail / 0 skip**（我本机 detached worktree 复跑）。演进：761→762→773→776→779（`754ffb5` 三处补证：原始 cwd 冻结、相对 ref 走同一文件边界、`memory-task-reverify`）→782 | 779→782 的 +3 来自并入 #53/#52 与一条 wiring 时序修复，非回归 |
+| #52 单测与行为测试 | 实测 | **登记头 `edb6345`**（Chief 最终裁定的 #52 头，含 team 用例）：`memory-project.test.js` **8/8**、全量 **747/747 pass / 0 fail / 0 skip**（独立 detached worktree 复跑）。我另外实测 `27e599b`（架构师 revert 后的头）为 **746/746**、用例 7/7——少的那条正是被 revert 掉的 team 用例 | Chief 裁定 `edb6345` 为最终头；截至本表更新时，缓存的上游跟踪引用仍为 `ed06b97`（同样不含 team 修复、实测 746），需架构师把 `feat-52` 归位到 `edb6345` 才能落地。头链：`5542df2`→`edb6345`→`27e599b`→`e604034`→`4db72d4`→`49e9801`→`ed06b97` |
+| #53 接线后全量测试 | 实测 | `c0a3f11`（Chief 登记头）与恢复后的 `4b6f1eb`（`Restore the team-write refusal, which the maintainer kept in scope`）我都实测：均 **758/758 pass / 0 fail / 0 skip**；`build-client --check` 0、`lint` 0 | 两个头都含 team 修复；`2943fc2` 为接线提交（755） |
+| #54 接线后全量测试 | 实测 | `16ee6ae`（Chief 登记头）与恢复后的 `114a4a0`（`Merge the memory index branch with the team-write refusal restored`）均 **782/782 pass / 0 fail / 0 skip**。演进：761→762→773→776→779（`754ffb5` 三处补证：原始 cwd 冻结、相对 ref 走同一文件边界、`memory-task-reverify`）→782 | 两个头都含 team 修复；779→782 的 +3 来自并入 #53/#52 与一条 wiring 时序修复 |
 | `node:sqlite` + FTS5 trigram 在 Node 侧可用 | 实测 | 设计 §8 记录的探针：建表、长中文 MATCH、短中文 LIKE、scope 过滤均通过 | 只覆盖 Node/Web 侧 |
 | **桌面 Electron 端的 `node:sqlite`** | **未验证** | 无 | 本机无 DSH 的 `app/` checkout，跑不了探针；桌面端必须走扫描回退 |
 | 原生 Windows 隔离 smoke | **未验证** | 无 | `dev/bench.sh` 需要 `deepseek-harness` checkout 与本机不符，尚未跑；不得计为通过 |
