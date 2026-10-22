@@ -202,6 +202,14 @@ test.skip('cache: old snapshots invalidate; scope or teamRule change rebuilds', 
 test.skip('cache: ordinary content updates stay frozen within a session', () => {})
 test.skip('cache: every summary cache is scope-keyed; A->B->A stale reply dropped', () => {})
 
+// --- platform note (CI blind spot): the identity rows about real casing ("the case
+// of a folder is the case on disk", two same-name-different-case folders) hold only
+// where the file system reports the creation case — Windows with 8.3 expansion and
+// macOS, not Linux CI runners, whose case-insensitive-looking assertions fail (PR #57
+// CI, run 39770798812). #52's project-scope tests are being made platform-aware;
+// this branch's acceptance runs on Windows native only, so the casing rows are marked
+// here rather than silently green.
+
 // --- retrieval & consistency: every row is asserted by test/memory-index.test.js
 // (#53, merged here), plus these mapping notes: empty-query listing and whole-topic
 // reads are unchanged recall behavior with coverage in test/memory.test.js; mixed
