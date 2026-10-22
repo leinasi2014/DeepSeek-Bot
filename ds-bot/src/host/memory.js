@@ -1297,7 +1297,7 @@ export function install(rt) {
   // and a conversation that goes on before its review starts is read in one go.
 
   const cursorsPath = join(root, 'reviewed.json')
-  // How many times in a row the model answered with something unreadable, per conversation
+  // How many times in a row the model answered with something invalid, per conversation
   // and at which cursor. A model that keeps producing an invalid answer would otherwise be
   // stuck on the same lines forever: the review fails, so the cursor never moves.
   const rejectionsPath = join(root, 'rejections.json')
@@ -1530,7 +1530,18 @@ export function install(rt) {
       const language = writtenIn(read.filter(line => line.who === 'user').map(line => line.text.replace(/^User: /, '')), languageNow())
       const reply = await botShot(bot, reviewSystem(writesTeam(bot.id)), reviewRequest({ bot, numbered, left, sizes, where: batch.where, earlier, fresh: fresh.texts, more, language }), { sessionId: rt.chatOf(bot.id), kind: 'memory' })
       const changes = parseReview(reply)
-      if (changes === undefined) {
+      const applied = changes?.slice(0, REVIEW_CHANGES_MAX) ?? []
+      const unknown = changes?.find(change => change.op !== 'add' && numbered[Number(change.entry) - 1] === undefined)
+      // A secret is left out for good; other invalid entries count as bad answers,
+      // just as invalid JSON does, so a model cannot hold this batch forever.
+      const unfit = applied.filter(change => change.op !== 'remove').map(change => cleanEntry(change.text)).find(text => !secretEntry(text) && entryProblem(text) !== undefined)
+      const badTopic = applied.find(change => (change.op === 'add' || change.op === 'move') && typeof change.topic === 'string' && change.topic.trim() !== '' && cleanTopic(change.topic) === undefined)
+      const invalid = changes === undefined ? `the model's answer is not a list of changes: ${clip(reply.replace(/\s+/g, ' '), 120)}`
+        : unknown !== undefined ? `the model's answer names entry ${unknown.entry}, which is not listed`
+        : unfit !== undefined ? `the model's answer holds an entry memory cannot keep: ${entryProblem(unfit)}`
+        : badTopic !== undefined ? `the model's answer names the topic "${clip(badTopic.topic, 60)}", which cannot be a topic name`
+        : undefined
+      if (invalid !== undefined) {
         // Count the failure at this cursor. One or two in a row keep the old behaviour:
         // the answer is refused and the next review reads the same lines.
         const rejections = await loadRejections()
@@ -1559,26 +1570,29 @@ export function install(rt) {
             // Only a batch that was cut short is marked as such.
             ...(more ? { truncated: true } : {}),
           })
-          // The cursor first: if that write fails the counter stays, so the next review
-          // starts from the same place instead of silently skipping lines nobody read.
-          // Hand the rest over before anything below can fail: a failed write must not
-          // leave the remaining lines unread for good.
-          if (more) queueReview(sessionId, room === undefined ? seen : { botId: bot.id, roomId: room.id, room })
           // Disk first, then memory: if the write fails, memory keeps the old cursor and the
-          // batch is retried rather than skipped in name only.
+          // batch waits for another turn rather than requeueing itself without progress.
           await writeText(cursorsPath, JSON.stringify({ ...cursorsNow(), [key]: through }))
           cursorsNow()[key] = through
+          // The rest is safe to queue now. Do it before clearing the refusal count, so
+          // failure to clear that count cannot leave the remaining lines unread.
+          if (more) queueReview(sessionId, room === undefined ? seen : { botId: bot.id, roomId: room.id, room })
           try {
             delete rejections[key]
             await saveRejections(rejections)
           } catch (error) {
             rt.warn('ds-bot: could not clear the review rejection count: %s', error)
           }
-          rt.warn('ds-bot: memory review of %s gave up on three unreadable answers in a row', bot.name)
+          rt.warn('ds-bot: memory review of %s gave up on three invalid answers in a row', bot.name)
           return
         }
-        throw new Error(`the model's answer is not a list of changes: ${clip(reply.replace(/\s+/g, ' '), 120)}`)
+        throw new Error(invalid)
       }
+      if (rt.botOf(bot.id) === undefined) return
+      const changed = await applyReview(bot, sessionId, numbered, applied, batch.source(read))
+      if (rt.botOf(bot.id) === undefined) return
+      // Operational failures are not bad model answers. Only a valid review that
+      // finished applying its changes clears the prior refusal count.
       {
         const rejections = await loadRejections()
         if (rejections[key] !== undefined) {
@@ -1586,18 +1600,6 @@ export function install(rt) {
           await saveRejections(rejections)
         }
       }
-      const unknown = changes.find(change => change.op !== 'add' && numbered[Number(change.entry) - 1] === undefined)
-      if (unknown !== undefined) throw new Error(`the model's answer names entry ${unknown.entry}, which is not listed`)
-      // A secret is left out for good; any other entry memory cannot keep (one too
-      // long, say) fails the answer, so the next review reads the lines again.
-      const applied = changes.slice(0, REVIEW_CHANGES_MAX)
-      const unfit = applied.filter(change => change.op !== 'remove').map(change => cleanEntry(change.text)).find(text => !secretEntry(text) && entryProblem(text) !== undefined)
-      if (unfit !== undefined) throw new Error(`the model's answer holds an entry memory cannot keep: ${entryProblem(unfit)}`)
-      const badTopic = applied.find(change => (change.op === 'add' || change.op === 'move') && typeof change.topic === 'string' && change.topic.trim() !== '' && cleanTopic(change.topic) === undefined)
-      if (badTopic !== undefined) throw new Error(`the model's answer names the topic "${clip(badTopic.topic, 60)}", which cannot be a topic name`)
-      if (rt.botOf(bot.id) === undefined) return
-      const changed = await applyReview(bot, sessionId, numbered, applied, batch.source(read))
-      if (rt.botOf(bot.id) === undefined) return
       // An answer at the limit may have left some out, so the same lines are read
       // again, a few times at most, while each pass still changes something.
       const prior = overflowed.get(key)
