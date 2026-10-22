@@ -126,11 +126,19 @@ test('a missing folder is unresolved and the case of a folder is the case on dis
   const resolve = makeResolver().resolve
   assert.equal(resolve(join(temp, 'not-there')).status, 'unresolved')
   const lower = folder('casetest')
-  // On a case-insensitive filesystem both spellings reach the folder; the answer
-  // is the name it was created with, and one hash for both.
+  // A case-insensitive filesystem (Windows, macOS) answers both spellings with
+  // the name on disk, so both are one project; a case-sensitive one (Linux CI)
+  // answers that the other spelling is not there. Both keep the real case,
+  // each in its own way, so the assertion follows the filesystem at hand.
   const upper = join(dirname(lower), 'CASETEST')
-  assert.equal(resolve(upper).root, lower)
-  assert.equal(resolve(upper).root, resolve(lower).root)
+  if (existsSync(upper)) {
+    assert.equal(resolve(upper).root, lower)
+    assert.equal(resolve(upper).root, resolve(lower).root)
+  } else {
+    assert.equal(resolve(upper).status, 'unresolved')
+    assert.equal(resolve(lower).root, lower)
+    assert.equal(resolve(lower).root, resolve(lower).root)
+  }
 })
 
 test('answers expire, so a folder that gains a repository is found again', () => {
