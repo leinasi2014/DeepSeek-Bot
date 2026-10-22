@@ -7,7 +7,8 @@
 //   <home>/memory/team/           what every Bot reads
 //   <home>/memory/journal.jsonl   every change, with the line before and after
 //   <home>/memory/snapshots/      the memory section each Session froze
-//   <home>/memory/summaries/      the memory panel's summary per Bot
+//   <home>/memory/summaries/      the memory panel's summary per Bot and scope set
+//   <home>/memory/projects/       one folder of memory per project (project-scope.js)
 //   <home>/memory/archive/        the memory of deleted Bots
 //   <home>/memory/reviewed.json   how far the memory review has read each conversation
 //
@@ -22,7 +23,7 @@
 // anyway), freezes it anew.
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
-import { mkdir, rename, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, rename, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { BlockAssembler } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -295,10 +296,10 @@ const wordsOf = (text) => {
 // while they fit, those sharing words with `about` (the user's new lines) first so
 // the model can correct them, then the newest. Topics can hold far more than a
 // model's window.
-export function reviewEntries(own, team, budget = REVIEW_MEMORY_MAX, about = '') {
+export function reviewEntries(own, team, budget = REVIEW_MEMORY_MAX, about = '', project = []) {
   const tagged = (files, scope) => files.flatMap(file => file.entries.map(entry => ({ ...entry, file, scope })))
-  const main = [...tagged(own.slice(0, 1), 'own'), ...tagged(team.slice(0, 1), 'team')]
-  const topics = [...tagged(own.slice(1), 'own'), ...tagged(team.slice(1), 'team')]
+  const main = [...tagged(own.slice(0, 1), 'own'), ...tagged(team.slice(0, 1), 'team'), ...tagged(project.slice(0, 1), 'project')]
+  const topics = [...tagged(own.slice(1), 'own'), ...tagged(team.slice(1), 'team'), ...tagged(project.slice(1), 'project')]
   let used = main.reduce((sum, entry) => sum + entry.text.length, 0)
   const asked = wordsOf(about)
   const shared = entry => [...wordsOf(`${entry.text} ${entry.file.topic ?? ''}`)].filter(word => asked.has(word)).length
@@ -509,8 +510,25 @@ export function install(rt) {
   const safeId = id => (/^[\w-]{1,128}$/.test(id) ? id : createHash('sha256').update(String(id)).digest('hex').slice(0, 32))
   const TEAM = { kind: 'team' }
   const ownScope = botId => ({ kind: 'bot', botId })
-  const dirOf = scope => (scope.kind === 'team' ? join(root, 'team') : join(root, 'bots', safeId(scope.botId)))
-  const scopeKey = scope => (scope.kind === 'team' ? 'team' : `bot:${scope.botId}`)
+  const dirOf = scope => (scope.kind === 'team' ? join(root, 'team') : scope.kind === 'project' ? rt.projectScope.dirOf(scope) : join(root, 'bots', safeId(scope.botId)))
+  const scopeKey = scope => (scope.kind === 'team' ? 'team' : scope.kind === 'project' ? `project:${scope.hash}` : `bot:${scope.botId}`)
+
+  // The one source of a Session's project, for every consumer: the working folder
+  // DSH has for it, and no other. A Session record when one is at hand (the tools,
+  // the prompt hook), the id looked up in ctx.sessions otherwise (the panel, the
+  // review); rt.sessionFolder treats both alike.
+  const sessionRecord = (session) => {
+    if (session === undefined || session === null) return session
+    if (typeof session === 'object') return session
+    try {
+      return ctx.sessions?.get?.(session)
+    } catch {
+      return undefined
+    }
+  }
+  // Absent (memory off through a runtime without the module) reads as "no
+  // project": memory then behaves exactly as it did before projects existed.
+  const projectOf = (session) => rt.projectScope?.resolve?.(sessionRecord(session) ?? session) ?? { status: 'none' }
 
   const readText = (path) => {
     try {
@@ -564,7 +582,7 @@ export function install(rt) {
     const botActor = actor?.id === 'user' ? undefined : actor?.id
     const gone = [scope.kind === 'bot' ? scope.botId : undefined, botActor].some(id => id !== undefined && rt.botOf(id) === undefined)
     if (gone) throw Object.assign(new Error('That Bot has been deleted'), { code: GONE })
-    const denied = botActor === undefined ? undefined : writeDenied(scope, botActor)
+    const denied = botActor === undefined ? undefined : writeDenied(scope, botActor, actor?.session)
     if (denied !== undefined) throw Object.assign(new Error(denied), { code: DENIED })
   }
 
@@ -575,22 +593,57 @@ export function install(rt) {
 
   const writesTeam = botId => rt.isMain(botId) || Object.values(state.rooms).some(room => room.admin === botId)
 
-  // `raw` names a scope: "own", "team", or a Bot. Undefined for the default.
-  function namedScope(raw, botId) {
+  // `raw` names a scope: "own", "team", "project", or a Bot. Undefined for the
+  // default. "project" is the caller's own project, decided here from its session —
+  // never a hash the model picks, which would be a permission by assertion.
+  const PROJECT_WORD = /^(project|项目)$/i
+  function namedScope(raw, botId, session) {
     const value = unquote(raw)
     if (value === '') return {}
     if (/^(own|me|mine|self|yours?|自己|我)$/i.test(value)) return { scope: ownScope(botId) }
     if (/^(team|团队|共享)$/i.test(value)) return { scope: TEAM }
+    if (PROJECT_WORD.test(value)) {
+      const project = projectOf(session)
+      if (project.status === 'ok') return { scope: project.scope }
+      if (project.status === 'unresolved') return { error: `This conversation has no project memory: ${project.reason}. Use "own" or "team" instead.` }
+      return { error: 'This conversation works outside any project folder, so it has no project memory. Use "own" or "team".' }
+    }
     const bot = rt.findBot(value)
-    if (bot === undefined) return { error: `No Bot named ${value}. scope is "own", "team", or a Bot's name.` }
+    if (bot === undefined) return { error: `No Bot named ${value}. scope is "own", "team", "project", or a Bot's name.` }
     return { scope: ownScope(bot.id) }
   }
-  function writeDenied(scope, botId) {
+
+  // The one decision every write passes through: the requested scope, or the
+  // default (the caller's project when it has one, else its own memory). A session
+  // whose project cannot be told apart writes nothing by default rather than land
+  // in the global own scope by accident.
+  function writeScopeOf(session, raw, botId) {
+    const value = unquote(raw)
+    if (value !== '' && !PROJECT_WORD.test(value)) return namedScope(value, botId, session)
+    const project = projectOf(session)
+    if (value !== '') {
+      if (project.status === 'ok') return { scope: project.scope }
+      if (project.status === 'unresolved') return { error: `This conversation has no project memory: ${project.reason}. Use "own" or "team" instead.` }
+      return { error: 'This conversation works outside any project folder, so it has no project memory. Use "own" or "team".' }
+    }
+    if (project.status === 'ok') return { scope: project.scope }
+    if (project.status === 'unresolved') return { error: `Cannot tell which project this conversation works in (${project.reason}), so nothing is saved by default. Name a scope — "own" or "team" — to save it anyway.` }
+    return {}
+  }
+  function writeDenied(scope, botId, session) {
     if (scope.kind === 'team') return writesTeam(botId) ? undefined : 'Only Main Bots and group admins write the team memory. Tell a Main Bot with message_bot what the team should know.'
+    if (scope.kind === 'project') {
+      // Re-read at write time: a queued write must not land in a project the
+      // conversation has left, and no Bot writes a project it does not work in.
+      const now = projectOf(session)
+      if (session === undefined) return 'Project memory changes need a session that works in the project.'
+      if (now.status !== 'ok' || now.scope.hash !== scope.hash) return 'This conversation no longer works in that project, so its memory stays as it is.'
+      return undefined
+    }
     if (scope.botId !== botId && !rt.isMain(botId)) return 'Only a Main Bot can change another Bot\'s memory. Use message_bot to tell that Bot instead.'
     return undefined
   }
-  const labelOf = (scope, botId) => (scope.kind === 'team' ? 'the team memory' : scope.botId === botId ? 'your memory' : `${rt.botOf(scope.botId)?.name ?? 'that Bot'}'s memory`)
+  const labelOf = (scope, botId) => (scope.kind === 'team' ? 'the team memory' : scope.kind === 'project' ? 'the project memory' : scope.botId === botId ? 'your memory' : `${rt.botOf(scope.botId)?.name ?? 'that Bot'}'s memory`)
 
   // The words an entry may not hold.
   const secretEntry = text => (rt.redactSecrets?.(text) ?? text) !== text || looksSecret(text)
@@ -787,12 +840,15 @@ export function install(rt) {
     assertWritable()
     const bot = rt.botOf(botId)
     for (const sessionId of [botId, rt.chatOf(botId), ...(bot?.segments ?? []).map(segment => segment.sessionId), ...rt.groupSessionsOf(botId)]) renewMemory(sessionId)
-    summaries.delete(botId)
+    for (const key of summaries.keys()) if (key.startsWith(`${botId}|`)) summaries.delete(key)
     news.delete(botId)
     return queued(async () => {
       if (rt.readOnly() !== undefined) return
       assertWritable()
       await unlink(join(root, 'summaries', `${safeId(botId)}.json`)).catch(() => {})
+      for (const name of await readdir(join(root, 'summaries')).catch(() => [])) {
+        if (name.startsWith(`${safeId(botId)}-`)) await unlink(join(root, 'summaries', name)).catch(() => {})
+      }
       const dir = dirOf(ownScope(botId))
       if (!existsSync(dir)) return
       const name = `${safeId(botId)}-${new Date().toISOString().replace(/[:.]/g, '-')}`
@@ -813,11 +869,23 @@ export function install(rt) {
     const names = topicNames(scope)
     return names.length > 0 ? [`Topics: ${names.map(name => `[[${name}]]`).join(', ')}`] : []
   }
-  function memorySection(bot) {
+  // The frozen section names the scopes it covers, sorted, so a Session whose
+  // project changes (a moved working folder, a part that opens elsewhere) is
+  // re-frozen instead of going on with the last project's memory in its prompt.
+  const snapshotHeader = (botId, projectScope) => `<!-- ds-bot:memory v2 scopes=${[projectScope === undefined ? undefined : scopeKey(projectScope), `bot:${botId}`, 'team'].filter(Boolean).sort().join(',')} -->`
+  // A Git identity is the .git folder; what a person reads is the repository's name.
+  const projectName = (root) => {
+    const parts = String(root ?? '').split(/[\\/]/).filter(Boolean)
+    const git = parts.at(-1) === '.git' ? parts.at(-2) : parts.at(-1)
+    return git ?? 'this project'
+  }
+  function memorySection(bot, projectScope) {
     const own = ownScope(bot.id)
     const main = parseMemory(readText(join(dirOf(own), MAIN)))
     const team = parseMemory(readText(join(dirOf(TEAM), MAIN)))
+    const project = projectScope === undefined ? undefined : parseMemory(readText(join(dirOf(projectScope), MAIN)))
     return [
+      snapshotHeader(bot.id, projectScope),
       '# Your memory',
       memoryRules(reviewOn),
       teamRule(rt.isMain(bot.id), writesTeam(bot.id)),
@@ -829,21 +897,32 @@ export function install(rt) {
       '## Team memory, shared by every Bot (team/MEMORY.md)',
       ...shownEntries(team),
       ...topicLine(TEAM),
+      ...(project === undefined ? [] : [
+        '',
+        `## Project memory of ${projectName(projectScope.root)} (project/MEMORY.md)`,
+        ...shownEntries(project),
+        ...topicLine(projectScope),
+      ]),
     ].join('\n')
   }
 
   /** @type {Map<string, string>} */
   const frozen = new Map()
   const snapshotPath = sessionId => join(root, 'snapshots', `${safeId(sessionId)}.md`)
-  function sectionFor(sessionId) {
+  function sectionFor(agent) {
+    const sessionId = agent?.id
     if (sessionId === undefined) return ''
     const bot = rt.botOf(rt.selfOf(sessionId))
     if (bot === undefined) return ''
     // A section frozen under another role (made a Main Bot or a group admin since, or no
-    // longer one) is frozen again, so the rule it states matches what the tools allow.
+    // longer one) is frozen again, so the rule it states matches what the tools allow;
+    // likewise one frozen under another set of scopes.
     const rule = teamRule(rt.isMain(bot.id), writesTeam(bot.id))
+    const project = projectOf(agent.session ?? sessionId)
+    const projectScope = project.status === 'ok' ? project.scope : undefined
+    const header = snapshotHeader(bot.id, projectScope)
     const kept = frozen.get(sessionId)
-    if (kept !== undefined && kept.includes(rule)) return kept
+    if (kept !== undefined && kept.includes(rule) && kept.includes(header)) return kept
     const path = snapshotPath(sessionId)
     // A snapshot that cannot be read must not take the turn down with it: the section is
     // rebuilt from the files below, which is what the hook is for.
@@ -851,11 +930,11 @@ export function install(rt) {
     if (existsSync(path)) {
       try { text = readText(path) } catch (error) { rt.warn('ds-bot: unreadable memory snapshot %s: %s', path, error) }
     }
-    if (text === '' || !text.includes(rule)) {
+    if (text === '' || !text.includes(rule) || !text.includes(header)) {
       // Reading the memory files themselves can fail too. The hook must still produce a
       // section: an empty one, with a warning, instead of failing the turn.
       try {
-        text = memorySection(bot)
+        text = memorySection(bot, projectScope)
       } catch (error) {
         rt.warn('ds-bot: memory section for %s could not be built: %s', bot.name, error)
         return ''
@@ -873,10 +952,12 @@ export function install(rt) {
     frozen.set(sessionId, text)
     return text
   }
-  // The Session's next render freezes the memory as it is then.
+  // The Session's next render freezes the memory as it is then; a new part may
+  // also mean a new working folder, so the project answers age with it.
   function renewMemory(sessionId) {
     if (sessionId === undefined) return
     frozen.delete(sessionId)
+    rt.projectScope?.clearCache?.()
     try { unlinkSync(snapshotPath(sessionId)) } catch { /* none saved */ }
   }
 
@@ -884,7 +965,7 @@ export function install(rt) {
     name: 'bot-memory',
     order: 645,
     interpolate: false,
-    text: context => sectionFor(context?.agent?.id),
+    text: context => sectionFor(context?.agent),
   }), 'ds-bot: memory section')
 
   // ---------------------------------------------------------------------------
@@ -918,26 +999,30 @@ export function install(rt) {
   }
   const metaFor = async (caller, scope, kind) => ({
     source: await sourceOf(caller.sessionId),
-    ...(scope.kind === 'team' || scope.botId !== caller.bot.id ? { by: caller.bot.name } : {}),
+    // A project's memory is shared by every Bot that works there, so the writer is
+    // named there as it is in the team's.
+    ...(scope.kind === 'team' || scope.kind === 'project' || scope.botId !== caller.bot.id ? { by: caller.bot.name } : {}),
     // The type lives in meta only. In the text it would take part in the replace match and
     // in recall scoring, and it would be injected into every conversation.
     ...(kind === undefined ? {} : { kind }),
     added: today(),
   })
 
-  const SCOPE_WRITE = { type: 'string', description: '"own" (the default); "team" for the memory every Bot reads (Main Bots and group admins only); or a Bot\'s name to change that Bot\'s memory (Main Bots only, when the user asks)' }
+  const SCOPE_WRITE = { type: 'string', description: '"project" (the default: the memory of the project this conversation works in); "own" for your memory across all conversations; "team" for the memory every Bot reads (Main Bots and group admins only); or a Bot\'s name to change that Bot\'s memory (Main Bots only, when the user asks)' }
   const TOPIC_WHERE = { type: 'string', description: 'The topic the entry is in, if you know it; omit to look in every file' }
 
   // What remember and forget share: the caller, the scope, and the right to write it.
   function writeContext(args, exec) {
     const caller = callerOf(exec)
     if (caller === undefined) return { error: 'Only Bots on the team keep a memory.' }
-    const { scope = ownScope(caller.bot.id), error } = namedScope(args.scope, caller.bot.id)
+    const session = exec?.agent?.session ?? caller.sessionId
+    const { scope, error } = writeScopeOf(session, args.scope, caller.bot.id)
     if (error) return { error }
-    const denied = writeDenied(scope, caller.bot.id)
+    const target = scope ?? ownScope(caller.bot.id)
+    const denied = writeDenied(target, caller.bot.id, session)
     if (denied) return { error: denied }
     const actor = { id: caller.bot.id, name: caller.bot.name, session: caller.sessionId }
-    return { caller, scope, actor, label: labelOf(scope, caller.bot.id) }
+    return { caller, scope: target, actor, label: labelOf(target, caller.bot.id) }
   }
   const topicArg = (raw) => {
     if (raw === undefined || raw === null || String(raw).trim() === '') return {}
@@ -1042,15 +1127,21 @@ export function install(rt) {
     },
   }))
 
-  // The scopes a caller reads: by default its own and the team's.
-  function readScopes(raw, botId) {
-    const { scope, error } = namedScope(raw, botId)
+  // The scopes a caller reads: by default its own, the team's, and the project it
+  // works in, when it has one.
+  function readScopes(raw, botId, session) {
+    const { scope, error } = namedScope(raw, botId, session)
     if (error) return { error }
-    if (scope === undefined) return { scopes: [ownScope(botId), TEAM] }
+    if (scope === undefined) {
+      const scopes = [ownScope(botId), TEAM]
+      const project = projectOf(session)
+      if (project.status === 'ok') scopes.push(project.scope)
+      return { scopes }
+    }
     if (scope.kind === 'bot' && scope.botId !== botId && !rt.isMain(botId)) return { error: 'Only a Main Bot can read another Bot\'s memory. Ask that Bot with message_bot instead.' }
     return { scopes: [scope] }
   }
-  const tagOf = (scope, botId) => (scope.kind === 'team' ? 'team' : scope.botId === botId ? 'yours' : rt.botOf(scope.botId)?.name ?? '?')
+  const tagOf = (scope, botId) => (scope.kind === 'team' ? 'team' : scope.kind === 'project' ? 'project' : scope.botId === botId ? 'yours' : rt.botOf(scope.botId)?.name ?? '?')
 
   ctx.tools.register(defineTool({
     name: 'recall',
@@ -1058,7 +1149,7 @@ export function install(rt) {
     parameters: {
       query: { type: 'string', description: 'Words to look for, separated by spaces. An entry must have all of them; when none has, those with the most are shown' },
       topic: { type: 'string', description: 'A topic to read whole, as listed with [[topic]]' },
-      scope: { type: 'string', description: 'Omit for yours and the team\'s; "own", "team", or a Bot\'s name (Main Bots only)' },
+      scope: { type: 'string', description: 'Omit for yours, the team\'s, and your project\'s; "own", "team", "project", or a Bot\'s name (Main Bots only)' },
     },
     output,
     async execute(args, exec) {
@@ -1066,7 +1157,7 @@ export function install(rt) {
       const caller = callerOf(exec)
       if (caller === undefined) return 'Only Bots on the team keep a memory.'
       const self = caller.bot.id
-      const { scopes, error } = readScopes(args.scope, self)
+      const { scopes, error } = readScopes(args.scope, self, exec?.agent?.session ?? caller.sessionId)
       if (error) return error
       const loaded = scopes.map(scope => ({ scope, tag: tagOf(scope, self), label: labelOf(scope, self), files: loadScope(scope) }))
       if (args.topic !== undefined && String(args.topic).trim() !== '') {
@@ -1177,13 +1268,21 @@ export function install(rt) {
   const summaries = new Map()
   const summarizing = new Map()
   const summaryFailures = new Map()
-  const summaryPath = botId => join(root, 'summaries', `${safeId(botId)}.json`)
-  const savedSummary = (botId) => {
-    if (summaries.has(botId)) return summaries.get(botId)
+  // A summary answers for one set of scopes: the panel that reads the team's and
+  // a project's must not be served one written for the Bot's own memory alone.
+  const summaryKey = (botId, scopes) => `${botId}|${[...scopes].sort().join(',')}`
+  // The file name leads with the Bot's id folder-safe, so archiving a Bot can
+  // clear every scope's summary by prefix.
+  const summaryPath = (key) => {
+    const botId = key.slice(0, key.indexOf('|'))
+    return join(root, 'summaries', `${safeId(botId)}-${createHash('sha256').update(key).digest('hex').slice(0, 8)}.json`)
+  }
+  const savedSummary = (key) => {
+    if (summaries.has(key)) return summaries.get(key)
     try {
-      const value = JSON.parse(readFileSync(summaryPath(botId), 'utf8'))
-      if (typeof value?.hash === 'string' && typeof value.text === 'string') {
-        summaries.set(botId, value)
+      const value = JSON.parse(readFileSync(summaryPath(key), 'utf8'))
+      if (typeof value?.hash === 'string' && typeof value.text === 'string' && typeof value.scopes === 'string') {
+        summaries.set(key, value)
         return value
       }
     } catch { /* none yet */ }
@@ -1191,19 +1290,43 @@ export function install(rt) {
   }
   const linesFor = files => allEntries(files).map(entry => `- ${entry.file.topic ? `[[${entry.file.topic}]] ` : ''}${entry.text}`)
 
-  function startSummary(bot, own, team, language, hash) {
+  function startSummary(bot, own, team, project, language, hash, key) {
     const model = bot.model
     const job = (async () => {
       const text = await botShot(bot, SUMMARY_SYSTEM, summaryRequest({ name: bot.name, own: linesFor(own), team: linesFor(team), language }), { sessionId: rt.chatOf(bot.id), kind: 'memory' })
-      const value = { hash, text: text.slice(0, SUMMARY_TEXT_MAX), at: Date.now() }
-      summaries.set(bot.id, value)
-      summaryFailures.delete(bot.id)
-      if (rt.readOnly() === undefined) await writeText(summaryPath(bot.id), JSON.stringify(value, null, 2))
+      const value = { hash, scopes: key.slice(key.indexOf('|') + 1), text: text.slice(0, SUMMARY_TEXT_MAX), at: Date.now() }
+      summaries.set(key, value)
+      summaryFailures.delete(key)
+      if (rt.readOnly() === undefined) await writeText(summaryPath(key), JSON.stringify(value, null, 2))
     })().catch((error) => {
-      summaryFailures.set(bot.id, { hash, model, message: error?.message ?? String(error) })
+      summaryFailures.set(key, { hash, model, message: error?.message ?? String(error) })
       rt.warn('ds-bot: memory summary for %s failed: %s', bot.name, error)
-    }).finally(() => summarizing.delete(bot.id))
-    summarizing.set(bot.id, job)
+    }).finally(() => summarizing.delete(key))
+    summarizing.set(key, job)
+  }
+
+  // The panel picks a project by naming a conversation of this Bot; the server
+  // decides which project that is, so a hash in the request is never a permission.
+  // A Bot's own chat and its group chats are its conversations.
+  function panelProject(bot, body) {
+    const named = String(body?.session ?? '')
+    if (named === '') return undefined
+    const owned = rt.sessionsOfBot?.(bot.id) ?? [rt.chatOf(bot.id)]
+    if (!owned.includes(named)) throw new Error('That conversation does not belong to this Bot.')
+    const project = projectOf(named)
+    if (project.status === 'ok') return project.scope
+    if (project.status === 'unresolved') throw new Error(`That conversation's project cannot be told apart: ${project.reason}`)
+    return undefined
+  }
+  // Each project the Bot works in, with one conversation that reaches it: the
+  // panel names that conversation, and the server names the project.
+  const projectsOfBot = (bot) => {
+    const found = new Map()
+    for (const id of rt.sessionsOfBot?.(bot.id) ?? []) {
+      const project = projectOf(id)
+      if (project.status === 'ok' && !found.has(project.hash)) found.set(project.hash, { hash: project.hash, root: project.root, session: id })
+    }
+    return [...found.values()]
   }
 
   // The summary is written again when the entries or the interface language change;
@@ -1212,32 +1335,37 @@ export function install(rt) {
   function memoryView(body) {
     const bot = rt.botOf(String(body.botId ?? ''))
     if (bot === undefined) throw new Error('Unknown Bot')
+    const projectScope = panelProject(bot, body)
     // A file that cannot be read must not surface as a broken panel: say so plainly.
-    let own, team
+    let own, team, project
     try {
       own = loadScope(ownScope(bot.id))
       team = loadScope(TEAM)
+      if (projectScope !== undefined) project = loadScope(projectScope)
     } catch (error) {
       rt.warn('ds-bot: memory panel for %s could not read its files: %s', bot.name, error)
       throw new Error(`The memory files of ${bot.name} cannot be read right now.`)
     }
-    const entries = [...panelEntries(own, 'own'), ...panelEntries(team, 'team')]
+    const entries = [...panelEntries(own, 'own'), ...panelEntries(team, 'team'), ...(project === undefined ? [] : panelEntries(project, 'project'))]
     const language = languageNow()
-    const hash = createHash('sha256').update(JSON.stringify([language, linesFor(own), linesFor(team)])).digest('hex')
-    const saved = savedSummary(bot.id)
-    const prior = summaryFailures.get(bot.id)
+    const hash = createHash('sha256').update(JSON.stringify([language, linesFor(own), linesFor(team), project === undefined ? [] : linesFor(project)])).digest('hex')
+    const key = summaryKey(bot.id, ['bot:' + bot.id, 'team', ...(projectScope === undefined ? [] : [scopeKey(projectScope)])])
+    const saved = savedSummary(key)
+    const prior = summaryFailures.get(key)
     const failed = prior?.hash === hash && prior.model === bot.model ? prior : undefined
     const wanted = body.regenerate === true || (body.summarize === true && saved?.hash !== hash && failed === undefined)
-    if (wanted && entries.length > 0 && !summarizing.has(bot.id)) startSummary(bot, own, team, language, hash)
+    if (wanted && entries.length > 0 && !summarizing.has(key)) startSummary(bot, own, team, project, language, hash, key)
     return {
       botId: bot.id,
       entries,
-      sizes: { own: own[0].content.length, team: team[0].content.length },
+      sizes: { own: own[0].content.length, team: team[0].content.length, ...(project === undefined ? {} : { project: project[0].content.length }) },
       limits: MEMORY_LIMITS,
       summary: entries.length > 0 && saved !== undefined ? { text: saved.text, at: saved.at } : null,
       fresh: entries.length === 0 || saved?.hash === hash,
-      summarizing: summarizing.has(bot.id),
-      error: failed !== undefined && !summarizing.has(bot.id) ? failed.message : null,
+      summarizing: summarizing.has(key),
+      error: failed !== undefined && !summarizing.has(key) ? failed.message : null,
+      project: projectScope === undefined ? null : { hash: projectScope.hash, root: projectScope.root },
+      projects: projectsOfBot(bot),
     }
   }
 
@@ -1246,18 +1374,27 @@ export function install(rt) {
     if (bot === undefined) throw new Error('Unknown Bot')
     const text = String(body.text ?? '').trim().slice(0, ASK_TEXT_MAX)
     if (text === '') throw new Error('Type a question or a change first')
+    const projectScope = panelProject(bot, body)
+    const projectFiles = projectScope === undefined ? undefined : loadScope(projectScope)
     const numbered = [
       ...allEntries(loadScope(ownScope(bot.id))).map(entry => ({ ...entry, scope: 'own' })),
       ...allEntries(loadScope(TEAM)).map(entry => ({ ...entry, scope: 'team' })),
+      ...(projectFiles === undefined ? [] : allEntries(projectFiles).map(entry => ({ ...entry, scope: 'project' }))),
     ]
+    const actor = projectScope === undefined ? USER : { ...USER, session: String(body.session) }
     const answer = parseAsk(await botShot(bot, ASK_SYSTEM, askRequest({ name: bot.name, numbered, language: languageNow(), text }), { sessionId: rt.chatOf(bot.id), kind: 'memory' }))
     const meta = { source: 'memory panel', by: 'user', added: today() }
     const changes = []
     for (const change of answer.changes.slice(0, ASK_CHANGES_MAX)) {
       const op = String(change?.op ?? '')
       const target = numbered[Number(change?.entry) - 1]
-      const scope = op === 'add' ? (change.team === true ? TEAM : ownScope(bot.id)) : target?.scope === 'team' ? TEAM : ownScope(bot.id)
-      const label = scope.kind === 'team' ? 'the team memory' : `${bot.name}'s memory`
+      // An add lands in the selected project by default; the user's own memory and
+      // the team's are the explicit choices, as they always were.
+      const scope = op === 'add'
+        ? change.team === true ? TEAM : projectScope ?? ownScope(bot.id)
+        : target?.scope === 'team' ? TEAM : target?.scope === 'project' ? projectScope : ownScope(bot.id)
+      // The panel is the user's view: the Bot's memory is named, not "yours".
+      const label = scope.kind === 'team' ? 'the team memory' : scope.kind === 'project' ? 'the project memory' : `${bot.name}'s memory`
       const next = cleanEntry(change?.text)
       // An add may choose a topic; edit and remove keep the entry where it is.
       const { topic, error: topicError } = op === 'add' ? topicArg(change?.topic) : {}
@@ -1270,27 +1407,33 @@ export function install(rt) {
         }
         // An add that duplicates an entry already in the scope writes nothing, so the
         // panel must not report it as saved: it says where the entry is instead.
-        const landed = op === 'add' ? await addEntry({ scope, topic, text: next, meta, actor: USER, label }) : undefined
+        const landed = op === 'add' ? await addEntry({ scope, topic, text: next, meta, actor, label }) : undefined
         if (landed !== undefined && !landed.changed) throw new Error(landed.message)
-        if (op === 'edit') await replaceEntry({ scope, topic: target.file.topic, match: target.text, text: next, meta, actor: USER, label })
-        else if (op === 'remove') await removeEntry({ scope, topic: target.file.topic, match: target.text, actor: USER, label })
+        if (op === 'edit') await replaceEntry({ scope, topic: target.file.topic, match: target.text, text: next, meta, actor, label })
+        else if (op === 'remove') await removeEntry({ scope, topic: target.file.topic, match: target.text, actor, label })
         else if (op !== 'add') continue
-        changes.push({ op, scope: scope.kind === 'team' ? 'team' : 'own', text: op === 'remove' ? target.text : next, ...(landed?.file.topic !== undefined ? { topic: landed.file.topic } : {}), ...(op === 'edit' ? { before: target.text } : {}), ok: true })
+        changes.push({ op, scope: scope.kind === 'team' ? 'team' : scope.kind === 'project' ? 'project' : 'own', text: op === 'remove' ? target.text : next, ...(landed?.file.topic !== undefined ? { topic: landed.file.topic } : {}), ...(op === 'edit' ? { before: target.text } : {}), ok: true })
       } catch (failure) {
-        changes.push({ op, scope: scope.kind === 'team' ? 'team' : 'own', text: next || target?.text || '', ok: false, error: failure.message })
+        changes.push({ op, scope: scope.kind === 'team' ? 'team' : scope.kind === 'project' ? 'project' : 'own', text: next || target?.text || '', ok: false, error: failure.message })
       }
     }
-    return { reply: answer.reply, changes, view: memoryView({ botId: bot.id }) }
+    return { reply: answer.reply, changes, view: memoryView({ botId: bot.id, session: body.session }) }
   }
 
   // One entry the user removes from the list.
   async function memoryForget(body) {
     const bot = rt.botOf(String(body.botId ?? ''))
     if (bot === undefined) throw new Error('Unknown Bot')
-    const scope = body.scope === 'team' ? TEAM : ownScope(bot.id)
+    let scope = body.scope === 'team' ? TEAM : body.scope === 'project' ? undefined : ownScope(bot.id)
+    if (body.scope === 'project') {
+      scope = panelProject(bot, body)
+      if (scope === undefined) throw new Error('That conversation works outside any project folder, so it has no project memory.')
+    }
+    const actor = scope.kind === 'project' ? { ...USER, session: String(body.session) } : USER
     const topic = body.topic === null || body.topic === undefined ? undefined : cleanTopic(body.topic)
-    await removeEntry({ scope, topic, match: String(body.text ?? ''), actor: USER, label: scope.kind === 'team' ? 'the team memory' : `${bot.name}'s memory` })
-    return memoryView({ botId: bot.id })
+    const label = scope.kind === 'team' ? 'the team memory' : scope.kind === 'project' ? 'the project memory' : `${bot.name}'s memory`
+    await removeEntry({ scope, topic, match: String(body.text ?? ''), actor, label })
+    return memoryView({ botId: bot.id, session: body.session })
   }
 
   // ---------------------------------------------------------------------------
@@ -1414,14 +1557,52 @@ export function install(rt) {
       const op = String(change?.op ?? '')
       const topic = (op === 'add' || op === 'move') && change?.topic !== undefined ? cleanTopic(String(change.topic)) : undefined
       const target = numbered[Number(change?.entry) - 1]
-      const scope = op === 'add' ? (change.team === true && teamWrites ? TEAM : ownScope(bot.id)) : target?.scope === 'team' ? TEAM : ownScope(bot.id)
-      const label = labelOf(scope, bot.id)
       const text = cleanEntry(change?.text)
+      const projectWrite = projectOf(sessionId)
+      // An explicit team choice the Bot cannot write is refused outright — skipped
+      // with a record, never quietly redirected to its own memory, which would swap
+      // the scope the model named for another one.
+      if (op === 'add' && change.team === true && !teamWrites) {
+        rt.warn('ds-bot: memory review of %s skipped a change: it may not write the team memory', bot.name)
+        await journal({
+          op: 'skip',
+          scope: 'team',
+          file: topic === undefined ? MAIN : `${topic}.md`,
+          ...actorOf(actor),
+          after: text,
+          intendedOp: op,
+          reason: 'team-write-denied',
+        })
+        continue
+      }
+      // A change that belongs to the session's project is skipped when the project
+      // cannot be told apart — recorded like a full file, so a person can write it by
+      // hand. Neither an add nor a change to a project entry may slip into the Bot's
+      // own memory instead; the tools refuse the same writes for the same reason.
+      if (projectWrite.status === 'unresolved' && (op === 'add' ? change.team !== true : target?.scope === 'project')) {
+        rt.warn('ds-bot: memory review of %s skipped a change: the project of %s cannot be told apart: %s', bot.name, sessionId, projectWrite.reason)
+        await journal({
+          op: 'skip',
+          scope: 'project:unresolved',
+          file: target?.file?.file ?? (topic === undefined ? MAIN : `${topic}.md`),
+          ...actorOf(actor),
+          after: text,
+          before: target?.text,
+          intendedOp: op,
+          reason: 'project-unresolved',
+          problem: projectWrite.reason,
+        })
+        continue
+      }
+      const scope = op === 'add'
+        ? (change.team === true && teamWrites ? TEAM : projectWrite.status === 'ok' ? projectWrite.scope : ownScope(bot.id))
+        : target?.scope === 'team' ? TEAM : target?.scope === 'project' ? (projectWrite.status === 'ok' ? projectWrite.scope : ownScope(bot.id)) : ownScope(bot.id)
+      const label = labelOf(scope, bot.id)
       // The review is the main writer: its changes need the type too, or a howto it saves
       // is stored as a fact.
       const meta = {
         source,
-        ...(scope.kind === 'team' ? { by: bot.name } : {}),
+        ...(scope.kind === 'team' || scope.kind === 'project' ? { by: bot.name } : {}),
         ...(change?.kind === 'howto' ? { kind: 'howto' } : {}),
         added: today(),
       }
@@ -1526,9 +1707,13 @@ export function install(rt) {
     if (read.some(line => line.who === 'user')) {
       const ownFiles = loadScope(ownScope(bot.id))
       const teamFiles = loadScope(TEAM)
+      // The review sees the project the reviewed conversation works in, and its
+      // writes land there by default — the same rule the tools follow.
+      const project = projectOf(sessionId)
+      const projectFiles = project.status === 'ok' ? loadScope(project.scope) : []
       const said = read.filter(line => line.who === 'user').map(line => line.text).join('\n')
-      const { numbered, left } = reviewEntries(ownFiles, teamFiles, REVIEW_MEMORY_MAX, said)
-      const sizes = { own: ownFiles[0].content.length, team: teamFiles[0].content.length }
+      const { numbered, left } = reviewEntries(ownFiles, teamFiles, REVIEW_MEMORY_MAX, said, projectFiles)
+      const sizes = { own: ownFiles[0].content.length, team: teamFiles[0].content.length, ...(projectFiles.length > 0 ? { project: projectFiles[0].content.length } : {}) }
       const earlier = batch.earlier.map(line => reviewLine(line.who, line.text, bot))
       const language = writtenIn(read.filter(line => line.who === 'user').map(line => line.text.replace(/^User: /, '')), languageNow())
       const reply = await botShot(bot, reviewSystem(writesTeam(bot.id)), reviewRequest({ bot, numbered, left, sizes, where: batch.where, earlier, fresh: fresh.texts, more, language }), { sessionId: rt.chatOf(bot.id), kind: 'memory' })
@@ -1710,5 +1895,9 @@ export function install(rt) {
   Object.assign(rt, {
     memoryEnabled: true, renewMemory, archiveBotMemory, memoryEndpoint, memoryReviews,
     memoryNews: () => Object.fromEntries(news),
+    // For the memory index (#53) and the task review (#54): committed-view reads
+    // and a place in the write queue, the two things those modules cannot reach
+    // on their own. Nothing here bypasses the queue.
+    memoryBridge: { root, read: readCommitted, list: listCommitted, runInMemoryQueue: queued },
   })
 }

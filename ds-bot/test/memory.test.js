@@ -449,7 +449,9 @@ test('a Session keeps the memory it began with, across restarts, until its snaps
   t.after(() => first.stop())
   await first.tool('remember', { text: 'Likes tea' }, 'b2')
   const opened = first.section('b2')
-  assert.match(opened, /^# Your memory\n/)
+  // The section names the scopes it covers, so a Session whose project changes is
+  // frozen anew instead of going on with the last project's memory.
+  assert.match(opened, /^<!-- ds-bot:memory v2 scopes=bot:b2,team -->\n# Your memory\n/)
   assert.match(opened, /## Your memory \(MEMORY\.md\)\n- Likes tea \[source: part 1 #10; added: [\d-]+\]\n\n## Team memory, shared by every Bot \(team\/MEMORY\.md\)\n\(nothing saved yet\)$/)
   assert.match(opened, /when the whole team should know something, tell a Main Bot with message_bot/)
   assert.match(first.section('m1'), /As a Main Bot you write it with remember scope "team"/)
@@ -740,7 +742,7 @@ test('a host that only reads the team shows memory but changes none of it', asyn
   assert.match(await tool('remember', { text: 'Likes tea' }, 'b2'), /^Memory cannot change now: The Bot team in .* is open in another dsh/)
   assert.equal((await call('memory-view', { botId: 'b2' })).ok, true)
   assert.equal((await call('memory-ask', { botId: 'b2', text: 'hi' })).error.code, 'bot/read-only')
-  assert.match(section('b2'), /^# Your memory/)
+  assert.match(section('b2'), /^<!-- ds-bot:memory v2 scopes=bot:b2,team -->\n# Your memory/)
   assert.equal(existsSync(join(home, 'memory', 'snapshots')), false)
 })
 
@@ -794,12 +796,13 @@ test('when a turn ends, the memory review keeps what the user said, through the 
     '',
     'Write every new or changed entry in English.',
   ].join('\n'))
-  // Writer writes no team memory, so the team entry stays its own; no password is kept.
+  // Writer writes no team memory, so the team entry is skipped with a record for a
+  // person to add by hand — it does not slip into its own; no password is kept.
   const entries = parseMemory(read('bots', 'b2', 'MEMORY.md')).entries
-  assert.deepEqual(entries.map(entry => entry.text), ['The user writes Rust', 'The user likes a plain style, mostly black and white', 'Everyone should keep it plain'])
+  assert.deepEqual(entries.map(entry => entry.text), ['The user writes Rust', 'The user likes a plain style, mostly black and white'])
   assert.equal(entries[1].meta.source, 'part 1 #20')
-  assert.deepEqual(journal().slice(1).map(record => [record.op, record.actorName, record.auto]), [
-    ['add', 'Writer', true], ['add', 'Writer', true], ['replace', 'Writer', true],
+  assert.deepEqual(journal().slice(1).map(record => [record.op, record.reason, record.actorName, record.auto]), [
+    ['add', undefined, 'Writer', true], ['skip', 'team-write-denied', 'Writer', true], ['replace', undefined, 'Writer', true],
   ])
   // The review's tokens count as the Bot's memory use, not as "Other".
   const meter = ctx.listeners.get('llm/stream').find(listener => /tags\.get/.test(String(listener)))

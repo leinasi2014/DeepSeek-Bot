@@ -564,9 +564,11 @@ export function apply(ctx) {
     // Hours come back in this browser's time zone, so days start at local midnight.
     usage: () => call('usage', { timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone }),
     // `summarize` starts a summary when the entries changed; `regenerate` always does.
+    // `session` names one of the Bot's conversations, and with it the project it
+    // works in — the server decides which project that is.
     memoryView: (botId, flags = {}) => call('memory-view', { botId, ...flags }),
-    memoryAsk: (botId, text) => call('memory-ask', { botId, text }),
-    memoryForget: (botId, entry) => call('memory-forget', { botId, scope: entry.scope, topic: entry.topic, text: entry.text }),
+    memoryAsk: (botId, text, session) => call('memory-ask', { botId, text, ...(session ? { session } : {}) }),
+    memoryForget: (botId, entry, session) => call('memory-forget', { botId, scope: entry.scope, topic: entry.topic, text: entry.text, ...(session ? { session } : {}) }),
     diagnostics: payload => call('diagnostics', payload),
     diagnosticsLog: () => call('diagnostics-log'),
     diagnosticsClear: () => call('diagnostics-clear'),
