@@ -161,3 +161,24 @@ node --experimental-test-module-mocks --import ./test/harness-resolve.mjs --test
 - `jiuwenswarm/agents/harness/common/tools/task_tools.py`：任务经验写进任务数据文件。
 
 **这不等于它的任务结果做了证据验收。** 本次没有复制任何外部代码或文本，只借鉴「以目录/仓库为项目边界、按路径 hash 分目录」这一条思路；证据验收规则是本项目自己的设计。
+
+## 收口记录（2026-10-23 00:10）
+
+**最终 dev = `7679844d0d490baa28069d88f77a9ceb001b91eb`**（PR #58 merge commit，`%p = c50a74f 71af1d2`）。
+
+| 项 | 结果 |
+|---|---|
+| 本地全量（两连跑） | 809 tests / 791 pass / 0 fail / 18 skip |
+| `PATH=''`（零外部命令） | 同上 |
+| `build-client --check` | exit 0 |
+| `npm run lint` | exit 0（仅既有 warning） |
+| `team-write-denied` 逐文件 | memory.js 1 / memory-acceptance 1 / memory-project 1 / memory.test 1 |
+| Leak scan（本地等价物） | `must fix: 0`，exit 0 |
+| CI（push run 39805808148） | **7/7 success** |
+| 插件加载（隔离 DSH_HOME） | add exit 0 / list 显示 ds-bot@link / dump-config 含两条目 / GET / → 200 |
+
+**合入后被 CI 抓到的两个缺陷（均已修复，走完整 PR #58 流程）**：
+1. Leak scan：本文件原先含真实 Windows 用户目录 → 已换占位符。
+2. ubuntu×3：`memory-acceptance.test.js` 无条件调用 `cmd.exe mklink /J`，Linux 上 `spawnSync cmd.exe ENOENT` → 改为纯 Node `symlinkSync(..., 'junction' | 'dir')`，不 skip、不放宽断言。
+
+**仍然未验证**：桌面 Electron 端的 `node:sqlite`、面板 UI 截图。18 条 skip 已逐组注明不可达原因，不计入 pass。
