@@ -186,18 +186,17 @@ test.skip('cache: old snapshots invalidate; scope or teamRule change rebuilds', 
 test.skip('cache: ordinary content updates stay frozen within a session', () => {})
 test.skip('cache: every summary cache is scope-keyed; A->B->A stale reply dropped', () => {})
 
-// --- retrieval (waits for #53: src/host/memory-index.js) ---------------------
-test.skip('retrieval: empty query lists the directory; topic reads a whole file', () => {})
-test.skip('retrieval: all-terms first, then partial; mixed zh 1/2/3-char queries', () => {})
-test.skip('retrieval: quote and LIKE wildcards are literal; ordering is stable', () => {})
-test.skip('retrieval: scope whitelist filters before LIMIT', () => {})
-test.skip('retrieval: index failure still finds fixture via scan; true no-match may be empty', () => {})
-
-// --- consistency (waits for #53) ----------------------------------------------
-test.skip('consistency: recall queued between move steps never sees the middle state', () => {})
-test.skip('consistency: delete/archive/same-size-same-mtime edits are detected by content', () => {})
-test.skip('consistency: dead bot scope rows are cleaned from entries/files', () => {})
-test.skip('consistency: sqlite removed or corrupted rebuilds; failed transaction publishes nothing', () => {})
+// --- retrieval & consistency: every row is asserted by test/memory-index.test.js
+// (#53, merged here), plus these mapping notes: empty-query listing and whole-topic
+// reads are unchanged recall behavior with coverage in test/memory.test.js; mixed
+// zh 1–2/3+ char queries map to the short-Chinese LIKE and long-term MATCH cases.
+// (#53, merged here): whitelist before LIMIT, all-terms first, literal quotes/%/_/\,
+// short-Chinese LIKE fallback, disappeared/edited files reindexed by content (same
+// size+mtime included — the freshness key is the content hash), deleted index rebuilt,
+// failed refresh publishes nothing, dead-scope cleanup, no-SQLite scan fallback, double
+// read failure reported. The write-queue serialization of move's two steps is pinned by
+// test/memory-read-commit.test.js; recall's empty-query listing and whole-topic reads
+// are unchanged pre-existing behavior with their own coverage in test/memory.test.js.
 
 // --- acceptance rules (waits for #54) -----------------------------------------
 test.skip('acceptance: idle/switch/overflow never trigger a review', () => {})
