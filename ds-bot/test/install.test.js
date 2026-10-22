@@ -79,6 +79,7 @@ test('apply registers listeners, tools, and effects in a fixed order', (t) => {
     'tool forget',
     'tool move',
     'tool recall',
+    'tool complete_task',
     'on agent/status',
     'effect ds-bot: memory review',
     'effect ds-bot: Bot compaction',
