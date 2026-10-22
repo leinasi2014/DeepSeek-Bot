@@ -15,7 +15,7 @@
 | 项 | 状态 | 证据 | 备注 |
 |---|---|---|---|
 | 既有代码基线（未合并新功能时） | 实测 | `npm test` 727/727 | 只证明基线没坏 |
-| #52 单测与行为测试 | 实测 | **X 定稿（保留 team 拒写），hash 待架构师补**：内容树 `44e60ac9f4d05bbd1291fcfd234776db3f57a125`（= `edb6345`/`e604034`），`team-write-denied` 命中 1，项目用例 8 条；全量 **747/747 pass / 0 fail / 0 skip**（我在等价的 X 态头 `b6379c8` 上实测） | **待换最终 hash**：架构师正按 X 在 `ed06b97` 上加恢复提交；推送后把本行换成新头（内容同为 X 态、数字不变）。参照头：`b6379c8`（`ls-remote` 上次成功查询所得，树 `44e60ac9…`）。Y 态 `ed06b97`（树 `048340de…`，746）已作废，仅作对照 |
+| #52 单测与行为测试 | 实测 | **X 定稿（保留 team 拒写）：`b6379c8`**（revert `ed06b97`）：树 `44e60ac9f4d05bbd1291fcfd234776db3f57a125`（= `edb6345`/`e604034`），`team-write-denied` 命中 1，项目用例 8 条；全量 **747/747 pass / 0 fail / 0 skip**（我本机 detached worktree 干净树实测） | **已确认在远端**：`git rev-parse HEAD` 与 `origin/feat/52-project-scope` 均为 `b6379c83dad9…`（同一提交），`git status -sb` 无 ahead/behind、`@{u}..HEAD` 为空——即该提交早已推送，无需重推（架构师报的 push 失败发生在更早的尝试）。Y 态 `ed06b97`（树 `048340de…`，746）已作废 |
 | #53 接线后全量测试 | 实测 | **X 定稿**：`4b6f1eb`（`Restore the team-write refusal, which the maintainer kept in scope`）→ **758/758 pass / 0 fail / 0 skip**，命中 1；check 0、lint 0 | 等价头：远端 `ls-remote` 为 `2e3e9b2`，两者树同为 `eee4328d…`、`4b6f1eb` 为其祖先（`merge-base --is-ancestor` exit 0），内容与数字一致 |
 | #54 接线后全量测试 | 实测 | **X 定稿**：`114a4a0`（`Merge the memory index branch with the team-write refusal restored`）→ **782/782 pass / 0 fail / 0 skip**（连跑 3 次全绿），命中 1；check 0、lint 0。演进：761→762→773→776→779→782 | 等价头：远端为 `0d8dac0`，两者树同为 `6d011389…`、`114a4a0` 为其祖先。该竞态用例根因：产品先写 Markdown、之后才落 `DONE`（`task-review.js:230-257`），用例等文件出现即断言、撞在两次写之间；**`APPLYING` 是崩溃恢复的合法中间态**，属用例竞态而非产品缺陷（已改用例等两者同时成立，修前 10 跑 1 挂、修后 15 跑 0 挂） |
 | `node:sqlite` + FTS5 trigram 在 Node 侧可用 | 实测 | 设计 §8 记录的探针：建表、长中文 MATCH、短中文 LIKE、scope 过滤均通过 | 只覆盖 Node/Web 侧 |
@@ -36,7 +36,7 @@
 | 显式 `team:true` 但 Bot 无 team 写权限时落到 own | **已修复（X 定稿，`5542df2` 实现）** | `memory.js` 中 `op === 'add' && change.team === true && !writesTeam` → `journal({op:'skip', scope:'team', reason:'team-write-denied', after: 全文})` + `continue`，不再落 own。用例「the memory review refuses a team write the Bot may not make, instead of saving it to own」用非 Main Bot fixture，断言 own 与 team 目录均未创建、journal 带该 reason 与全文，为项目用例 8 条之一 | 与设计 §2 第 40 行「显式 own/team 仍须通过原有授权」一致。`legacy` 用例「keeps what the user said」的改写（team 条目不再进 own、journal 序列变 `add/skip/replace`）属**预期的行为变更**、非回归。历史上该点被 revert 过多次，全部线性留痕、无 force-push |
 
 
-**结论：上表中「实测」的项只覆盖测试套件、静态检查，以及一次云机**加载 + 记忆基线** smoke（SMOKE-PASS）；**桌面 Electron 端的 `node:sqlite` 与 UI 截图仍未验证**，新功能 acceptance 尚未在云机上跑。不要把本文件里的测试数读成新功能验收通过——按 **X 定稿（保留 team 拒写）**：#52 **747**（hash 待架构师补）、#53 `4b6f1eb` **758**、#54 `114a4a0` **782**，均我本机干净树实测。** 几个等价头已核对：`4b6f1eb` 与远端 `2e3e9b2` 同树 `eee4328d…`，`114a4a0` 与 `0d8dac0` 同树 `6d011389…`，`b6379c8` 与 `edb6345`/`e604034` 同树 `44e60ac9…`——引用哪个都不改变结论。各分支尚未合入 `dev`，合入后数字还会变。**
+**结论：上表中「实测」的项只覆盖测试套件、静态检查，以及一次云机**加载 + 记忆基线** smoke（SMOKE-PASS）；**桌面 Electron 端的 `node:sqlite` 与 UI 截图仍未验证**，新功能 acceptance 尚未在云机上跑。不要把本文件里的测试数读成新功能验收通过——按 **X 定稿（保留 team 拒写）**：#52 `b6379c8` **747**、#53 `4b6f1eb` **758**、#54 `114a4a0` **782**，均我本机干净树实测。** 等价头已核对：`4b6f1eb` 与远端 `2e3e9b2` 同树 `eee4328d…`，`114a4a0` 与 `0d8dac0` 同树 `6d011389…`，`b6379c8` 与 `edb6345`/`e604034` 同树 `44e60ac9…`——引用哪个都不改变结论。各分支尚未合入 `dev`，合入后数字还会变。**
 
 ## 怎么自己复核
 
