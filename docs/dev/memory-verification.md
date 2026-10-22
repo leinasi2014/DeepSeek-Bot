@@ -20,8 +20,9 @@
 | #54 接线后全量测试 | 实测 | **X 定稿**：`114a4a0`（`Merge the memory index branch with the team-write refusal restored`）→ **782/782 pass / 0 fail / 0 skip**（连跑 3 次全绿），命中 1；check 0、lint 0。演进：761→762→773→776→779→782 | 等价头：远端为 `0d8dac0`，两者树同为 `6d011389…`、`114a4a0` 为其祖先。该竞态用例根因：产品先写 Markdown、之后才落 `DONE`（`task-review.js:230-257`），用例等文件出现即断言、撞在两次写之间；**`APPLYING` 是崩溃恢复的合法中间态**，属用例竞态而非产品缺陷（已改用例等两者同时成立，修前 10 跑 1 挂、修后 15 跑 0 挂） |
 | `node:sqlite` + FTS5 trigram 在 Node 侧可用 | 实测 | 设计 §8 记录的探针：建表、长中文 MATCH、短中文 LIKE、scope 过滤均通过 | 只覆盖 Node/Web 侧 |
 | **桌面 Electron 端的 `node:sqlite`** | **未验证** | 无 | 本机无 DSH 的 `app/` checkout，跑不了探针；桌面端必须走扫描回退 |
-| 原生 Windows 隔离 smoke | **未验证** | 无 | `dev/bench.sh` 需要 `deepseek-harness` checkout 与本机不符，尚未跑；不得计为通过 |
+| 原生 Windows 隔离 smoke（加载 + 记忆基线） | **实测（SMOKE-PASS，exit 0）** | 云机 `170.106.141.48`，代码 `feat/55-acceptance @ 039e591`（含 X 态 `edb6345` 内容）；git bundle sha256 `3713C703…` → 克隆到 `C:\lab\src\DeepSeek-Bot-m55` → `npm ci` + `build` exit 0 → `dsh plugin --profile web add link:` exit 0；`127.0.0.1:3210`（web）+ `3211`（`mock-llm.mjs`），`DSH_HOME=C:\lab\bench-m55\.dsh-test-m55`，零真实密钥 | 断言：Main Bot 创建并应答；`记住 Alpha uses pnpm` 落入 bench home 内 `bots/<id>/MEMORY.md`；`回忆 Alpha` 正常；`memory/` 下有 `bots,journal.jsonl,reviewed.json,snapshots,team`；bench cwd 非项目 → **无 `projects` 泄漏**（符合设计）；写入全部限定在 bench home。归档：`C:\lab\runs\20261022-1930-qa-m55-load\`（MANIFEST / cmd.txt / result.txt / web.log / mock.jsonl），LOG.md 已记账。**范围仅限加载与记忆基线，不含新功能 acceptance** |
 | 面板 UI 截图 | **未验证** | 无 | 依赖 UI 构建与真实界面，尚未截图 |
+| 测试工具缺陷：`bench-memory` 的 probe 与 mock 日志不匹配 | **已定位（非产品缺陷）** | `dev/bench-memory.mjs:144-145` 读 tap 的 `status`/`text` 字段，而 `dev/mock-llm.mjs:634` 的 MOCK_LOG 只写 `out` 数组、无这两个字段，两者直接组合永远判 RateLimited；疑似 `bench-memory` 当年配 `dev/llm-tap.mjs`（真实模型、记 status）设计 | Chief 已批准按「兼容 mock 的 `out` 格式」或「明确挂 `llm-tap`」修改 `dev/` 脚本；**不动产品代码**。改完需在 #55 证据里补一句，此处同步更新 |
 | 同大小同 mtime 的手工改写可被发现 | 推断 | 设计 §4 规定以内容 hash 为唯一新鲜度依据，不用 mtime/size | 待 #53 用例实测 |
 | 归档后清理死 scope 的索引行 | 推断 | #53 实现里有显式回收，见 `memory-index.js` 与归档调用点 | 待用例实测 |
 | 强杀后逐项续写、每条恰好一次 | 推断 | 设计 §6 的逐项状态机与固定 `review_id`；`task-review.js` 有 `HELD` 与逐候选 `task-plans/<id>.json` | 仍待故障注入实测（强杀点尚未注入） |
@@ -35,7 +36,7 @@
 | 显式 `team:true` 但 Bot 无 team 写权限时落到 own | **已修复（X 定稿，`5542df2` 实现）** | `memory.js` 中 `op === 'add' && change.team === true && !writesTeam` → `journal({op:'skip', scope:'team', reason:'team-write-denied', after: 全文})` + `continue`，不再落 own。用例「the memory review refuses a team write the Bot may not make, instead of saving it to own」用非 Main Bot fixture，断言 own 与 team 目录均未创建、journal 带该 reason 与全文，为项目用例 8 条之一 | 与设计 §2 第 40 行「显式 own/team 仍须通过原有授权」一致。`legacy` 用例「keeps what the user said」的改写（team 条目不再进 own、journal 序列变 `add/skip/replace`）属**预期的行为变更**、非回归。历史上该点被 revert 过多次，全部线性留痕、无 force-push |
 
 
-**结论：上表中「实测」的项只覆盖测试套件与静态检查；新功能的隔离 smoke、UI 截图、桌面端探针都还没有跑。不要把本文件里的测试数读成新功能验收通过——按 **X 定稿（保留 team 拒写）**：#52 **747**（hash 待架构师补）、#53 `4b6f1eb` **758**、#54 `114a4a0` **782**，均我本机干净树实测。** 几个等价头已核对：`4b6f1eb` 与远端 `2e3e9b2` 同树 `eee4328d…`，`114a4a0` 与 `0d8dac0` 同树 `6d011389…`，`b6379c8` 与 `edb6345`/`e604034` 同树 `44e60ac9…`——引用哪个都不改变结论。各分支尚未合入 `dev`，合入后数字还会变。**
+**结论：上表中「实测」的项只覆盖测试套件、静态检查，以及一次云机**加载 + 记忆基线** smoke（SMOKE-PASS）；**桌面 Electron 端的 `node:sqlite` 与 UI 截图仍未验证**，新功能 acceptance 尚未在云机上跑。不要把本文件里的测试数读成新功能验收通过——按 **X 定稿（保留 team 拒写）**：#52 **747**（hash 待架构师补）、#53 `4b6f1eb` **758**、#54 `114a4a0` **782**，均我本机干净树实测。** 几个等价头已核对：`4b6f1eb` 与远端 `2e3e9b2` 同树 `eee4328d…`，`114a4a0` 与 `0d8dac0` 同树 `6d011389…`，`b6379c8` 与 `edb6345`/`e604034` 同树 `44e60ac9…`——引用哪个都不改变结论。各分支尚未合入 `dev`，合入后数字还会变。**
 
 ## 怎么自己复核
 
