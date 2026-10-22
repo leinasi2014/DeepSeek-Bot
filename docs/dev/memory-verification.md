@@ -89,9 +89,13 @@ node --experimental-test-module-mocks --import ./test/harness-resolve.mjs --test
 **当前 skip 总数**：`memory-acceptance.test.js` 里 **18 条**（缓存 3、验收 3、等待 3、恢复 7、上限 2；`Select-String -Pattern 'test\.skip\('` 实数 18，`^test\('` 真用例 6 条）。这 18 条**一条都不算通过**。其中「检索」「一致性」「权限」三组的实质覆盖已在映射到的用例里，但**在这份文件里它们不是 skip 了，而是换成了指向既有用例的映射，不曾在 feat-55 里新增断言**——要新增断言的只剩这 18 条。
 
 **feat-55 合并后实测（按提交头区分，数字不同，不要混用）**
-- `cb0468d`（**含** team 守卫，`memory.js` 命中 1，`memory-project.test.js` 8 例）：**806 / 788 pass / 0 fail / 18 skip**（exit 0），`npm run build` exit 0、`npm run lint` exit 0（仅 warning）。
+- `2102c8a`（QA 报的「里程碑」头，**含** team 守卫、`memory-project.test.js` 8 例、`memory-acceptance.test.js` 30 条 skip / 4 条真用例）：我单独实测 **816 tests / 786 pass / 0 fail / 30 skip**（exit 0）——QA 报的数字在这个头上**成立**。
+- 但 `2102c8a` **不是当前头**：它之后的 `e7e82f1`（删 `retrieval:` 5 + `consistency:` 4 条 skip、改为映射注记）、`13154bc`（`permissions:` 3 条 → 2 条真断言 + 1 条映射）、`cf3e5b7`、`b86ab48`（守卫恢复）、`6177f6f`、以及我的文档提交，把 skip 从 30 降到 **18**、真用例从 4 增到 **6**。
+- `cb0468d`（**含** team 守卫，命中 1，8 例）：**806 / 788 pass / 0 fail / 18 skip**（exit 0），`npm run build` exit 0、`npm run lint` exit 0（仅 warning）。
 - `e9da76a`（守卫被 `d0acd7b` 删掉时的头，命中 **0**、7 例）：**805 / 787 pass / 0 fail / 18 skip**（exit 0）。与 X 定稿相反，**不可作为验收头**，留作对照。
-- **从 `de942fe` 起（QA 的 `b86ab48` "Final ruling X: keep the team-write refusal" 之后；此后 `6177f6f` 只换 `project-scope.test.js` 的断言写法、`390833f` 只改文档，产品代码不变）：X 内容已回到代码里**——`git show HEAD:` 逐文件数 `team-write-denied`：`src/host/memory.js` **1**、`test/memory-project.test.js` **1**、`test/memory.test.js` **1**、`test/memory-acceptance.test.js` **1**；`memory-project.test.js` 回到 **8 例**。我 `npm test` 连跑 **2 次都是 806 tests / 788 pass / 0 fail / 18 skip**（exit 0）。
+- **当前头（`b86ab48` 之后）：X 内容已在代码里**——`git show HEAD:` 逐文件数 `team-write-denied`：`src/host/memory.js` **1**、`test/memory-project.test.js` **1**、`test/memory.test.js` **1**、`test/memory-acceptance.test.js` **1**；`memory-project.test.js` 回到 **8 例**。我 `npm test` 连跑 **2 次都是 806 tests / 788 pass / 0 fail / 18 skip**（exit 0），`npm run build` exit 0、`npm run lint` exit 0（仅 warning）。
+
+**所以「816/786/30」与「806/788/18」都对，但属于不同头**：前者是 `2102c8a`，后者是当前头。对外引用必须带 hash，否则会出现「数字对不上」的假分歧。当前头之所以 tests 更少而 pass 更多，是因为 12 条 skip 被删（映射到既有用例）或转成真断言，不是丢了覆盖。
 
 **验收判据（合完后直接数）**：`git grep -c team-write-denied` 在三个文件各命中 1 处——`src/host/memory.js`、`test/memory-project.test.js`、`test/memory.test.js`（我在 `b6379c8`/`4b6f1eb`/`114a4a0` 三支实测也是 1/1/1），`memory-project.test.js` **8 例**，全量 **806 / 788 / 0 / 18**；同一头上 `npm run build` exit 0、`npm run lint` exit 0（仅 warning）。**一次失败不算数**：我第一次跑同一份内容时 `scope: the automatic review defaults to project and rejects unresolved` 挂过一次（`ENOENT … memory/projects/<hash>/MEMORY.md`，读文件早于写入），随后连跑 2 次全绿——这条用例本身有竞态，验收以连跑 2 次以上都绿为准。788 是「已实现并跑过」的部分，18 skip 是尚未转真的条目，两者不相加冒充全绿。**注意**：若在 feat-55 工作区里跑出 fail，先看 `git status`——QA 可能正在把剩下的 `acceptance:`/`waiting:` 组转成真断言，未提交状态下的失败属在写用例，不是已提交头的回归。
 
