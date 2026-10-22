@@ -46,6 +46,15 @@ export const candidateIdOf = (sessionId, callId) => createHash('sha256').update(
 // The id that lands in the Markdown metadata. Lower-case and stable per plan item.
 export const reviewIdOf = (candidateId, index) => createHash('sha256').update(`${candidateId}:${index}`).digest('hex').slice(0, 16)
 
+// The metadata exactly as the secret check reads it, without `review_id`.
+//
+// `review_id` is the host's own hash, not content: 16 lower-case hex characters, of which
+// about one in a thousand is all digits (`(10/16)^16`), and the memory module's "15 digits
+// in a row" rule reads an all-digit id as an ID number. Checking it refused the whole
+// entry with "the entry looks like a secret": the user never got the lesson and had no way
+// to tell why. Every other value, and the entry text itself, is still checked.
+export const metaForSecretCheck = meta => Object.fromEntries(Object.entries(meta ?? {}).filter(([key]) => key !== 'review_id'))
+
 // taskReview({ root, check, extract, applyItem, linkTopic, readScope, parse, format, entryProblem, secretEntry, now, warn })
 //
 // - `check(candidate)` re-validates the Bot, the session and the project; resolves
@@ -163,8 +172,11 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
       const reviewId = reviewIdOf(record.candidateId, index)
       const meta = { ...(item.meta ?? {}), review_id: reviewId }
       const text = String(item.text ?? '')
-      const metaText = Object.entries(meta).map(([key, value]) => `${key}: ${value}`).join(' ')
-      const problem = entryProblem(text) ?? (secretEntry(text) || secretEntry(metaText) ? 'the entry looks like a secret' : undefined)
+      const metaText = Object.entries(metaForSecretCheck(meta)).map(([key, value]) => `${key}: ${value}`).join(' ')
+      // The final line is checked as well, and also without `review_id`: the formatter
+      // joins values in a way the raw text does not, and a secret must not appear either way.
+      const line = format(text, meta)
+      const problem = entryProblem(text) ?? (secretEntry(text) || secretEntry(metaText) || secretEntry(format(text, metaForSecretCheck(meta))) ? 'the entry looks like a secret' : undefined)
       if (problem !== undefined) {
         refused.push({ claim: item.meta?.claim, text, topic: item.topic ?? '', outcome: item.outcome ?? 'unverified', reason: 'invalid-at-freeze', problem })
         return
@@ -178,7 +190,7 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
         outcome: item.outcome ?? 'unverified',
         source: item.source ?? '',
         meta,
-        line: format(text, meta),
+        line,
       })
     })
     return { version: CANDIDATE_VERSION, frozenAt: now(), items: accepted, refused }

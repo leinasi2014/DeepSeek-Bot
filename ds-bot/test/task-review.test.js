@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { candidateIdOf, reviewIdOf, STATUS, taskReview } from '../src/host/task-review.js'
-import { formatEntry, parseMemory } from '../src/host/memory.js'
+import { formatEntry, looksSecret, parseMemory } from '../src/host/memory.js'
 
 // A memory root whose scopes are plain text files, so the review can be driven without a
 // Session, a model, or a DSH_HOME. `calls` records every write the review attempted.
@@ -281,4 +281,41 @@ test('a lesson that looks like a secret is refused at freeze', async t => {
   assert.equal(record.plan, null)
   assert.equal(h.calls.apply.length, 0)
   assert.equal(record.unverified.at(-1).reason, 'invalid-at-freeze')
+})
+
+test('an all-digit review id is not read as a secret, and the entry is written', async t => {
+  // `review_id` is 16 lower-case hex characters; about one in a thousand of them is all
+  // digits, and the memory module reads 15 digits in a row as an ID number. This
+  // candidateId was searched for so that reviewIdOf gives exactly such an id: checking it
+  // like content refused the whole lesson with "the entry looks like a secret".
+  const allDigits = { ...candidate, callId: 'reverify-141' }
+  const id = candidateIdOf(allDigits.sessionId, allDigits.callId)
+  const reviewId = reviewIdOf(id, 0)
+  assert.match(reviewId, /^\d{16}$/, 'the fixture still produces an all-digit id')
+  assert.equal(looksSecret(`review_id: ${reviewId}`), true, 'the raw shape is what the memory rule reads')
+  const h = harness(t, { secretEntry: looksSecret })
+  const { candidateId } = await h.review.enqueue(allDigits)
+  const record = await h.review.process(candidateId)
+  assert.equal(record.status, STATUS.done)
+  assert.equal(record.plan.items.length, 1, 'the entry survives the freeze')
+  assert.match(record.plan.items[0].line, new RegExp(`review_id: ${reviewId}`))
+})
+
+test('the secret check still reads the other metadata values and the text', async t => {
+  // The `review_id` exclusion must not weaken the check: a digit run in a real value is
+  // still refused, whether it sits in the metadata or in the entry text itself.
+  const source = harness(t, {
+    secretEntry: looksSecret,
+    extract: () => ({ items: [{ scope: 'project:a', text: '用脚本发布', outcome: 'verified', meta: { kind: 'howto', source: '1234567890123456' } }] }),
+  })
+  const first = await source.review.process((await source.review.enqueue(candidate)).candidateId)
+  assert.equal(first.status, STATUS.held)
+  assert.equal(first.unverified.at(-1).reason, 'invalid-at-freeze')
+  const body = harness(t, {
+    secretEntry: looksSecret,
+    extract: () => ({ items: [{ scope: 'project:a', text: '账号 1234567890123456', outcome: 'verified', source: 'part 1 #2' }] }),
+  })
+  const second = await body.review.process((await body.review.enqueue({ ...candidate, callId: 'c2' })).candidateId)
+  assert.equal(second.status, STATUS.held)
+  assert.equal(second.unverified.at(-1).reason, 'invalid-at-freeze')
 })

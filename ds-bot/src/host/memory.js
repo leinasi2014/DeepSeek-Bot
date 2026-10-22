@@ -32,7 +32,7 @@ import { speakerOf } from '../shared/mentions.js'
 import { output } from './tools.js'
 import { memoryFiles } from './memory-files.js'
 import { memoryIndex } from './memory-index.js'
-import { STATUS as TASK_STATUS, taskReview as createTaskReview } from './task-review.js'
+import { STATUS as TASK_STATUS, taskReview as createTaskReview, metaForSecretCheck } from './task-review.js'
 import { within } from './folders.js'
 
 // Fixed sizes, in characters. Both MEMORY.md files ride in every request of every
@@ -782,7 +782,9 @@ export function install(rt) {
       writable(scope, { id: 'user', name: 'user' })
       const problem = entryProblem(item.text)
       if (problem !== undefined) throw Object.assign(new Error(problem), { code: 'memory/invalid' })
-      const metaText = Object.entries(item.meta ?? {}).map(([key, value]) => `${key}: ${value}`).join(' ')
+      // `review_id` is the host's own hash, not content: left out of the secret check for
+      // the same reason as at freeze time — an all-digit id reads as an ID number.
+      const metaText = Object.entries(metaForSecretCheck(item.meta)).map(([key, value]) => `${key}: ${value}`).join(' ')
       if (secretEntry(item.text) || secretEntry(metaText)) throw Object.assign(new Error('This entry looks like a secret'), { code: 'memory/invalid' })
       const files = loadScope(scope)
       const main = files[0]
