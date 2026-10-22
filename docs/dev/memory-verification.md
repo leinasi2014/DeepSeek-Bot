@@ -16,8 +16,8 @@
 |---|---|---|---|
 | 既有代码基线（未合并新功能时） | 实测 | `npm test` 727/727 | 只证明基线没坏 |
 | #52 单测与行为测试 | 实测 | **`49e9801`**（定稿口径；树哈希 `44e60ac9f4d05bbd1291fcfd234776db3f57a125` = `edb6345`）：全量 **747/747 pass / 0 fail / 0 skip**，`team-write-denied` 命中 **1**。等价 head：`ls-remote` 在核对时返回的是 `b6379c8`，其树与之**完全相同**且以 `49e9801` 为祖先，二者内容等价、数字同为 747 | 历史链：`5542df2`(实现)→`edb6345`→`27e599b`(撤)→`e604034`(恢复)→`4db72d4`(撤)→`49e9801`(恢复)→`ed06b97`→`b6379c8`。引用若需远端字面值，用 `b6379c8`；两者树相同，不改变结论 |
-| #53 接线后全量测试 | 实测 | **758/758 pass / 0 fail / 0 skip**，`team-write-denied` 命中 1；check 0、lint 0 | 定稿数字 758（团队口径）。`ls-remote` 核对时远端头为 `2e3e9b2`，口径引用的 `46a9690` 是其前身，两者数字与内容一致 |
-| #54 接线后全量测试 | 实测 | **782/782 pass / 0 fail / 0 skip**（连跑 3 次全绿），`team-write-denied` 命中 1；check 0、lint 0。演进：761→762→773→776→779→782 | 定稿数字 782。`ls-remote` 核对时远端头为 `0d8dac0`，口径引用的 `5be01ab` 是其前身（含 `5be01ab` 修的 `task-review-wiring` 竞态）。该竞态根因：产品先写 Markdown、之后才落 `DONE`（`task-review.js:230-257`），用例等文件出现即断言、撞在两次写之间；**`APPLYING` 是崩溃恢复的合法中间态**，属用例竞态而非产品缺陷 |
+| #53 接线后全量测试 | 实测 | **758/758 pass / 0 fail / 0 skip**，`team-write-denied` 命中 1；check 0、lint 0。定稿口径引用 `46a9690`；`ls-remote` 核对时远端为 `2e3e9b2`，两者树均为 `eee4328d…`（`git rev-parse` 一致）、`46a9690` 是 `2e3e9b2` 的祖先 | 数字与内容等价；用哪个 hash 都不改变结论 |
+| #54 接线后全量测试 | 实测 | **782/782 pass / 0 fail / 0 skip**（连跑 3 次全绿），`team-write-denied` 命中 1；check 0、lint 0。定稿口径引用 `5be01ab`；`ls-remote` 核对时远端为 `0d8dac0`，两者树均为 `6d011389…` 且前者为后者的祖先。演进：761→762→773→776→779→782 | 该竞态用例根因：产品先写 Markdown、之后才落 `DONE`（`task-review.js:230-257`），用例等文件出现即断言、撞在两次写之间；**`APPLYING` 是崩溃恢复的合法中间态**，属用例竞态而非产品缺陷 |
 | `node:sqlite` + FTS5 trigram 在 Node 侧可用 | 实测 | 设计 §8 记录的探针：建表、长中文 MATCH、短中文 LIKE、scope 过滤均通过 | 只覆盖 Node/Web 侧 |
 | **桌面 Electron 端的 `node:sqlite`** | **未验证** | 无 | 本机无 DSH 的 `app/` checkout，跑不了探针；桌面端必须走扫描回退 |
 | 原生 Windows 隔离 smoke | **未验证** | 无 | `dev/bench.sh` 需要 `deepseek-harness` checkout 与本机不符，尚未跑；不得计为通过 |
