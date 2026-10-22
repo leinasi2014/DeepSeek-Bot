@@ -6,7 +6,7 @@
 // model only, and never the real DSH_HOME.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -204,10 +204,110 @@ test.skip('acceptance: idle/switch/overflow never trigger a review', () => {})
 test.skip('acceptance: forged completion, self-reported exit code, green tool wrapper around failed tests are not success', () => {})
 test.skip('acceptance: short user confirmation can verify; forged excerpt is rejected', () => {})
 
-// --- permissions (waits for #54) ----------------------------------------------
-test.skip('permissions: cross-bot/project anchors, ../, prefix-sibling dirs, junctions refused', () => {})
-test.skip('permissions: re-check scope before executing; fixed plan never changes scope', () => {})
-test.skip('permissions: secret-looking values in any field stay out of every store', () => {})
+// --- permissions: two genuinely uncovered edges of #54's evidence gates, driven the
+// way test/task-review-wiring.test.js drives the wiring (fake llm by system prompt).
+// The remaining permission rows are covered elsewhere: a changed project drops the
+// candidate (task-review.test.js), and secret-shaped values by its dual checks plus
+// test/secrets.test.js.
+import { apply as applyPlugin } from '../index.js'
+
+const TEAM_TASK = {
+  version: 1, mainBotIds: ['m1'], revision: 1, whaleStored: true,
+  bots: {
+    m1: { id: 'm1', sessionId: 'm1', name: 'Chief', role: 'Chief', model: 'deepseek/v4', instructions: '', createdAt: 1 },
+    b2: { id: 'b2', sessionId: 'b2', name: 'Writer', role: '写作', model: 'deepseek/v4', instructions: '', createdAt: 2 },
+  },
+  rooms: {}, exchanges: [], exchangeTurns: {}, questions: {},
+}
+// b2's own part has a user line only; the evidence lives in another session's log.
+const TASK_HISTORY = {
+  b2: [
+    { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Please run the release script now.' }] } } },
+    { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'On it; the run is in progress.' }] } } } },
+  ],
+  b3: [
+    { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'run it' }] } } },
+    { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Ran scripts/ship.sh; the suite passed: tests 12/12.' }] } } } },
+  ],
+}
+function startTask({ items = [], support = [], cwd } = {}) {
+  const home = mkdtempSync(join(tmpdir(), '.dsh-test-memory-task-'))
+  writeFileSync(join(home, 'state.json'), JSON.stringify(TEAM_TASK))
+  const ctx = fakeContext()
+  Object.assign(ctx, {
+    llm: {
+      listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }],
+      listModels: async () => [{ id: 'v4' }],
+      resolveModelInfo: async () => ({ reasoning: { efforts: [{ id: 'off' }] } }),
+      async* stream(request) {
+        const system = String(request.system ?? '')
+        let reply = ''
+        if (system.startsWith('You keep the long-term memory')) reply = '{"changes":[]}'
+        else if (system.startsWith('You turn a reported finished task')) reply = JSON.stringify({ items })
+        else if (system.startsWith('You check whether')) reply = JSON.stringify({ support })
+        yield { type: 'text-delta', index: 0, text: reply }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    },
+    sessionController: {
+      resolveAgent: async sessionId => ({ agent: { session: { id: sessionId, seq: (TASK_HISTORY[sessionId] ?? [{ event: { seq: 1 } }]).at(-1).event.seq + 1 } } }),
+      selectModel: async () => {},
+      page: async ({ address, beforeSeq }) => ({ records: (TASK_HISTORY[address.sessionId] ?? []).filter(r => beforeSeq === undefined || r.event.seq < beforeSeq), hasMore: false }),
+    },
+    sessions: { messageProjections: [], get: id => (cwd === undefined ? undefined : { id, header: { cwd } }) },
+    workspaceRegistry: { archiveSession: async () => {} },
+  })
+  applyPlugin(ctx, { home, memoryReviewDelayMs: 0 })
+  const plans = () => (existsSync(join(home, 'memory', 'task-plans'))
+    ? readdirSync(join(home, 'memory', 'task-plans')).filter(n => n.endsWith('.json')).map(n => JSON.parse(readFileSync(join(home, 'memory', 'task-plans', n), 'utf8')))
+    : [])
+  return {
+    ctx, home, plans,
+    tool: (name, args, callId) => ctx.registeredTools.get(name).execute(args, { agent: { id: 'b2' }, callId }),
+    stop: async () => { await ctx.dispose(); rmSync(home, { recursive: true, force: true, maxRetries: 5 }) },
+  }
+}
+const settleTask = () => new Promise(r => setTimeout(r, 20))
+async function untilTask(check) {
+  for (let tries = 0; tries < 300 && !check(); tries += 1) await settleTask()
+  assert.ok(check(), 'the condition did not hold within 6 s')
+}
+const TASK_CLAIM = { kind: 'command', statement: '发布脚本跑通', evidence: 'tests 12/12', ref: 'part 1 #11' }
+
+test('permissions: evidence that exists only in another session\'s log is refused', async t => {
+  const s = startTask({ items: [{ claim: 0, topic: '', text: '借来的证据', outcome: 'verified' }], support: ['yes'] })
+  t.after(() => s.stop())
+  await s.tool('complete_task', { result: 'done', claims: [TASK_CLAIM] }, 'cross-1')
+  s.ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
+  await untilTask(() => s.plans().length === 1)
+  await untilTask(() => s.plans()[0].status === 'HELD')
+  assert.equal(s.plans()[0].unverified[0].reason, 'evidence-unsupported')
+  assert.equal(existsSync(join(s.home, 'memory', 'bots', 'b2', 'MEMORY.md')), false)
+})
+
+test('permissions: a junction inside the folder that leads outside is refused', async t => {
+  const repo = mkdtempSync(join(tmpdir(), '.dsh-test-memory-jct-'))
+  const work = join(repo, 'work')
+  const outside = join(repo, 'elsewhere')
+  mkdirSync(work, { recursive: true })
+  mkdirSync(outside, { recursive: true })
+  mkdirSync(join(repo, '.git'), { recursive: true })
+  writeFileSync(join(outside, 'notes.txt'), 'the suite passed: tests 12/12')
+  // A junction named inside the working folder that points outside it.
+  const junction = join(work, 'link')
+  const { execFileSync } = await import('node:child_process')
+  execFileSync('cmd.exe', ['/c', 'mklink', '/J', junction, outside])
+  t.after(() => { rmSync(repo, { recursive: true, force: true, maxRetries: 5 }) })
+  const s = startTask({ cwd: work, items: [{ claim: 0, topic: '', text: '穿链接的证据', outcome: 'verified' }], support: ['yes'] })
+  t.after(() => s.stop())
+  const claim = { kind: 'file', statement: '测试通过', evidence: 'tests 12/12', ref: 'link/notes.txt' }
+  await s.tool('complete_task', { result: 'done', claims: [claim] }, 'jct-1')
+  s.ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
+  await untilTask(() => s.plans().length === 1)
+  await untilTask(() => s.plans()[0].status === 'HELD')
+  assert.equal(s.plans()[0].unverified[0].reason, 'evidence-unsupported')
+  assert.equal(existsSync(join(s.home, 'memory', 'projects')), false, 'nothing written anywhere')
+})
 
 // --- waiting (waits for #54) ---------------------------------------------------
 test.skip('waiting: related work/question pending waits; other groups never block', () => {})
