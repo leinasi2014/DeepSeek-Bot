@@ -117,11 +117,27 @@ function EntryRow({ entry, remove }) {
     }, confirming ? t('Remove') : h(TrashIcon)))
 }
 
+const projectNameOf = root => String(root ?? '').split(/[\\/]/).filter(Boolean).at(-1) ?? '?'
+
+// The projects this Bot works in, as the host counts them; naming one shows and
+// changes its memory. "No project" is the Bot's own and the team's alone.
+function ProjectPicker({ view, session, onSession }) {
+  const projects = view.projects ?? []
+  if (projects.length === 0) return null
+  return h('div', { className: 'bt-mem-projects', role: 'tablist', 'aria-label': t('Project memory') },
+    h('button', { type: 'button', role: 'tab', 'aria-selected': session === '' || undefined, onClick: () => onSession('') }, t('No project')),
+    projects.map(project => h('button', {
+      key: project.hash, type: 'button', role: 'tab', title: project.root,
+      'aria-selected': session === project.session || undefined, onClick: () => onSession(project.session),
+    }, projectNameOf(project.root))))
+}
+
 function Entries({ bot, view, remove }) {
   const groups = groupEntries(view.entries)
   const sections = [
     { scope: 'own', title: t("{name}'s memory", { name: bot.name }), size: view.sizes.own },
     { scope: 'team', title: t('Team memory'), hint: t('Every Bot reads it'), size: view.sizes.team },
+    ...(view.sizes.project === undefined ? [] : [{ scope: 'project', title: t('Project memory'), hint: view.project?.root, size: view.sizes.project }]),
   ]
   return h('div', { className: 'bt-mem-entries' },
     sections.map(section => h('section', { key: section.scope, className: 'bt-mem-section' },
@@ -139,9 +155,9 @@ function Entries({ bot, view, remove }) {
 function changeLine(change) {
   const text = change.text.length > 120 ? `${change.text.slice(0, 120)}…` : change.text
   if (!change.ok) return t('Not changed: {text} ({reason})', { text, reason: hostText(change.error ?? '') })
-  if (change.op === 'remove') return change.scope === 'team' ? t('Removed from team memory: {text}', { text }) : t('Removed: {text}', { text })
+  if (change.op === 'remove') return change.scope === 'team' ? t('Removed from team memory: {text}', { text }) : change.scope === 'project' ? t('Removed from project memory: {text}', { text }) : t('Removed: {text}', { text })
   if (change.op === 'edit') return t('Updated: {text}', { text })
-  return change.scope === 'team' ? t('Added to team memory: {text}', { text }) : t('Added: {text}', { text })
+  return change.scope === 'team' ? t('Added to team memory: {text}', { text }) : change.scope === 'project' ? t('Added to project memory: {text}', { text }) : t('Added: {text}', { text })
 }
 
 function Reply({ answer, dismiss }) {
@@ -160,8 +176,9 @@ function Reply({ answer, dismiss }) {
 }
 
 // The view as the host has it, loaded again while a summary is being written. Only the
-// latest request's answer counts.
-function useMemoryView(botId, actions) {
+// latest request's answer counts. `session` names the conversation whose project the
+// view covers; empty means the Bot's own and the team's memory alone.
+function useMemoryView(botId, actions, session) {
   const [view, setView] = useState(null)
   const [error, setError] = useState('')
   const timer = useRef(0)
@@ -176,19 +193,19 @@ function useMemoryView(botId, actions) {
     clearTimeout(timer.current)
     const ticket = ++latest.current
     try {
-      const next = await actions.memoryView(botId, flags)
+      const next = await actions.memoryView(botId, { ...flags, ...(session ? { session } : {}) })
       if (!alive.current || ticket !== latest.current) return
       show(next)
       if (next.summarizing) timer.current = setTimeout(() => void load({ summarize: flags.summarize || flags.regenerate }), POLL_MS)
     } catch (failure) {
       if (alive.current && ticket === latest.current) setError(failure?.message ?? String(failure))
     }
-  }, [botId])
+  }, [botId, session])
   useEffect(() => {
     alive.current = true
     void load({ summarize: true })
     return () => { alive.current = false; clearTimeout(timer.current) }
-  }, [botId])
+  }, [load])
   return { view, error, load, show }
 }
 
@@ -202,7 +219,8 @@ function useNow(every) {
 }
 
 export function MemoryDialog({ bot, actions, leaving = false }) {
-  const { view, error, load, show } = useMemoryView(bot.id, actions)
+  const [session, setSession] = useState('')
+  const { view, error, load, show } = useMemoryView(bot.id, actions, session)
   const [page, setPage] = useState('summary')
   const [menu, setMenu] = useState(false)
   const [menuShown, menuLeaving] = useLinger(menu, MENU_EXIT_MS)
@@ -233,7 +251,7 @@ export function MemoryDialog({ bot, actions, leaving = false }) {
   const backToSummary = () => { setPage('summary'); void load({ summarize: true }) }
   const remove = async (entry) => {
     try {
-      show(await actions.memoryForget(bot.id, entry))
+      show(await actions.memoryForget(bot.id, entry, session))
       return true
     } catch (failure) {
       setAnswer({ asked: entry.text, error: failure?.message ?? String(failure) })
@@ -247,7 +265,7 @@ export function MemoryDialog({ bot, actions, leaving = false }) {
     setText('')
     setAnswer({ asked, pending: true })
     try {
-      const result = await actions.memoryAsk(bot.id, asked)
+      const result = await actions.memoryAsk(bot.id, asked, session)
       setAnswer({ asked, reply: result.reply, changes: result.changes })
       show(result.view)
       if (result.changes.some(change => change.ok)) void load({ summarize: page === 'summary' })
@@ -283,7 +301,9 @@ export function MemoryDialog({ bot, actions, leaving = false }) {
       h('div', { className: 'bt-mem-body' },
         error ? h('div', { className: 'bt-error', role: 'alert', style: { padding: 0 } }, hostText(error)) : null,
         view === null ? (error ? null : h(Skeleton))
-          : page === 'entries' ? h(Entries, { bot, view, remove })
+          : page === 'entries' ? h(Fragment, null,
+            h(ProjectPicker, { view, session, onSession: setSession }),
+            h(Entries, { bot, view, remove }))
             : h(Summary, { bot, view, regenerate })),
       h('div', { className: 'bt-mem-foot' },
         answer ? h(Reply, { answer, dismiss: () => setAnswer(null) }) : null,
