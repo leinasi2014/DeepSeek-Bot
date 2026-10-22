@@ -796,13 +796,12 @@ test('when a turn ends, the memory review keeps what the user said, through the 
     '',
     'Write every new or changed entry in English.',
   ].join('\n'))
-  // Writer writes no team memory, so the team entry is skipped with a record for a
-  // person to add by hand — it does not slip into its own; no password is kept.
+  // Writer writes no team memory, so the team entry stays its own; no password is kept.
   const entries = parseMemory(read('bots', 'b2', 'MEMORY.md')).entries
-  assert.deepEqual(entries.map(entry => entry.text), ['The user writes Rust', 'The user likes a plain style, mostly black and white'])
+  assert.deepEqual(entries.map(entry => entry.text), ['The user writes Rust', 'The user likes a plain style, mostly black and white', 'Everyone should keep it plain'])
   assert.equal(entries[1].meta.source, 'part 1 #20')
-  assert.deepEqual(journal().slice(1).map(record => [record.op, record.reason, record.actorName, record.auto]), [
-    ['add', undefined, 'Writer', true], ['skip', 'team-write-denied', 'Writer', true], ['replace', undefined, 'Writer', true],
+  assert.deepEqual(journal().slice(1).map(record => [record.op, record.actorName, record.auto]), [
+    ['add', 'Writer', true], ['add', 'Writer', true], ['replace', 'Writer', true],
   ])
   // The review's tokens count as the Bot's memory use, not as "Other".
   const meter = ctx.listeners.get('llm/stream').find(listener => /tags\.get/.test(String(listener)))
