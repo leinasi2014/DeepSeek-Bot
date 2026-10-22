@@ -318,13 +318,13 @@ test('permissions: evidence that exists only in another session\'s log is refuse
 
 test('permissions: a junction inside the folder that leads outside is refused', async t => {
   const repo = mkdtempSync(join(tmpdir(), '.dsh-test-memory-jct-'))
+  t.after(() => { rmSync(repo, { recursive: true, force: true, maxRetries: 5 }) })
   const work = join(repo, 'work')
   const outside = join(repo, 'elsewhere')
   mkdirSync(work, { recursive: true })
   mkdirSync(outside, { recursive: true })
   mkdirSync(join(repo, '.git'), { recursive: true })
   writeFileSync(join(outside, 'notes.txt'), 'the suite passed: tests 12/12')
-  t.after(() => { rmSync(repo, { recursive: true, force: true, maxRetries: 5 }) })
   // A link named inside the working folder that points outside it. Node can make both
   // kinds itself, so the case needs no shell: a directory junction on Windows, a
   // directory symlink elsewhere. Both are the same escape once the real path resolves,
