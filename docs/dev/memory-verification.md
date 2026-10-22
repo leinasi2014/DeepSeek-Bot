@@ -15,9 +15,9 @@
 | 项 | 状态 | 证据 | 备注 |
 |---|---|---|---|
 | 既有代码基线（未合并新功能时） | 实测 | `npm test` 727/727 | 只证明基线没坏 |
-| #52 单测与行为测试 | 实测 | 两版都实测过：**`27e599b`**（Chief 末次裁定：team 落 own 属既有行为）→ **746/746**、项目用例 **7/7**；**`e604034`**（架构师追加的 revert-of-revert，树哈希 `44e60ac9…` 与 `edb6345` 逐字节相同）→ **747/747**、**8/8**，含 team 用例 | **两版并存，须以 Chief 裁定为准**：裁定取 `27e599b` 时本行记 **746**，team 为既有行为；架构师随后的 `e604034`（及其本地未推的 `b6379c8`，树同）恢复了 team 修复，属对同一裁定的反向执行。我在 `github.com:443` 超时期间无法实时核对远端，缓存引用为 `ed06b97`（不含修复） |
-| #53 接线后全量测试 | 实测 | 两版都实测过：`55e5fab`（`Merge the project scope revert of the team-write refusal`，team 命中 0）→ **757/757**；`4b6f1eb`（`Restore the team-write refusal…`，team 命中 1）→ **758/758** | 取值随 #52 裁定：#52 取 `27e599b` 则 #53 记 **757**；取 `e604034` 则记 **758** |
-| #54 接线后全量测试 | 实测 | `16ee6ae`、`114a4a0`（team 命中 1）→ **782/782**；按 `27e599b` 重并后应为 **781**（782 − 1 条 team 用例）。演进：761→762→773→776→779（`754ffb5` 三处补证）→782 | 同上，最终值取决于 #52 采用哪版 |
+| #52 单测与行为测试 | 实测 | **最终头 `e604034`**（Chief 2026-10-22 末次定稿）：全量 **747/747 pass / 0 fail / 0 skip**，`memory-project.test.js` **8/8**（我本机 detached worktree 复跑）。其树哈希 `44e60ac9f4d05bbd1291fcfd234776db3f57a125` 与 `edb6345` **完全相同**，即内容等同、只多两条 revert 留痕 | 历史：`5542df2`(team 修复)→`edb6345`(第 8 条回归)→`27e599b`(revert)→**`e604034`(revert-of-revert，最终头)**。研发期间该点被反复裁定，最终以前一句为准 |
+| #53 接线后全量测试 | 实测 | 含 team 修复的头上实测 **758/758**（`4b6f1eb`）；`27e599b` 系（`55e5fab`）为 **757/757**（少 1 条 team 用例） | **最终应取 758**：#53 需按 `e604034` 重新并入后确认；两者之差恰为 team 那 1 条用例 |
+| #54 接线后全量测试 | 实测 | 含 team 修复的 `16ee6ae`/`114a4a0` 实测 **782/782**；`27e599b` 系（`26c020e`）为 **781/781**。演进：761→762→773→776→779（`754ffb5` 三处补证）→782 | **最终应取 782**：#54 需并入按 `e604034` 重做的 #53 后确认 |
 | `node:sqlite` + FTS5 trigram 在 Node 侧可用 | 实测 | 设计 §8 记录的探针：建表、长中文 MATCH、短中文 LIKE、scope 过滤均通过 | 只覆盖 Node/Web 侧 |
 | **桌面 Electron 端的 `node:sqlite`** | **未验证** | 无 | 本机无 DSH 的 `app/` checkout，跑不了探针；桌面端必须走扫描回退 |
 | 原生 Windows 隔离 smoke | **未验证** | 无 | `dev/bench.sh` 需要 `deepseek-harness` checkout 与本机不符，尚未跑；不得计为通过 |
@@ -32,10 +32,10 @@
 | 项目无法判定时不落 own（工具路径） | 实测 | #52 的 `memory-project.test.js`：unresolved 拒绝隐式写入 | 见 #52 分支 |
 | 项目无法判定时不落 own（自动复盘路径，add） | 实测 | `d4ca7d9`。skip 判定在 `memory.js:1566`：`op === 'add'` 且非显式 `team`，或 `target?.scope === 'project'`；命中即 `journal({op:'skip', scope:'project:unresolved', reason:'project-unresolved', problem})` 后 `continue`，不再走 `:1582-1583` 的 `ownScope` 回落。用例「the memory review skips project writes when the project is unresolved, and journals them」用 broken gitdir（`.git` 写 `gitdir: ../nowhere`）真走 review 通道，断言 `memory/bots/b2` 不存在、team 那条仍落盘、`problem` 含 `nowhere`、`after` 存全文 | — |
 | edit/move/remove 在 unresolved 时不改投 own | 实测（用例来自 `edb6345`，`memory-project.test.js:237`） | 常规 review 路径不可达（`memory.js:1713`：unresolved 时 `projectFiles = []`，模型无从引用 project 条目），但架构师用了一个**可达窗口**造出真断言：先经工具写入 project 两条（MEMORY.md + topic），等 review 请求已发出、回复未落地时把 `.git` 改成 `gitdir: ../nowhere` 并 `clearCache()`，再一次性提交 edit/move/remove 三条。断言 project 两个文件**逐字未变**、`memory/bots/b2` 不存在、journal 三项 `(intendedOp, scope)` 恰为 `[['edit','project:unresolved'],['move','project:unresolved'],['remove','project:unresolved']]` | `edb6345` 上单跑 **8/8** 在列；当前头 `4db72d4` 上仍保留，单跑 **7/7** 含此条 |
-| 显式 `team:true` 但 Bot 无 team 写权限时落到 own | **既有行为，本次不改**（`5542df2`→`27e599b` 留痕）**；另有恢复版待裁定** | 结构为 `change.team === true && teamWrites ? TEAM : ownScope`，与项目隔离无关。`5542df2` 曾实现 skip + `journal({reason:'team-write-denied'})`，`27e599b` revert 之（team 命中 0）；架构师随后又提交 `e604034` / 本地 `b6379c8` 恢复该修复（team 命中 1，树同 `edb6345`） | Chief 末次裁定接受 `27e599b`、team 属既有行为、本次不改（QA 独立审查亦建议维持）；架构师按「恢复」执行，二者不一致。**本表按首席裁定记录**，并注明恢复版存在，合并前须再次对齐 |
+| 显式 `team:true` 但 Bot 无 team 写权限时落到 own | 实测（`5542df2` 修复，用例在 `edb6345`/`e604034`） | `memory.js` 中 `op === 'add' && change.team === true && !writesTeam` → `journal({op:'skip', scope:'team', reason:'team-write-denied', after: 全文})` + `continue`，不再落 own。用例「the memory review refuses a team write the Bot may not make, instead of saving it to own」用非 Main Bot fixture，断言 own 与 team 目录均未创建、journal 带该 reason 与全文 | Chief 定稿：**保留该修复**（与设计 §2 第 40 行「显式 own/team 仍须通过原有授权」一致，且 QA 的 team 断言无需删除）。legacy 用例「keeps what the user said」期望随之变为 `add/skip/replace`，属**预期变更**、非回归 |
 
 
-**结论：上表中「实测」的项只覆盖测试套件与静态检查；新功能的隔离 smoke、UI 截图、桌面端探针都还没有跑。不要把本文件里的测试数（#52 746；#53/#54 待按 `27e599b` 重做为 757/781）读成新功能验收通过——它们只是各分支当前头的全量测试数，且都在本机临时目录里跑；各分支尚未合入 `dev`，合入后数字还会变。**
+**结论：上表中「实测」的项只覆盖测试套件与静态检查；新功能的隔离 smoke、UI 截图、桌面端探针都还没有跑。不要把本文件里的测试数（#52 747；#53 758、#54 782 待按 `e604034` 重并确认）读成新功能验收通过——它们只是各分支当前头的全量测试数，且都在本机临时目录里跑；各分支尚未合入 `dev`，合入后数字还会变。**
 
 ## 怎么自己复核
 
@@ -68,7 +68,7 @@ node --experimental-test-module-mocks --import ./test/harness-resolve.mjs --test
 | 身份 | none/unresolved 后补 Git 能恢复；真实大小写；hash 碰撞拒绝 | `project-scope.test.js`「answers expire, so a folder that gains a repository is found again」、「a missing folder is unresolved and the case of a folder is the case on disk」、「the session scope serves reads and writes, and refuses a hash collision」 | 实测 |
 | 范围 | A 写 B 零可见 | `memory-project.test.js`「a Session saves to its project by default, and only its project is visible to it」 | 实测 |
 | 范围 | 所有第一方入口默认 project；显式 own/team 仍可用 | `memory-project.test.js`「an explicit own or team scope still writes there, from a project session」；`memory-acceptance.test.js`「scope: the automatic review defaults to project and rejects unresolved」 | 实测 |
-| 范围 | 显式 team 仍须通过原有授权 | 授权失败时的落点为**既有行为**（落 own），本次不改；`5542df2`→`27e599b` 留痕 | 既有行为，不在本次范围 |
+| 范围 | 显式 team 仍须通过原有授权（无权限不得改投 own） | `memory-project.test.js`「the memory review refuses a team write the Bot may not make, instead of saving it to own」；legacy 用例期望同步更新 | 实测（`5542df2` 修复，`e604034` 最终头） |
 | 范围 | project 目标的 edit/move/remove 在 unresolved 时不改投 own | `memory-project.test.js:237`「review changes to project entries are skipped when the project breaks before they apply」——用「请求已发、回复未落」的窗口 + `clearCache()` 使该 guard 可达 | 实测（`edb6345` 8/8；当前头 `4db72d4` 7/7 仍含此条） |
 | 范围 | unresolved 不落 own（工具/面板/复盘三路） | `memory-project.test.js`「a session whose project cannot be told apart writes nothing by default」；`memory-acceptance.test.js`「scope: an unresolved project never falls back to own, tool or panel」 | 实测 |
 | 范围 | 面板假 hash/错 session 拒绝；项目列表由服务端算 | `memory-acceptance.test.js`「scope: the panel project list is server-computed from the Bot's own sessions」、「scope: the panel writes a project entry only through a session that works in it」 | 实测 |
