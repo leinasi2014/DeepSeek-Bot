@@ -54,6 +54,20 @@ npx @deepseek-ai/dsh@0.2.0-rc.2 web
 
 ![bot 详情页：模型、记忆、用量](docs/images/details.zh.png)
 
+### 记忆
+
+bot 的记忆分三个范围：
+
+- **它自己**：你和这个 bot 说过的话，以及它了解到的你的习惯。
+- **项目**：在某个目录里工作时学到的东西。每个项目一份记忆，一个仓库里的经验不会出现在另一个仓库里。项目由 Git 仓库识别：同一仓库的多个 worktree 算同一个项目，子模块算独立项目；没有 Git 时，以最近的 `package.json` 这类项目文件为准。
+- **团队**：团队里所有 bot 共享的内容。
+
+在项目里，bot 读这三个范围，新记忆默认写进项目。不在项目里时，和以前一样只读写自己的记忆。你也可以指定某一个范围，bot 详情页里可以选择查看哪个项目；项目列表来自这个 bot 自己的会话，所以它无法被指向一个从未工作过的项目。已有记忆不会被搬动或重写，只有新写入的内容按这些规则走。
+
+检索是在你自己的电脑上对你的记忆文件做词面匹配。记忆文件旁边有一个索引让它更快；索引建不起来时 bot 直接读文件，检索照常可用。**不使用 embedding 或向量**：换个说法提问，可能找不到那条记忆。
+
+任务结束后，bot 可以记下这次学到的东西。任务算不算完成只认 bot 自己的日志，也就是它实际拿到的工具输出、退出状态和文件内容，不认它自己说做完了。每条这样的记录都留一个指向该证据的引用。核对不上的说法留在候选里，不写进长期记忆。写入过程中 DSH 被停掉，下次启动会逐条续写，且不会重复写同一条。记忆满了会把这条留着并告诉你，不会悄悄丢掉。
+
 ### Main bot
 
 这个 bot 作为你的 chief，它拥有非常高的权限，可以管理其他 bot 和群聊。第一次进入 ds bot 时，默认会有一个 main bot 叫 Chief。你可以直接和它对话，让它引导你完成配置。
@@ -82,6 +96,8 @@ ds bot 拥有群聊功能。群聊是非常好的多 bot 协作方式，但它�
 
 所有数据都在你自己的电脑上，在 dsh 主目录（默认 `~/.dsh`）的 `bot/` 和 `sessions/` 里。卸载插件不会删除这些数据。
 
+记忆在 `bot/memory/`：各个 bot 的记忆、团队记忆、`projects/` 下每个项目一份，以及检索索引 `index.sqlite`。索引是从 Markdown 文件派生出来的：随时可以删掉，下次检索会重建。还在写入中的任务复盘记录暂存在 `task-plans/`。可以直接手工改这些 Markdown，下次检索会发现。
+
 ## 开发
 
 插件源码在 [`ds-bot/`](ds-bot/)。配置项和内部结构见 [`ds-bot/README.md`](ds-bot/README.md)，开发、测试和协作方式见 [CONTRIBUTING.zh.md](CONTRIBUTING.zh.md)，版本变化见 [CHANGELOG.md](CHANGELOG.md)。
@@ -97,6 +113,7 @@ ds bot 拥有群聊功能。群聊是非常好的多 bot 协作方式，但它�
   - [Hermes Agent](https://github.com/NousResearch/hermes-agent) 和 [Hermes Bot Mode](https://github.com/NousResearch/Hermes-Bot-Mode)：每个成员在每个群里一个会话，以及交接时带上用户之前的原话。
   - [OpenCode](https://github.com/sst/opencode)、[goose](https://github.com/block/goose)、[pi](https://github.com/badlogic/pi-mono)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)：长对话什么时候压缩，交接笔记写哪些内容。
   - [obelisk](https://github.com/tommy0103/obelisk)：用 SQLite 全文索引搜索聊天记录。
+  - [JiuwenSwarm](https://github.com/openJiuwen-ai/jiuwenswarm)：按项目路径的 hash 给每个项目一份记忆目录，以及把任务经验写进任务数据文件。这里只借鉴思路；它的任务经验没有像这里这样按证据验收。
 - 每一位试用 ds bot、提问题、报 bug 的人。
 
 ## 许可

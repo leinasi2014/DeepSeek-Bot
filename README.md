@@ -54,6 +54,20 @@ Bots also have memory. A bot remembers what you like and uses it in later work. 
 
 ![Bot details: model, memory, usage](docs/images/details.png)
 
+### Memory
+
+A bot's memory has three scopes:
+
+- **Its own** — what you told this bot, and what it learned about how you like to work.
+- **Project** — what was learned while working in one folder. Each project gets its own memory, so a lesson from one repository does not turn up in another. The project is identified by its Git repository; several worktrees of the same repository count as one project, and a submodule counts as its own. Without Git, the nearest project file such as `package.json` decides.
+- **Team** — what the bots of the team share.
+
+Inside a project a bot reads all three, and writes new memories to the project by default. Outside a project it reads and writes its own memory as before. You can still ask for one scope in particular, and the bot's details page lets you choose which project to look at; the list of projects comes from the bot's own sessions, so a bot cannot be pointed at a project it never worked in. Memory you already have is not moved or rewritten: only new writes follow these rules.
+
+Search is word matching over your own memory files, done on your computer. An index next to the memory files keeps it quick, and if the index cannot be built the bot reads the files directly instead, so search still works. It does **not** use embeddings or vectors: a question worded with other words may not find the entry.
+
+When a task ends, the bot can write down what it learned. A task counts as done only when the bot's own log supports it, meaning the tool output, the exit status and the file contents it actually got, not what the bot says it did. Each such entry keeps a pointer to that evidence. If the bot cannot check a claim, it stays a candidate and is not written into long-term memory. If DSH is stopped while these entries are being written, the bot resumes them one by one at the next start and never writes one twice. If memory is full, the entry is kept and reported to you instead of being dropped.
+
 ### Main bot
 
 The main bot is your chief. It has very high rights: it manages the other bots and the group chats. The first time you open DS Bot, there is already a main bot called Chief. Talk to it, and it walks you through the setup.
@@ -82,6 +96,8 @@ In **Settings** → **Usage**, you can see token usage by time, by bot and by mo
 
 All data stays on your own computer, in `bot/` and `sessions/` in the DSH home folder (`~/.dsh` by default). Uninstalling the plugin does not delete this data.
 
+Memory lives in `bot/memory/`: your bots' memory, the team memory, one folder per project under `projects/`, and the search index `index.sqlite`. The index is derived from the Markdown files: you can delete it at any time and it is rebuilt on the next search. Task notes that are still being written wait in `task-plans/`. Editing the Markdown files by hand is allowed; the next search picks the change up.
+
 ## Development
 
 The plugin source is in [`ds-bot/`](ds-bot/). For options and internals, see [`ds-bot/README.md`](ds-bot/README.md). For development, tests and how the team works, see [CONTRIBUTING.md](CONTRIBUTING.md). For changes between versions, see [CHANGELOG.md](CHANGELOG.md).
@@ -97,6 +113,7 @@ The plugin source is in [`ds-bot/`](ds-bot/). For options and internals, see [`d
   - [Hermes Agent](https://github.com/NousResearch/hermes-agent) and [Hermes Bot Mode](https://github.com/NousResearch/Hermes-Bot-Mode): one session per member per group chat, and handoffs that carry the earlier user messages.
   - [OpenCode](https://github.com/sst/opencode), [goose](https://github.com/block/goose), [pi](https://github.com/badlogic/pi-mono) and [Gemini CLI](https://github.com/google-gemini/gemini-cli): when to condense a long chat, and what a handoff note holds.
   - [obelisk](https://github.com/tommy0103/obelisk): chat search with a SQLite full-text index.
+  - [JiuwenSwarm](https://github.com/openJiuwen-ai/jiuwenswarm): keeping one memory directory per project, keyed by a hash of the project path, and recording task experience in a task data file. These are ideas only; their task experience is not checked against evidence the way it is here.
 - Everyone who tries DS Bot, asks questions and reports bugs.
 
 ## License
