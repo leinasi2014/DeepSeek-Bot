@@ -325,11 +325,30 @@ CREATE TABLE files (
 ## 尚未解决 / 未完成
 
 1. **桌面 Electron 端 `node:sqlite`**：`chat-index.js:76`、`usage.js:241` 只证明了 Node/Web 侧；当前 `dev` 无 `app/` 目录（`git ls-tree -d dev` 仅 `.agents/.github/docker/docs/ds-bot/scripts`），无法查 Electron 版本。列为阻塞前提。
-2. **资料员核实未完成**：本地无 JiuwenSwarm 克隆，模型侧遇 429 限流；后经远端抓取已拿到部分原文（见下），但**出处与「已实现 / 文档描述」的逐条区分尚未交回**。本设计不依赖其结论：只借鉴方向性思路（以仓库/目录为项目边界、任务经验复盘），未复制其代码或文本。
-3. **插件工程师核实未完成**：429 中断，未交完整报告。已由 Chief 复核并写入本稿的部分：`waits` 参数是 work id 而非 Bot id、`state.questions` 以 Session id 为键、`commit` 是唯一写漏斗、`archiveBotMemory` 走 `rename` 旁路、worktree 的 `.git`/`commondir` 实测格式。
-4. **测试注入点**：需在实现中预留，属实现验收项。
-5. **面板写入的 project 归属**：面板以「某个 Bot」为操作对象，而项目身份属于会话。本稿规定「按当前打开的会话解析项目，无明确会话时不写 project」，**这条是设计选择、尚未经过实现验证**，列为评审待确认项。
-6. **批量提交 vs 逐条恢复**：第 3 节给了两种幂等实现（整批 `commit` 原子提交 / 按 `entryId` 逐条恢复），未定选哪一个，属实现期决策。
+2. **插件工程师核实未完成**：429 中断，未交完整报告。已由 Chief 复核并写入本稿的部分：`waits` 参数是 work id 而非 Bot id、`state.questions` 以 Session id 为键、`commit` 是唯一写漏斗、`archiveBotMemory` 走 `rename` 旁路、worktree 的 `.git`/`commondir` 实测格式。
+3. **测试注入点**：需在实现中预留，属实现验收项。
+4. **面板写入的 project 归属**：面板以「某个 Bot」为操作对象，而项目身份属于会话。本稿规定「按当前打开的会话解析项目，无明确会话时不写 project」，**这条是设计选择、尚未经过实现验证**，列为评审待确认项。
+5. **批量提交 vs 逐条恢复**：第 3 节给了两种幂等实现（整批 `commit` 原子提交 / 按 `entryId` 逐条恢复），未定选哪一个，属实现期决策。
+
+## 与 JiuwenSwarm 的关系（资料员核实结果）
+
+资料员于本轮完成核实，结论**推翻本稿早先设想的引用基础**，故单列一节，并把引用降级。
+
+**事实（资料员给的行号，本轮未逐条复验）**
+
+- 记忆模块 8 个文件（`agentserver/memory/`：`manager/config/internal/types/embeddings/summarizer/compaction/__init__`），**没有项目或仓库维度**。
+- 记忆作用域是 **agent 级单目录**：`utils.py get_agent_workspace_dir()` → `workspace/agent`；`config.py DEFAULT_WORKSPACE_DIR`；`docs/智能体.md` 写「记忆工作目录：workspace/agent」；`memory_tools._validate_memory_path` 只放行 `memory/` 前缀。**无按项目分区**。
+- 「任务经验」只有 `tools/todo_toolkits.py` 的 `TodoToolkit`：`workspace/session/<id>/todo.md`，`TaskStatus` = waiting/running/completed/cancelled，`result` 为模型自由文本；**不校验证据、不写回记忆、无复盘或晋升**。`docs/任务规划.md` 属宣传性描述。
+- `evolution/` 是技能自演进，**不是任务经验**，不可混用。
+- 曾当作「检索排除已注入层」依据的 `manager.py:788-789` 实为 `search()` 的 **docstring**；实现该意图的 `_is_recent_session_file`（L545）**定义后零调用**；真正的过滤只有 `_build_source_filter`（L1026-1035）按 `sources` 过滤。→ 那是「想做但没做完」，不是可用先例。
+- 另两处行号纠错：`minScore` 默认来自 `config.py` 的 `query.minScore=0.3`（`manager.py:803` 的 `0.7` 只是缺省兜底）；混合权重在 `manager.py:836-837`，此前引作 `:1061` 有误。
+
+**对本设计的处置**
+
+- 项目作用域与任务复盘在本设计中属于**原创补齐**，**不以 JiuwenSwarm 作为「已实现先例」**。文档中不再出现任何「他们已实现、我们照做」的表述。
+- 唯一保留的方向性借鉴是「以仓库/目录为项目边界」这一想法——而对方**自己也没有实现**，只能作为「该做而未做」的旁证，不作为可行性证据。
+- 这些内容本身不需要外部先例支撑：项目身份、索引、复盘各自的依据都在本仓库源码里（见各节行号），DSH 公开 API 的边界也已逐条核实。
+- **无代码或文本复制**。Chief 复核：`git grep` 与全树文件搜索 `MemoryIndexManager|chunks_vec|chunks_fts|build_fts_query|TodoToolkit|EMBEDDING_CACHE_TABLE|vector_to_blob|list_memory_files|is_memory_path` 均无命中（`docs/dev-artifacts/scratch/` 未入库，其中 `jiuwenswarm-memory.md:24` 只是引用表名做对比）。产品侧为 Apache-2.0 / Python，本插件为 JS，无共享代码。
 
 ## 评审状态
 
@@ -348,16 +367,17 @@ CREATE TABLE files (
 | 内容哈希无存放位置 | 已指定 `index-hashes.json` |
 | 「40 个主题 / 毫秒级」表述不准 | 40 是每 scope 上限（`memory.js:37/652`）；删除未测量的性能断言 |
 
-**仍未通过、需后续处理的**：桌面端 sqlite 可用性（P0 阻塞）、面板 project 归属规则（第 5 条）、幂等实现二选一（第 6 条）、资料员与工程师的完整核实报告。
+**仍未通过、需后续处理的**：桌面端 sqlite 可用性（P0 阻塞）、面板 project 归属规则（第 4 条）、幂等实现二选一（第 5 条）、插件工程师的完整核实报告。
 
 ## 评审结论（四角色）
 
 - **架构师**：给出 V2 总体设计（三文件、三态状态机、scope 白名单、快照冻结共存）。Chief 采纳其模块划分与状态机，修正其证据闸（不再四条件 AND）、`waits` 签名、索引失效方式、非 Git 根判定。
 - **插件工程师**：核实到源码级并实测了 worktree 的 `.git`/`commondir` 格式；429 中断，未交完整报告；关键结论由 Chief 复核补入。
 - **测试工程师**：提出 T1–T5 与崩溃注入方案，指出 `isError` 与 `exitCode` 的判定缺口；按后续纠正，本稿改为**按主张逐条判定**（见第 3 节表格）。其 T2/T5 已被证伪并替换。
-- **资料员**：未完成（见「尚未解决」第 2 条）。
+- **资料员**：本轮完成。核实出 JiuwenSwarm **没有**项目维度的记忆、**没有**任务经验实现（只有 `TodoToolkit` 的会话待办，不校验证据、不回写记忆）；并纠正此前把 `manager.py:788-789` 的 docstring 当作可用机制的错误。据其结论，本稿把对外引用降级为「文档意图 / 未接线」，项目作用域与任务复盘按**原创补齐**处理。见「与 JiuwenSwarm 的关系」。
 
 ## 变更
 
 - 2026-10-22：初稿。按最终口径删除全部向量/embedding 内容；完成判定改为显式候选 + 按主张的证据核验；索引一致性改为已提交视图 + 写入漏斗标脏 + 显式重建。
 - 2026-10-22（修订 2）：按评审意见修正存储根、目录名、单一规范化算法、`.git` 无 `commondir` 的回落、第一方写入的 project 传递、多 claims 幂等、索引字段与哈希位置；删除未测量的性能断言；新增「评审状态」一节，明确本次评审**未全部通过**。
+- 2026-10-22（修订 3）：按资料员核实结果新增「与 JiuwenSwarm 的关系」，把对外引用降级为「文档意图 / 未接线」，项目作用域与任务复盘改为原创补齐；补记无代码复制的外部复核方式；「尚未解决」项相应减少一条。
