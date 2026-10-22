@@ -93,7 +93,9 @@ node --experimental-test-module-mocks --import ./test/harness-resolve.mjs --test
 - 但 `2102c8a` **不是当前头**：它之后的 `e7e82f1`（删 `retrieval:` 5 + `consistency:` 4 条 skip、改为映射注记）、`13154bc`（`permissions:` 3 条 → 2 条真断言 + 1 条映射）、`cf3e5b7`、`b86ab48`（守卫恢复）、`6177f6f`、以及我的文档提交，把 skip 从 30 降到 **18**、真用例从 4 增到 **6**。
 - `cb0468d`（**含** team 守卫，命中 1，8 例）：**806 / 788 pass / 0 fail / 18 skip**（exit 0），`npm run build` exit 0、`npm run lint` exit 0（仅 warning）。
 - `e9da76a`（守卫被 `d0acd7b` 删掉时的头，命中 **0**、7 例）：**805 / 787 pass / 0 fail / 18 skip**（exit 0）。与 X 定稿相反，**不可作为验收头**，留作对照。
-- **当前头（`5d14aa6` 把远端 #52 终头 `26be576` 并进来之后，再一个文档提交 `29aa6c0` 之后；当前 `29aa6c0`）：X 内容在代码里，且远端 #52 终头已成为 feat-55 的祖先**（`merge-base --is-ancestor 26be576 feat/55-acceptance` = 0）。`git show HEAD:` 逐文件数 `team-write-denied`：`src/host/memory.js` **1**、`test/memory-project.test.js` **1**、`test/memory.test.js` **1**、`test/memory-acceptance.test.js` **1**；`memory-project.test.js` **8 例**、skip **18 条**。我在并入 `26be576` 之后连跑 **2 次都是 806 tests / 788 pass / 0 fail / 18 skip**（exit 0）。
+- **当前头 `5c8a6d9`（已推送，`origin/feat/55-acceptance` = `5c8a6d9`；`5c8a6d9` 只把 `dev/mock-llm.mjs` 的 `记住/忘掉/回忆` 改成读首行、并加 `test/mock-llm.test.js`）：X 内容在代码里，三个远端终头都已是 feat-55 的祖先**（`merge-base --is-ancestor` 对 `26be576`/`2e3e9b2`/`0d8dac0` 均 = 0；`5be01ab` 也在）。`git show HEAD:` 逐文件数 `team-write-denied`：`src/host/memory.js` **1**、`test/memory-project.test.js` **1**、`test/memory.test.js` **1**、`test/memory-acceptance.test.js` **1**；`memory-project.test.js` **8 例**、skip **18 条**。我在干净 detached worktree（树 `5c8a6d9`、`node_modules` 用 junction 指向主仓库）上连跑 **2 次都是 807 tests / 789 pass / 0 fail / 18 skip**（exit 0）。
+
+**一条环境坑（不是代码问题，验收时必须排除）**：同一个 `feat-55` worktree 在 20:25 前后曾跑到 **744 tests / 712 pass / 14 fail**、`client-bundle.test.js` 报 `Cannot find package 'esbuild'`——原因是该 worktree 的 `ds-bot/node_modules` 被重装成半成品（只剩 `.bin`/`.ignored`/`@esbuild` 三个目录，`esbuild` 本体不存在），不是提交回归。重装完成或用 junction 指回主仓库后即 807/789/0/18。**遇到大面积 fail 先看 `node_modules` 是否完整，再谈代码。**
 
 **所以「816/786/30」与「806/788/18」都对，但属于不同头**：前者是 `2102c8a`，后者是当前头。对外引用必须带 hash，否则会出现「数字对不上」的假分歧。当前头之所以 tests 更少而 pass 更多，是因为 12 条 skip 被删（映射到既有用例）或转成真断言，不是丢了覆盖。
 
