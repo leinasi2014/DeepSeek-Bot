@@ -235,6 +235,36 @@ test('topics hold details, linked from MEMORY.md, and go when their last entry d
   assert.equal(read('bots', 'b2', 'MEMORY.md'), '# Memory\n\n## Index\n')
 })
 
+test('failed journal writes roll back remember, replace and forget, so the same operation can be retried', async t => {
+  for (const operation of ['add', 'replace', 'remove', 'add-topic', 'remove-topic']) {
+    await t.test(operation, async t => {
+      const { tool, home, read, journal, stop } = start({ config: { memoryReview: false } })
+      t.after(() => stop())
+      const dir = join(home, 'memory', 'bots', 'b2')
+      mkdirSync(dir, { recursive: true })
+      const topic = operation === 'remove-topic'
+      const before = `# Memory\n\n${topic ? '' : '- Original fact [source: part 1 #2; added: 2026-01-02]\n\n'}## Index\n${topic ? '- [[ops]]\n' : ''}`
+      const detail = '# ops\n\n- Original fact [source: part 1 #2; added: 2026-01-02]\n'
+      writeFileSync(join(dir, 'MEMORY.md'), before)
+      if (topic) writeFileSync(join(dir, 'ops.md'), detail)
+      const blocked = join(home, 'memory', 'journal.jsonl')
+      mkdirSync(blocked)
+      const call = () => operation.startsWith('remove')
+        ? tool('forget', { entry: 'Original fact' }, 'b2')
+        : tool('remember', { text: 'The replacement fact', ...(operation === 'replace' ? { replace: 'Original fact' } : {}), ...(operation === 'add-topic' ? { topic: 'ops' } : {}) }, 'b2')
+      assert.doesNotMatch(await call(), /^(Saved|Updated|Removed)/)
+      assert.equal(read('bots', 'b2', 'MEMORY.md'), before)
+      assert.equal(existsSync(join(dir, 'ops.md')), topic)
+      if (topic) assert.equal(read('bots', 'b2', 'ops.md'), detail)
+      assert.equal(readdirSync(dir).filter(name => /\.(bak|tmp)$/.test(name)).length, 0)
+      rmSync(blocked, { recursive: true })
+      assert.match(await call(), /^(Saved|Updated|Removed)/)
+      assert.equal(journal().length, 1)
+      assert.equal(journal()[0].op, operation === 'replace' ? 'replace' : operation.startsWith('remove') ? 'remove' : 'add')
+    })
+  }
+})
+
 test('move takes an entry out of MEMORY.md into a topic, whole, with one record', async (t) => {
   const { tool, read, journal, stop } = start()
   t.after(() => stop())
@@ -1402,22 +1432,26 @@ test('two moves inside the window, and the third is refused', async (t) => {
   assert.deepEqual(mainEntries(), ['Charlie three'], 'a refused move changes nothing')
 })
 
-// The window comes from the plugin config, so a test can make it zero: then every call opens
-// a fresh window and nothing is refused. That is what proves the cap is time based and not
-// tied to a turn boundary the tool cannot see.
+// Advance a monotonic clock across the actual boundary. Disk latency must not
+// decide whether the first two moves happened inside the test's short window.
 test('a short window really expires, so the third move succeeds afterwards', async (t) => {
+  let now = 100
+  t.mock.method(performance, 'now', () => now)
+  t.mock.timers.enable({ apis: ['setTimeout'] })
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-move-window-'))
   const { tool, read, stop } = start({ home, config: { memoryReviewDelayMs: 0, memoryMoveWindowMs: 50 } })
   t.after(() => stop())
   for (const text of ['Alpha one', 'Bravo two', 'Charlie three']) await tool('remember', { text }, 'b2')
   await tool('move', { entry: 'Alpha one', topic: 'ops' }, 'b2')
+  now = 149
   await tool('move', { entry: 'Bravo two', topic: 'ops' }, 'b2')
   const refused = await tool('move', { entry: 'Charlie three', topic: 'ops' }, 'b2')
   assert.match(String(refused), /Moved 2 entries just now/, 'two inside a 50ms window bind')
-  await new Promise(resolve => setTimeout(resolve, 70))
+  now = 150
+  t.mock.timers.tick(50)
   for (const entry of ['Charlie three']) {
     const answer = await tool('move', { entry, topic: 'ops' }, 'b2')
-    assert.doesNotMatch(String(answer), /Moved 2 entries just now/, 'the window really expired, no fake clock reset')
+    assert.match(String(answer), /^Moved from MEMORY\.md/, 'the move succeeds exactly when the monotonic window expires')
   }
   assert.equal(parseMemory(read('bots', 'b2', 'MEMORY.md')).entries.length, 0, 'all three moved')
 })
