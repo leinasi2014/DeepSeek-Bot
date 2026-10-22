@@ -131,12 +131,13 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
   // Persisted before the tool call returns, so a candidate that was accepted is never
   // lost by a restart.
   //
-  // `work` and `questions` are what this candidate is bound to, captured when the report
-  // is made: the work the reporting turn was doing (and the requests that joined it), and
-  // the question the Bot had asked and not had answered. They are the only things WAITING
-  // may look at. Checking the Bot's other work instead would let one busy group chat stall
-  // a report made in another, which is the point of keeping this list per candidate.
-  async function enqueue({ botId, sessionId, roomId, project, cwd, callId, result, claims, notes, work, questions }) {
+  // `work`, `questions` and `groupWaits` are what this candidate is bound to, captured when
+  // the report is made: the work the reporting turn was doing (and what it opened itself),
+  // the question the Bot had asked and not had answered, and the group calls its turn made.
+  // They are the only things WAITING may look at. Checking the Bot's other work instead
+  // would let one busy group chat stall a report made in another, which is the point of
+  // keeping these lists per candidate.
+  async function enqueue({ botId, sessionId, roomId, project, cwd, callId, result, claims, notes, work, questions, groupWaits }) {
     if (typeof sessionId !== 'string' || typeof callId !== 'string') throw new Error('A candidate needs the session and the tool call')
     const candidateId = candidateIdOf(sessionId, callId)
     const existing = await read(candidateId).catch(() => undefined)
@@ -164,6 +165,10 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
       // Question ids, not Session ids: a question moves to the next Session when the
       // conversation changes part, and its id stays the same.
       questions: (Array.isArray(questions) ? questions : []).filter(id => typeof id === 'string' && id !== '').slice(0, CLAIMS_MAX),
+      // Room calls this turn made, as work ids in the same book as the rest: a group line
+      // that names a member is work the moment it is posted, which is while the turn is
+      // still open, so a report made later in that turn can wait for it.
+      groupWaits: (Array.isArray(groupWaits) ? groupWaits : []).filter(id => typeof id === 'string' && id !== '').slice(0, CLAIMS_MAX),
       plan: null,
       progress: { done: [], conflicts: [] },
     }

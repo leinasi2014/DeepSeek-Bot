@@ -134,8 +134,9 @@ test('a candidate whose own work is still out waits, and goes on once it comes b
   assert.equal(waiting.retry, 0, 'waiting does not spend the retry budget')
   assert.equal(s.memoryText(), '', 'nothing was written')
 
-  // The child comes back: the same candidate goes on at the next idle, no new report.
-  s.rt.state.works['w-1'].open = []
+  // The child comes back: the work leaves the book, and the same candidate goes on at the
+  // next idle, with no new report.
+  delete s.rt.state.works['w-1']
   s.idle()
   await until(() => s.plans()[0]?.status === 'DONE')
   assert.match(s.memoryText(), /发布用 scripts\/ship\.sh/)
@@ -144,10 +145,10 @@ test('a candidate whose own work is still out waits, and goes on once it comes b
 test('work open in another chat never blocks a report made here', async t => {
   // The same Bot has work open elsewhere — another group, another chat, a handoff that
   // has not come back. Only the work the reporting turn was doing may hold this candidate:
-  // looking the Bot's work up by botId is exactly the cross-chat stall §6 forbids.
+  // looking the Bot's work up by botId is exactly the cross-chat stall §6 forbids. The
+  // request this turn answers is already settled, so it is not in the book any more.
   const s = await start({
     works: {
-      'w-mine': { from: 'm1', to: 'b2', open: [], results: [], at: 1 },
       'w-elsewhere': { from: 'm1', to: 'b2', room: 'r9', open: ['child-9'], results: [], at: 2 },
     },
   })
@@ -156,7 +157,7 @@ test('work open in another chat never blocks a report made here', async t => {
   await s.tool('complete_task', report, 'call-other-work')
   s.idle()
   await until(() => s.plans()[0]?.status === 'DONE')
-  assert.deepEqual(s.plans()[0].work, ['w-mine'], 'only its own work is recorded')
+  assert.deepEqual(s.plans()[0].work, ['w-mine'], 'only the work this turn reported is recorded')
   assert.match(s.memoryText(), /发布用 scripts\/ship\.sh/)
 })
 
@@ -200,7 +201,7 @@ test('a candidate recorded under the old part goes on when the new part is idle'
   // Session id) reaches it. Work comes back at the same moment.
   s.rt.state.bots.b2.segments = [{ sessionId: 'b2' }]
   s.rt.state.bots.b2.sessionId = 'b2-next'
-  s.rt.state.works['w-4'].open = []
+  delete s.rt.state.works['w-4']
   s.rt.chatOwners.delete('b2')
   s.rt.pastOwners.set('b2', { botId: 'b2' })
   s.rt.chatOwners.set('b2-next', 'b2')
@@ -223,7 +224,7 @@ test('a waiting candidate is picked up again after a restart', async t => {
 
   // The child came back while the host was down; a fresh runtime must resume the file.
   const state = JSON.parse(readFileSync(join(home, 'state.json'), 'utf8'))
-  state.works['w-3'].open = []
+  delete state.works['w-3']
   writeFileSync(join(home, 'state.json'), JSON.stringify(state))
 
   const second = await start({ home })

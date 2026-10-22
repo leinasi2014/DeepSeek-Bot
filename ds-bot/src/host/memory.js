@@ -649,11 +649,31 @@ export function install(rt) {
     }
   }
 
-  // The work the calling turn does: the request it answers, and the requests that joined
-  // it (tools.js:107 `worksOf`). Read through `rt` because handoffs installs before memory.
+  // The work the calling turn does: the request it answers, the requests that joined it
+  // (tools.js:107 `worksOf`), and the requests it opened itself in this turn.
+  //
+  // A turn in a Bot's own chat has no work above it: the user spoke, and `workOf` answers
+  // undefined for that. That is a normal, complete case — there is nothing to wait for —
+  // not a missing record. What such a turn starts with `message_bot` is a real request to
+  // another Bot, and `openWork` pins each one on the turn that opened it, so this reads
+  // only what this turn set going rather than everything the Bot ever sent.
   const worksOfTurn = (exec) => {
     const turn = rt.live.get(exec?.agent?.id)
-    return [rt.workOf(turn?.info), ...(turn?.joined ?? []).map(joined => rt.workOf(joined.info))].filter(Boolean)
+    const answered = [rt.workOf(turn?.info), ...(turn?.joined ?? []).map(joined => rt.workOf(joined.info))]
+    return [...new Set([...answered, ...(turn?.spawned ?? [])].filter(Boolean))]
+  }
+
+  // The group calls this turn made. They are opened when the line that names the member is
+  // posted (`postStep`, while this turn is still open), so a report made later in the same
+  // turn sees them; `callMembers` and the member's own answer reuse and close them.
+  const groupWaitsOf = (exec) => (rt.live.get(exec?.agent?.id)?.spawned ?? []).filter(id => id.startsWith('room:'))
+  // A group call already in the work book has not been answered: `closeRoomCall` removes it
+  // when the member really speaks. Waiting on the round's slot status would miss the
+  // window where the round has moved on but the member has not answered, and a round that
+  // is no longer in `roomProgress` (a restart) would wrongly read as finished.
+  const groupStillWaits = (waits) => {
+    if (!Array.isArray(waits) || waits.length === 0) return false
+    return waits.some(id => rt.pendingWork?.(id) === true)
   }
 
   // The questions this Session has open, by id. `ask_user` keeps one per Session, and a
@@ -676,11 +696,13 @@ export function install(rt) {
     const current = project.status === 'ok' ? `project:${project.hash}` : null
     if (record.project !== null && current !== record.project) return { ok: false, waiting: true }
     // Only the work and the questions this candidate recorded. Asking about anything the
-    // Bot happens to be doing would let a busy group chat stall a report from another one;
-    // a work that is gone from the map (answered, dropped, or gone with a restart of the
-    // handoff book) simply stops blocking.
+    // Bot happens to be doing would let a busy group chat stall a report from another one.
+    // `pendingWork` is "still in the book", which is what an unanswered request means —
+    // `waitsWork` only asks whether work is waiting on its own children, so a leaf request
+    // (what `message_bot` opens) reads false there even while the other Bot has not replied.
     const work = Array.isArray(record.work) ? record.work : []
-    if (work.some(id => rt.waitsWork?.(id) === true)) return { ok: false, waiting: true }
+    if (work.some(id => rt.pendingWork?.(id) === true)) return { ok: false, waiting: true }
+    if (groupStillWaits(record.groupWaits)) return { ok: false, waiting: true }
     const questions = Array.isArray(record.questions) ? record.questions : []
     if (questions.length > 0) {
       const open = openQuestionIds()
@@ -1623,6 +1645,7 @@ export function install(rt) {
         notes: String(args.notes ?? '').trim().slice(0, 4000),
         work: worksOfTurn(exec),
         questions: openQuestionsOf(caller.sessionId),
+        groupWaits: groupWaitsOf(exec),
       })
       return `Recorded as a candidate (${record.candidateId.slice(0, 8)}). After this turn the host checks the evidence and keeps only what it supports; your memory has not changed yet.`
     },

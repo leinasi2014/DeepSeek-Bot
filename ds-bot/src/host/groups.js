@@ -482,6 +482,9 @@ export function install(rt) {
       const found = named.filter(other => other.id !== member.id)
       const callees = leads && all ? [...found, ...others.filter(other => !found.includes(other))] : found
       callMembers(round, turns, index, callees, `${member.name} mentioned you`, leads ? ROOM_ADMIN_TURNS_EACH : ROOM_TURNS_EACH, member.id)
+      // This member has now had its say in the group: whatever was waiting on it from an
+      // earlier line of this round is settled, so the report that waited can go on.
+      for (const peer of everyone) rt.closeRoomCall?.(room.id, peer.id, member.id)
     }
   }
 
@@ -744,6 +747,11 @@ export function install(rt) {
   // in a round, it joins that round. Later, it joins whatever round runs in the group, or
   // posts on its own. Only the members it calls with @ answer it, and not past the late
   // round limit; the member that asked for the work answers the result.
+  //
+  // A member this line calls is work as of here, not as of the round loop: the line is
+  // posted while the caller's turn is still open, which is the only moment a report made
+  // in that turn can see it. `callMembers` (which runs after the turn ends) finds this
+  // entry and reuses it, and a real answer closes it.
   async function postStep(sessionId, info, text) {
     const waiter = info?.role === 'room' ? rt.roomWaiters.get(info.exchangeId) : undefined
     if (waiter !== undefined) return waiter.say(text)
@@ -751,6 +759,12 @@ export function install(rt) {
     if (room === undefined) return
     ensureRoomLog(room)
     const calls = callsIn(room, member, text)
+    if (calls) {
+      const everyone = room.members.map(rt.botOf).filter(Boolean)
+      for (const peer of mentionsIn(text, everyone).found.filter(other => other.id !== member.id)) {
+        rt.openRoomCall?.(room.id, member.id, peer.id, sessionId)
+      }
+    }
     const running = [...rt.roomProgress.values()].find(round => round.roomId === room.id)
     if (!calls && running !== undefined) return postInRound(room, running, member, text)
     const quiet = !calls || (room.lateRounds ?? 0) >= ROOM_LATE_ROUNDS

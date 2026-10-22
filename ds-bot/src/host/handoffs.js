@@ -26,11 +26,18 @@ export function install(rt) {
   const workOf = info => (info === undefined ? undefined
     : info.role === 'request' && info.audience !== 'user' ? info.exchangeId : info.work)
 
-  // `parent`: the work the sender was doing when it sent this one.
-  function openWork(id, { from, to, parent, fromRoom, room }) {
+  // `parent`: the work the sender was doing when it sent this one. `session`: the Session
+  // that sent it, when the caller knows it (a Bot can speak from its own chat or a group).
+  function openWork(id, { from, to, parent, fromRoom, room, session }) {
     const above = parent === undefined ? undefined : works()[parent]
     works()[id] = { ...(from ? { from } : {}), ...(to ? { to } : {}), ...(room ? { room } : {}), ...(above ? { parent } : {}), ...(fromRoom ? { fromRoom } : {}), open: [], results: [], at: Date.now() }
     if (above !== undefined) above.open.push(id)
+    // The work a turn set going, on the turn itself: a report made later in the same turn
+    // waits for these even when there was no work above it (the user spoke in its own
+    // chat, so `workOf` has nothing). Process-local like the rest of `live`, and dropped
+    // with the turn, which is what keeps it to this turn rather than the Bot's history.
+    const turn = rt.live?.get(session ?? (from === undefined ? undefined : (rt.chatOf?.(from) ?? from)))
+    if (turn !== undefined) (turn.spawned ??= []).push(id)
     save()
   }
 
@@ -69,6 +76,35 @@ export function install(rt) {
 
   const owns = (botId, workId) => workId !== undefined && works()[workId]?.to === botId
   const waits = workId => (works()[workId]?.open.length ?? 0) > 0
+  // A request that has not been answered yet. `waits` only asks whether work is waiting on
+  // its own children, so a request with no children of its own reads false even while the
+  // other Bot has not replied — which is exactly the leaf a report must wait for. Being in
+  // the map at all is what "not answered" means: `closeWork` deletes it, `dropWork` too.
+  const pending = workId => workId !== undefined && works()[workId] !== undefined
+  // The requests this turn opened, by the turn that opened them.
+  const spawnedBy = sessionId => (rt.live?.get(sessionId)?.spawned ?? [])
+
+  // A member a group line calls: work as of the line, which is posted while the caller's
+  // turn is still open. One entry per (room, caller, callee) that has not been answered
+  // yet, so a member that is called again in the same round reuses it instead of stacking
+  // duplicates. `closeRoomCall` deletes it when the member really answers in the group.
+  const roomCallKey = (roomId, from, to) => `room:${roomId}:${from}:${to}`
+  function openRoomCall(roomId, from, to, session) {
+    const id = roomCallKey(roomId, from, to)
+    if (works()[id] !== undefined) return id
+    works()[id] = { from, to, room: roomId, open: [], results: [], at: Date.now() }
+    const turn = session === undefined ? undefined : rt.live?.get(session)
+    if (turn !== undefined) (turn.spawned ??= []).push(id)
+    save()
+    return id
+  }
+  // The member answered in the group: what this caller was waiting on is settled.
+  function closeRoomCall(roomId, from, to) {
+    const id = roomCallKey(roomId, from, to)
+    if (works()[id] === undefined) return
+    delete works()[id]
+    save()
+  }
   function hold(workId, text) {
     const work = works()[workId]
     if (work === undefined || text === '') return
@@ -182,5 +218,5 @@ export function install(rt) {
     return lines.join('; ')
   }
 
-  Object.assign(rt, { workOf, openWork, closeWork, dropWork, takenWork: taken, ownsWork: owns, waitsWork: waits, holdWork: hold, workAsker: askedBy, answerText, upstreamOf, sameWork, forgetBotWork: forgetBot, statusOf, waitingView })
+  Object.assign(rt, { workOf, openWork, closeWork, dropWork, takenWork: taken, ownsWork: owns, waitsWork: waits, pendingWork: pending, spawnedBy, openRoomCall, closeRoomCall, holdWork: hold, workAsker: askedBy, answerText, upstreamOf, sameWork, forgetBotWork: forgetBot, statusOf, waitingView })
 }
