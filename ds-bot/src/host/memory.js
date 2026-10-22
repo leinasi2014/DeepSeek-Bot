@@ -617,6 +617,11 @@ export function install(rt) {
   const taskLabel = scope => labelOf(scope, scope.kind === 'bot' ? scope.botId : undefined)
   const taskScopeOf = record => (record.project === null ? ownScope(record.botId) : { kind: 'project', hash: record.project.slice('project:'.length) })
 
+  const taskCwdOf = (sessionId) => {
+    const session = sessionRecord(sessionId)
+    return session === undefined ? null : rt.sessionFolder(session) ?? null
+  }
+
   // The lines of the candidate's own conversation, oldest first: the only evidence the
   // host will quote from, so an anchor cannot reach another Bot's or another project's log.
   async function taskLines(sessionId) {
@@ -647,19 +652,18 @@ export function install(rt) {
     return { ok: true, project: current }
   }
 
-  // A claim about a file is checked against that file, and only inside the reporting
-  // Session's own working folder: both sides are resolved to their real path and compared
-  // with a directory separator, so `../`, a same-prefix folder and a junction cannot reach
-  // outside. The file is opened only after both checks pass.
+  // A claim about a file is checked against that file, and only inside the folder the
+  // report was made in (`record.cwd`, frozen at enqueue): both sides are resolved to their
+  // real path and compared with a directory separator, so `../`, a same-prefix folder and a
+  // junction cannot reach outside, and a Session that moved afterwards cannot widen the
+  // root. A relative ref is resolved against that same root. The file is opened only after
+  // the containment check, and the real path must still be the same after the read.
   function taskClaimFile(record, ref) {
-    const path = String(ref ?? '').trim()
-    if (path === '' || !isAbsolute(path)) return undefined
-    const session = sessionRecord(record.sessionId)
-    const folder = session === undefined ? undefined : rt.sessionFolder(session)
-    if (folder === undefined) return undefined
+    const raw = String(ref ?? '').trim()
+    if (raw === '' || record.cwd === null || record.cwd === undefined) return undefined
     try {
-      const file = realpathSync(path)
-      const root = realpathSync(folder)
+      const root = realpathSync(record.cwd)
+      const file = realpathSync(isAbsolute(raw) ? raw : join(root, raw))
       if (!within(file, root)) return undefined
       const text = readFileSync(file, 'utf8').slice(0, TASK_FILE_MAX)
       // The read must have come from the same real path the containment check proved: if
@@ -709,10 +713,10 @@ export function install(rt) {
       // an absolute path is checked against that file instead, and only when the file is
       // inside the Session's folder: a path that cannot be proven to be inside is refused
       // rather than falling back to the conversation.
-      const named = claim.kind === 'file' && isAbsolute(String(claim.ref ?? '').trim())
+      const isFileClaim = claim.kind === 'file'
       let supported
       let context = ''
-      if (named) {
+      if (isFileClaim) {
         const file = taskClaimFile(record, claim.ref)
         supported = file !== undefined && file.includes(evidence)
         context = supported ? `file ${claim.ref}` : ''
@@ -744,7 +748,7 @@ export function install(rt) {
     if (!Array.isArray(support)) return { invalid: 'the model did not answer with support' }
     const items = []
     candidates.forEach((entry, index) => {
-      if (support[index] !== 'yes') { drop('model-unsupported', { claim: entry.claim, text: entry.text }); return }
+      if (support[index] !== 'yes') { drop('model-unsupported', { claim: entry.claim, text: entry.text, topic: entry.topic, outcome: entry.outcome, evidence: entry.evidence, statement: claims[entry.claim].statement, kind: claims[entry.claim].kind, context: entry.context }); return }
       items.push({
         scope: scopeKey(scope),
         topic: entry.topic,
@@ -1530,6 +1534,7 @@ export function install(rt) {
         sessionId: caller.sessionId,
         roomId: owner?.roomId ?? null,
         project: project.status === 'ok' ? `project:${project.hash}` : null,
+        cwd: taskCwdOf(caller.sessionId),
         callId: String(exec?.callId ?? `no-call-${Date.now()}`),
         result,
         claims,
@@ -2209,7 +2214,57 @@ export function install(rt) {
       if (record.status === TASK_STATUS.pending) void runSessionTasks(record.sessionId)
       return { ok: true, status: record.status, unverified: record.unverified ?? [] }
     }
+    // Re-checking what the semantic gate refused, on the same quotes, without asking the
+    // model for a new extraction. A frozen plan is only re-applied, never regenerated.
+    if (endpoint === 'memory-task-reverify') return taskReviewReverify(String(body?.candidateId ?? ''))
     throw new Error(`Unknown endpoint ${endpoint}`)
+  }
+
+  async function taskReviewReverify(id) {
+    const record = await taskReview.read(id)
+    if (record === undefined) return { ok: false, error: 'No such task candidate.' }
+    if (record.plan !== null) {
+      // A conflict or a full file can be resolved by a person; the plan then runs again.
+      if (record.status !== TASK_STATUS.conflict && record.status !== TASK_STATUS.capacity) {
+        return { ok: true, status: record.status, rechecked: 0 }
+      }
+      record.status = TASK_STATUS.planned
+      await taskReview.save(record)
+      void runSessionTasks(record.sessionId)
+      return { ok: true, status: record.status, rechecked: 0 }
+    }
+    const retryable = (record.unverified ?? []).filter(entry => entry.reason === 'model-unsupported' && typeof entry.evidence === 'string' && entry.evidence !== '')
+    if (retryable.length === 0) return { ok: true, status: record.status, rechecked: 0 }
+    const bot = rt.botOf(record.botId)
+    if (bot === undefined) return { ok: false, error: 'The Bot is gone.' }
+    const verdict = await botShot(bot, TASK_VERIFY_SYSTEM, retryable.map(entry => JSON.stringify({
+      claim: entry.statement ?? entry.text,
+      kind: entry.kind ?? 'answer',
+      evidence: entry.evidence,
+      context: entry.context ?? '',
+    })).join('\n'), { sessionId: record.sessionId, kind: 'memory' })
+    const support = parseTaskJson(verdict)?.support
+    if (!Array.isArray(support)) return { ok: false, error: 'The model did not answer with support.' }
+    const accepted = []
+    const kept = []
+    retryable.forEach((entry, index) => {
+      if (support[index] === 'yes') {
+        accepted.push({ scope: scopeKey(taskScopeOf(record)), claim: entry.claim, topic: entry.topic ?? '', text: entry.text, outcome: entry.outcome === 'failed' ? 'failed' : 'verified', evidence: entry.evidence })
+      } else {
+        kept.push(entry)
+      }
+    })
+    record.unverified = [...(record.unverified ?? []).filter(entry => entry.reason !== 'model-unsupported'), ...kept]
+    if (accepted.length === 0) {
+      await taskReview.save(record)
+      return { ok: true, status: record.status, rechecked: 0 }
+    }
+    // Frozen from what was already stored: no extraction, no new wording.
+    record.plan = taskReview.freeze(record, accepted)
+    record.status = TASK_STATUS.planned
+    await taskReview.save(record)
+    void runSessionTasks(record.sessionId)
+    return { ok: true, status: record.status, rechecked: accepted.length }
   }
 
   Object.assign(rt, {

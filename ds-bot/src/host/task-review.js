@@ -118,7 +118,7 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
 
   // Persisted before the tool call returns, so a candidate that was accepted is never
   // lost by a restart.
-  async function enqueue({ botId, sessionId, roomId, project, callId, result, claims, notes }) {
+  async function enqueue({ botId, sessionId, roomId, project, cwd, callId, result, claims, notes }) {
     if (typeof sessionId !== 'string' || typeof callId !== 'string') throw new Error('A candidate needs the session and the tool call')
     const candidateId = candidateIdOf(sessionId, callId)
     const existing = await read(candidateId).catch(() => undefined)
@@ -130,6 +130,9 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
       sessionId,
       roomId: roomId ?? null,
       project: project ?? null,
+      // The folder the report was made in. A file claim is judged against this root for
+      // the rest of the candidate's life, even if the Session moves elsewhere.
+      cwd: cwd ?? null,
       createdAt: now(),
       status: STATUS.pending,
       invalid: 0,

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -33,9 +33,10 @@ const HISTORY = {
 
 // The three model calls are answered by their system prompt, so the order in which the
 // idle handlers happen to run does not matter.
-function start({ items = [], support = [], memory = '{"changes":[]}' } = {}) {
+function start({ items = [], support = [], memory = '{"changes":[]}', cwd } = {}) {
   // Each verify call takes the next list, so a retry can be answered differently.
   const supportQueue = Array.isArray(support[0]) ? [...support] : undefined
+  let folder = cwd
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-task-review-wiring-'))
   writeFileSync(join(home, 'state.json'), JSON.stringify(TEAM))
   const ctx = fakeContext()
@@ -65,7 +66,7 @@ function start({ items = [], support = [], memory = '{"changes":[]}' } = {}) {
         return { records, hasMore: records.length < all.length }
       },
     },
-    sessions: { messageProjections: [] },
+    sessions: { messageProjections: [], get: id => (folder === undefined ? undefined : { id, header: { cwd: folder } }) },
     workspaceRegistry: { archiveSession: async () => {} },
   })
   let route
@@ -86,7 +87,11 @@ function start({ items = [], support = [], memory = '{"changes":[]}' } = {}) {
     await ctx.dispose()
     rmSync(home, { recursive: true, force: true, maxRetries: 5 })
   }
-  return { ctx, home, tool, json, memoryFile, planDir, plans, requests, stop }
+  const setCwd = next => { folder = next }
+  const memoryPathOf = record => (record.project === null
+    ? join(home, 'memory', 'bots', 'b2', 'MEMORY.md')
+    : join(home, 'memory', 'projects', record.project.slice('project:'.length), 'MEMORY.md'))
+  return { ctx, home, tool, json, memoryFile, memoryPathOf, planDir, plans, requests, setCwd, stop }
 }
 
 const settle = () => new Promise(resolve => setTimeout(resolve, 20))
@@ -212,4 +217,65 @@ test('an explicit retry reopens a held task, and a frozen one is never extracted
   await s.json('memory-task-retry', { candidateId: id })
   await settle()
   assert.equal(s.requests.filter(request => String(request.system).startsWith('You turn a reported')).length, extraction)
+})
+
+// A claim about a relative file is judged against the folder frozen at enqueue, even if
+// the Session works somewhere else by the time the review runs. Both folders sit in one
+// repository, so the project identity stays the same and only the file root is at stake.
+test('a relative file claim is judged against the cwd frozen at enqueue', async t => {
+  const repo = mkdtempSync(join(tmpdir(), 'ds-bot-cwd-'))
+  const first = join(repo, 'a')
+  const second = join(repo, 'b')
+  t.after(() => rmSync(repo, { recursive: true, force: true }))
+  mkdirSync(join(repo, '.git'), { recursive: true })
+  mkdirSync(first, { recursive: true })
+  mkdirSync(second, { recursive: true })
+  writeFileSync(join(first, 'notes.txt'), 'the suite passed: tests 12/12')
+  writeFileSync(join(second, 'notes.txt'), 'something else entirely')
+  const s = start({ cwd: first, items: [{ claim: 0, topic: '', text: '发布脚本的测试通过', outcome: 'verified' }], support: ['yes'] })
+  t.after(() => s.stop())
+  const claim = { kind: 'file', statement: '测试通过', evidence: 'tests 12/12', ref: 'notes.txt' }
+  await s.tool('complete_task', { ...report, claims: [claim] }, 'b2', 'call-cwd')
+  const [record] = s.plans()
+  assert.equal(record.cwd, first, 'the folder is frozen with the candidate')
+  // The Session moves on before the review runs; the file is still the one in `first`.
+  s.setCwd(second)
+  idle(s.ctx)
+  await until(() => s.plans()[0].status === 'DONE')
+  const text = readFileSync(s.memoryPathOf(s.plans()[0]), 'utf8')
+  assert.match(text, /发布脚本的测试通过/)
+})
+
+test('a relative file claim that leaves the folder is refused', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'ds-bot-cwd-out-'))
+  const inner = join(root, 'inner')
+  mkdirSync(inner, { recursive: true })
+  writeFileSync(join(root, 'outside.txt'), 'the suite passed: tests 12/12')
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const s = start({ cwd: inner, items: [{ claim: 0, topic: '', text: '越界的教训', outcome: 'verified' }], support: ['yes'] })
+  t.after(() => s.stop())
+  const claim = { kind: 'file', statement: '测试通过', evidence: 'tests 12/12', ref: '../outside.txt' }
+  await s.tool('complete_task', { ...report, claims: [claim] }, 'b2', 'call-esc')
+  idle(s.ctx)
+  await until(() => s.plans().length === 1)
+  await until(() => s.plans()[0].status === 'HELD')
+  assert.equal(s.plans()[0].unverified[0].reason, 'evidence-unsupported')
+  assert.equal(existsSync(s.memoryPathOf(s.plans()[0])), false)
+})
+
+test('an explicit re-verify reuses the stored lesson without extracting again', async t => {
+  const s = start({ items: ONE_ITEM, support: [['no'], ['yes']] })
+  t.after(() => s.stop())
+  await s.tool('complete_task', report, 'b2', 'call-reverify')
+  idle(s.ctx)
+  await until(() => s.plans()[0]?.status === 'HELD')
+  const extractions = s.requests.filter(request => String(request.system).startsWith('You turn a reported')).length
+  const id = s.plans()[0].candidateId
+  const rechecked = await s.json('memory-task-reverify', { candidateId: id })
+  assert.equal(rechecked.value.ok, true)
+  assert.equal(rechecked.value.rechecked, 1)
+  idle(s.ctx)
+  await until(() => s.plans()[0]?.status === 'DONE')
+  assert.equal(s.requests.filter(request => String(request.system).startsWith('You turn a reported')).length, extractions, 'the lesson is reused, not extracted again')
+  assert.equal(parseMemory(readFileSync(s.memoryPathOf(s.plans()[0]), 'utf8')).entries.length, 1)
 })
