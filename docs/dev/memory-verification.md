@@ -41,7 +41,9 @@
 | 显式 `team:true` 但 Bot 无 team 写权限时落到 own | **实测（`5542df2` 实现，现于 `b6379c8`）** | `memory.js` 中 `if (op === 'add' && change.team === true && !teamWrites)`（`teamWrites = writesTeam(bot.id)`）：#52 `b6379c8` 在 `:1565`、#53 `2e3e9b2`（≡`4b6f1eb`）在 `:1613`、#54 `0d8dac0`（≡`114a4a0`）在 `:1922`（行号随各支接线不同，判据与文案相同）→ `rt.warn(...)` + `journal({op:'skip', scope:'team', reason:'team-write-denied', after: 全文, intendedOp: op})` + `continue`，不再落 own。用例「the memory review refuses a team write the Bot may not make, instead of saving it to own」用非 Main Bot fixture，断言 own 与 team 目录均未创建、journal 带该 reason 与全文，为项目用例 8 条之一。**QA 的 `7a76c63`（`test: review refuses a team write it may not make`）保留、不删**（`merge-base --is-ancestor 7a76c63 feat/55-acceptance` exit 0，当前树里两条断言都在：`memory-project.test.js`「refuses a team write…」与 `memory-acceptance.test.js` 的 `/"reason":"team-write-denied"/`） | 与设计 §2 第 40 行「显式 own/team 仍须通过原有授权」一致。`legacy` 用例「keeps what the user said」的改写（team 条目不再进 own、journal 序列变 `add/skip/replace`）属**预期的行为变更**、非回归。历史上该点被 revert 过多次，全部线性留痕、无 force-push |
 
 
-**截至 2026-10-22 22:05，工作区干净；`origin/feat/55-acceptance` 与本地 HEAD 相同（现场跑 `git status -sb`，应无 `ahead`；推送一律带 `-c http.proxy=http://127.0.0.1:10808`）；HEAD 不在此处写死**——本文件每次修订都会产生一个新提交，写在这里的 hash 必然落后一次，请现场执行 `git rev-parse HEAD` 读取并以当时输出为准（`dev` = `ba9757b`）。**已含 `5d14aa6`（feat-55 自己的 merge 提交，父 = `9c734be` + `26be576`）**：`git merge-base --is-ancestor 5d14aa6 HEAD` exit 0。**区间要按两类分别记，不能写「之后全是文档」**：提交总数不写死——每改一次本文件就变一次，现场跑 `git rev-list --count 5d14aa6..HEAD`；其中 **改 `ds-bot/dev`/`ds-bot/test` 的固定 9 个**（`mock-llm.mjs` +12/−4、`bench-memory.mjs` +7、`memory-acceptance.test.js`、`mock-llm.test.js`、`fresh-home-race.md`），其余只改本文件；**产品运行时四文件（`ds-bot/src`、`client.js`、`index.js`、`package.json`）在 `5d14aa6` 与当前头之间 `git diff --stat` 为空**（逐字节相同），守卫恒为四文件各 1。`78cbec4`（20:12:05）是该支的**祖先**、落后 50+ 个提交，**已降为历史**，不要当作当前头；`9cbd735`/`2102c8a`/`1f57613`/`148ce83`/`9842213`/`563a98a` 同样都是**历史**，不作当前头。
+**截至 2026-10-22 22:10，工作区干净；`origin/feat/55-acceptance` 与本地 HEAD 相同（现场跑 `git status -sb`，应无 `ahead`；推送一律带 `-c http.proxy=http://127.0.0.1:10808`）；HEAD 不在此处写死**——本文件每次修订都会产生一个新提交，写在这里的 hash 必然落后一次，请现场执行 `git rev-parse HEAD` 读取并以当时输出为准（`dev` = `ba9757b`）。**已含 `5d14aa6`（feat-55 自己的 merge 提交，父 = `9c734be` + `26be576`）**：`git merge-base --is-ancestor 5d14aa6 HEAD` exit 0。**区间要按两类分别记，不能写「之后全是文档」**：提交总数不写死——每改一次本文件就变一次，现场跑 `git rev-list --count 5d14aa6..HEAD`；其中 **改 `ds-bot/dev`/`ds-bot/test` 的固定 9 个**（`mock-llm.mjs` +12/−4、`bench-memory.mjs` +7、`memory-acceptance.test.js`、`mock-llm.test.js`、`fresh-home-race.md`），其余只改本文件；**产品运行时四文件（`ds-bot/src`、`client.js`、`index.js`、`package.json`）在 `5d14aa6` 与当前头之间 `git diff --stat` 为空**（逐字节相同），守卫恒为四文件各 1。`78cbec4`（20:12:05）是该支的**祖先**、落后 50+ 个提交，**已降为历史**，不要当作当前头；`9cbd735`/`2102c8a`/`1f57613`/`148ce83`/`9842213`/`563a98a` 同样都是**历史**，不作当前头。
+
+**`18e7afc` 的推送状态（20:27 时点，已过期，留作方法示例）**：当时本地 ahead 1、`git push` 报 `Recv failure: Connection was reset`（exit 128），远端仍是 `5c8a6d9`。**但 21:38 之后经本机代理全部推成功**——`18e7afc` 现在是当前头的祖先（`git merge-base --is-ancestor 18e7afc HEAD` exit 0，`18e7afc..HEAD` = 60 个提交）。**所以"未推送"只对那个时点有效，引用前必须重新 `git status -sb`。**
 
 **推送/取远端的可用通道（2026-10-22 21:40–22:05 实测，很关键）**：直连 `github.com:443` 时通时断（`Failed to connect` / `Recv failure: Connection was reset`，exit 128），但**加本机代理即可稳定成功**：`git -c http.proxy=http://127.0.0.1:10808 push origin feat/55-acceptance`、`git -c http.proxy=http://127.0.0.1:10808 ls-remote origin`、`… fetch origin` 均 exit 0（21:38–21:44 连续四次 `update by push` 就是这样推成的）。**结论：判断"是否已推送"不要看直连是否报 443，先看 `git reflog show origin/feat/55-acceptance`，再用代理复核。**
 
@@ -121,6 +123,18 @@ node --experimental-test-module-mocks --import ./test/harness-resolve.mjs --test
 
 **当前 skip 总数**：`memory-acceptance.test.js` 里 **18 条**（缓存 3、验收 3、等待 3、恢复 7、上限 2；`Select-String -Pattern 'test\.skip\('` 实数 18，`^test\('` 真用例 6 条）。这 18 条**一条都不算通过**。其中「检索」「一致性」「权限」三组的实质覆盖已在映射到的用例里，但**在这份文件里它们不是 skip 了，而是换成了指向既有用例的映射，不曾在 feat-55 里新增断言**——要新增断言的只剩这 18 条。
 
+**这 18 条的处置方式已定为「逐条写明不可达/实现期验收，不强行转真断言、不改 skip 数量」**（2026-10-22 定）。逐组理由与「由谁验证」如下，**任何一条都不得写成通过**：
+
+| 组 | 条数 | 为什么只能是 skip | 由什么验证 |
+|---|---|---|---|
+| `cache:` | 3 | 需要 A→B→A 的会话切换与「旧异步回包丢弃」时序，当前测试基座没有该钩子 | 实现期（补会话切换钩子后）或云机多会话手工验收 |
+| `waiting:` | 3 | 需要「换段仍等待」「其他群不阻塞」的跨段/跨群钩子 | 实现期（补等待态钩子后） |
+| `recovery:` | 7 | 需要崩溃注入（强杀后重放）钩子，产品当前没有该钩子 | 实现期（补崩溃注入钩子后）；桌面端重启手工验收 |
+| `acceptance:` | 3 | 是端到端验收场景，不是单元断言 | 云机终测（load + mock 会话） |
+| `limits:` | 2 | 需要批量预算/退避的可控计时注入 | 实现期或云机压测 |
+
+**所以 #55 的「18 条 skip 未收口」要这样读**：不是「有人没干完」，而是**这 18 条按设计属实现期/云机验收项**，本轮决定保持 skip 并逐条注明理由；它们在 `npm test` 里始终是 `skipped`，不计入 pass。
+
 **feat-55 合并后实测（按提交头区分，数字不同，不要混用）**
 - `2102c8a`（QA 报的「里程碑」头，**含** team 守卫、`memory-project.test.js` 8 例、`memory-acceptance.test.js` 30 条 skip / 4 条真用例）：我单独实测 **816 tests / 786 pass / 0 fail / 30 skip**（exit 0）——QA 报的数字在这个头上**成立**。
 - 但 `2102c8a` **不是当前头**。skip 从 30 降到 **18**、真用例从 4 增到 **6**，来源是 `e7e82f1`（删 `retrieval:` 5 + `consistency:` 4 条 skip、改为映射注记）与 `13154bc`（`permissions:` 3 条 → 2 条真断言 + 1 条映射）两笔。**`cf3e5b7` 不计入这条归因链**：它是按已作废的 Y 口径写的（把断言固定成「team 被拒落会话项目」），后来被 `b86ab48`（Final ruling X: keep the team-write refusal）推翻，与 skip 下降无关——把它并列会让人误以为 Y 也参与了验收。
@@ -129,7 +143,7 @@ node --experimental-test-module-mocks --import ./test/harness-resolve.mjs --test
 - `e9da76a`（守卫被 `d0acd7b` 删掉时的头，命中 **0**、7 例）：**805 / 787 pass / 0 fail / 18 skip**（exit 0）。与 X 定稿相反，**不可作为验收头**，留作对照。
 - **`5c8a6d9` 是历史，不是当前头**（它只把 `dev/mock-llm.mjs` 的 `记住/忘掉/回忆` 改成读首行、并加 `test/mock-llm.test.js`，+36/−4）；`5c8a6d9..HEAD` 已 55 个提交，当前远端头见 `git ls-remote`（2026-10-22 21:52 = `1fff36b`）。**这两个 mock 文件的内容在 `5c8a6d9` 与当前头完全相同**：`git diff --stat 5c8a6d9 HEAD -- ds-bot/dev/mock-llm.mjs ds-bot/test/mock-llm.test.js` **空输出**。以下读数我在 `5c8a6d9` 上连跑 2 次、在当前头上复跑同样成立：X 内容在代码里，三个远端终头都已是 feat-55 的祖先**（`merge-base --is-ancestor` 对 `26be576`/`2e3e9b2`/`0d8dac0` 均 = 0；`5be01ab` 也在）。`git show HEAD:` 逐文件数 `team-write-denied`：`src/host/memory.js` **1**、`test/memory-project.test.js` **1**、`test/memory.test.js` **1**、`test/memory-acceptance.test.js` **1**；`memory-project.test.js` **8 例**、skip **18 条**。我在干净 detached worktree（树 `5c8a6d9`、`node_modules` 用 junction 指向主仓库）上连跑 **2 次都是 807 tests / 789 pass / 0 fail / 18 skip**（exit 0）。
 
-**一条环境坑（不是代码问题，验收时必须排除）**：同一个 `feat-55` worktree 在 20:25 前后曾跑到 **744 tests / 712 pass / 14 fail**、`client-bundle.test.js` 报 `Cannot find package 'esbuild'`——原因是该 worktree 的 `ds-bot/node_modules` 被重装成半成品（只剩 `.bin`/`.ignored`/`@esbuild` 三个目录，`esbuild` 本体不存在），不是提交回归。重装完成或用 junction 指回主仓库后即 807/789/0/18。**遇到大面积 fail 先看 `node_modules` 是否完整，再谈代码。**
+**一条环境坑（不是代码问题，验收时必须排除）**：同一个 `feat-55` worktree 在 20:25 前后曾跑到 **744 tests / 712 pass / 14 fail**、`client-bundle.test.js` 报 `Cannot find package 'esbuild'`——原因是**该工作区的依赖不完整**（`ds-bot/node_modules` 只剩 `.bin`/`.ignored`/`@esbuild` 三个目录，`esbuild` 本体不存在），**无法归因到人或某次操作**，也不是提交回归。重装完成或用 junction 指回主仓库后即 **807/789/0/18**（同一头复跑，exit 0）。**遇到大面积 fail 先看 `node_modules` 是否完整，再谈代码。**
 
 **所以「816/786/30」与「806/788/18」都对，但属于不同头**：前者是 `2102c8a`，后者是当前头。对外引用必须带 hash，否则会出现「数字对不上」的假分歧。当前头之所以 tests 更少而 pass 更多，是因为 12 条 skip 被删（映射到既有用例）或转成真断言，不是丢了覆盖。
 
