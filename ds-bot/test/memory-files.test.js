@@ -169,6 +169,9 @@ test('an unrestorable body keeps its recovery backup and reports its location', 
   assert.equal(read(f.main), 'Changed')
   assert.ok(failure.message.includes(join(f.dir, backups[0])))
   assert.match(failure.message, /could not be fully rolled back/)
+  assert.equal(files.read(f.main, read), f.before, 'readers retain the last committed contents while recovery is required')
+  await assert.rejects(files.commit([{ path: f.main, text: 'Another change' }], { op: 'replace' }), /could not be fully rolled back/)
+  assert.equal(read(join(f.dir, backups[0])), f.before, 'a retry must not overwrite the recovery copy')
 })
 
 test('a journal close failure does not undo successfully committed files or history', async t => {

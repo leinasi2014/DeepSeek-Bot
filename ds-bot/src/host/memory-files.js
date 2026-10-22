@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
-import { constants } from 'node:fs'
+import { constants, readFileSync } from 'node:fs'
 import { copyFile, mkdir, open, rename, unlink } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 
 // A failed append may have written part of its line. Keep all journal writers in
 // one queue so restoring its previous length cannot discard somebody else's entry.
@@ -9,6 +9,21 @@ export function memoryFiles(root, writeText, warn) {
   const journalPath = join(root, 'journal.jsonl')
   let appending = Promise.resolve()
   let journalFailure
+  let commitFailure
+  const pending = new Map()
+
+  // A synchronous prompt render can run while the journal is awaiting I/O. It
+  // must freeze committed memory, including the old list of topic files.
+  const read = (path, fallback) => pending.has(path) ? pending.get(path) ?? '' : fallback(path)
+  function list(dir, fallback) {
+    const names = new Set(fallback(dir))
+    for (const [path, before] of pending) {
+      if (dirname(path) !== dir) continue
+      if (before === undefined) names.delete(basename(path))
+      else names.add(basename(path))
+    }
+    return [...names]
+  }
   function journal(record) {
     const run = appending.then(async () => {
       if (journalFailure !== undefined) throw journalFailure
@@ -52,6 +67,7 @@ export function memoryFiles(root, writeText, warn) {
   }
 
   async function commit(changes, record) {
+    if (commitFailure !== undefined) throw commitFailure
     const saved = []
     const changed = []
     try {
@@ -68,14 +84,18 @@ export function memoryFiles(root, writeText, warn) {
           if (error?.code !== 'ENOENT') throw error
           exists = false
         }
-        saved.push({ ...change, backup: exists ? backup : undefined })
+        const kept = { ...change, backup: exists ? backup : undefined }
+        saved.push(kept)
+        kept.before = exists ? readFileSync(backup, 'utf8') : undefined
       }
+      for (const change of saved) pending.set(change.path, change.before)
       for (const change of saved) {
         if (change.text === null) await unlink(change.path).catch(error => { if (error?.code !== 'ENOENT') throw error })
         else await writeText(change.path, change.text)
         changed.push(change)
       }
       await journal(record)
+      pending.clear()
     } catch (failure) {
       const unrestored = []
       for (const change of changed.reverse()) {
@@ -91,8 +111,10 @@ export function memoryFiles(root, writeText, warn) {
         }
       }
       if (unrestored.length > 0) {
-        throw new Error(`Memory change failed (${failure.message}) and could not be fully rolled back. Restore these files before trying again: ${unrestored.join('; ')}`, { cause: failure })
+        commitFailure = new Error(`Memory change failed (${failure.message}) and could not be fully rolled back. Restore these files and restart DSH before trying again: ${unrestored.join('; ')}`, { cause: failure })
+        throw commitFailure
       }
+      pending.clear()
       throw failure
     } finally {
       for (const change of saved) {
@@ -103,5 +125,5 @@ export function memoryFiles(root, writeText, warn) {
     }
   }
 
-  return { journal, commit }
+  return { journal, commit, read, list }
 }

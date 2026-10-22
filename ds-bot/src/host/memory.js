@@ -514,7 +514,7 @@ export function install(rt) {
 
   const readText = (path) => {
     try {
-      return readers.readText(path)
+      return readCommitted(path, readers.readText)
     } catch (error) {
       // A missing file is an empty one; anything else must not look empty, or the next
       // write rebuilds the scope from EMPTY_MAIN and every old entry is gone.
@@ -524,7 +524,7 @@ export function install(rt) {
   }
   const topicNames = (scope) => {
     try {
-      return readdirSync(dirOf(scope)).filter(name => name.endsWith('.md') && name !== MAIN).map(name => name.slice(0, -3)).sort()
+      return listCommitted(dirOf(scope), readdirSync).filter(name => name.endsWith('.md') && name !== MAIN).map(name => name.slice(0, -3)).sort()
     } catch (error) {
       // Only a missing scope is empty: hiding an unreadable directory would let a
       // later save replace an existing topic as if it were a new file.
@@ -547,7 +547,7 @@ export function install(rt) {
   async function writeText(path, text) {
     await writeTextTo(path, text, rt.warn)
   }
-  const { journal, commit } = memoryFiles(root, writeText, rt.warn)
+  const { journal, commit, read: readCommitted, list: listCommitted } = memoryFiles(root, writeText, rt.warn)
   let writing = Promise.resolve()
   const queued = (job) => {
     const run = writing.then(job)
