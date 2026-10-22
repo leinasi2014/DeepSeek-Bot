@@ -741,6 +741,9 @@ body[data-ds-dark-theme] .bt-theme-chip i{background:var(--da)}
 .bt-mem-failed{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:12px;background:var(--bt-hover);font-size:13px;line-height:18px;color:var(--bt-ink-2)}
 .bt-mem-failed>span{flex:1;min-width:0;overflow-wrap:anywhere}
 .bt-mem-entries{display:flex;flex-direction:column;gap:28px;animation:bt-page-in ${SPRING_SHAPE.duration}ms ${SPRING_SHAPE.easing},bt-veil-in .22s ease-out}
+.bt-mem-projects{display:flex;gap:6px;flex-wrap:wrap}
+.bt-mem-projects button{border:.5px solid var(--bt-line);border-radius:999px;background:none;color:var(--bt-ink-2);font:inherit;font-size:12px;line-height:16px;padding:5px 12px;cursor:pointer;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bt-mem-projects button[aria-selected=true]{background:var(--bt-hover);color:var(--bt-ink);border-color:transparent}
 .bt-mem-section-head{display:flex;align-items:baseline;gap:8px;margin-bottom:4px}
 .bt-mem-section-head h3{margin:0;font-size:15px;line-height:22px;font-weight:600}
 .bt-mem-section-head span{font-size:12px;line-height:16px;color:var(--bt-ink-3)}

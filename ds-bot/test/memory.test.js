@@ -449,7 +449,9 @@ test('a Session keeps the memory it began with, across restarts, until its snaps
   t.after(() => first.stop())
   await first.tool('remember', { text: 'Likes tea' }, 'b2')
   const opened = first.section('b2')
-  assert.match(opened, /^# Your memory\n/)
+  // The section names the scopes it covers, so a Session whose project changes is
+  // frozen anew instead of going on with the last project's memory.
+  assert.match(opened, /^<!-- ds-bot:memory v2 scopes=bot:b2,team -->\n# Your memory\n/)
   assert.match(opened, /## Your memory \(MEMORY\.md\)\n- Likes tea \[source: part 1 #10; added: [\d-]+\]\n\n## Team memory, shared by every Bot \(team\/MEMORY\.md\)\n\(nothing saved yet\)$/)
   assert.match(opened, /when the whole team should know something, tell a Main Bot with message_bot/)
   assert.match(first.section('m1'), /As a Main Bot you write it with remember scope "team"/)
@@ -740,7 +742,7 @@ test('a host that only reads the team shows memory but changes none of it', asyn
   assert.match(await tool('remember', { text: 'Likes tea' }, 'b2'), /^Memory cannot change now: The Bot team in .* is open in another dsh/)
   assert.equal((await call('memory-view', { botId: 'b2' })).ok, true)
   assert.equal((await call('memory-ask', { botId: 'b2', text: 'hi' })).error.code, 'bot/read-only')
-  assert.match(section('b2'), /^# Your memory/)
+  assert.match(section('b2'), /^<!-- ds-bot:memory v2 scopes=bot:b2,team -->\n# Your memory/)
   assert.equal(existsSync(join(home, 'memory', 'snapshots')), false)
 })
 
