@@ -11,6 +11,10 @@ export function memoryFiles(root, writeText, warn) {
   let journalFailure
   let commitFailure
   const pending = new Map()
+  const assertWritable = () => {
+    if (commitFailure !== undefined) throw commitFailure
+    if (journalFailure !== undefined) throw journalFailure
+  }
 
   // A synchronous prompt render can run while the journal is awaiting I/O. It
   // must freeze committed memory, including the old list of topic files.
@@ -26,7 +30,7 @@ export function memoryFiles(root, writeText, warn) {
   }
   function journal(record) {
     const run = appending.then(async () => {
-      if (journalFailure !== undefined) throw journalFailure
+      assertWritable()
       const line = `${JSON.stringify({ time: new Date().toISOString(), ...record })}\n`
       await mkdir(root, { recursive: true })
       // Windows append-only handles cannot truncate a partial write. This queue
@@ -67,7 +71,7 @@ export function memoryFiles(root, writeText, warn) {
   }
 
   async function commit(changes, record) {
-    if (commitFailure !== undefined) throw commitFailure
+    assertWritable()
     const saved = []
     const changed = []
     try {
@@ -125,5 +129,5 @@ export function memoryFiles(root, writeText, warn) {
     }
   }
 
-  return { journal, commit, read, list }
+  return { journal, commit, read, list, assertWritable }
 }

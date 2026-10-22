@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import * as actual from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -10,7 +10,12 @@ let fault
 const { default: defaultExport, ...namedExports } = actual
 mock.module('node:fs/promises', { defaultExport: { ...defaultExport }, namedExports: {
   ...namedExports,
+  async rename(from, to) {
+    if (fault?.rollbackFail && String(from).endsWith('.bak')) throw new Error('EPERM restoring backup')
+    return actual.rename(from, to)
+  },
   async open(path, flags) {
+    if (fault?.openFail && path === fault.path) throw new Error('EPERM opening journal')
     const file = await actual.open(path, flags)
     return {
       stat: () => file.stat(), truncate: n => file.truncate(n), close: () => file.close(),
@@ -47,9 +52,35 @@ function start(t) {
     tool: (name, args, id = 'b2') => ctx.registeredTools.get(name).execute(args, { agent: { id } }),
     section: id => ctx.sections.get('bot-memory').text({ agent: { id } }),
     view: () => rt.memoryEndpoint('memory-view', { botId: 'b2' }),
+    archive: () => rt.archiveBotMemory('b2'),
     read: (...path) => readFileSync(join(home, 'memory', ...path), 'utf8'),
   }
 }
+
+test('a failed rollback blocks a duplicate-target move and other writes before they alter recovery files', async t => {
+  const s = start(t)
+  await s.tool('remember', { text: 'Deliver on Friday' })
+  const before = s.read('bots', 'b2', 'MEMORY.md')
+  const entry = before.split('\n').find(line => line.startsWith('- Deliver'))
+  const dir = join(s.home, 'memory/bots/b2')
+  writeFileSync(join(dir, 'ops.md'), `# ops\n\n${entry}\n`)
+  const journal = s.read('journal.jsonl')
+  fault = { path: join(s.home, 'memory/journal.jsonl'), openFail: true, rollbackFail: true }
+  assert.match(await s.tool('remember', { replace: 'Deliver on Friday', text: 'Deliver on Thursday' }), /could not be fully rolled back/)
+  fault = undefined
+  const held = () => Object.fromEntries(readdirSync(dir).map(name => [name, readFileSync(join(dir, name), 'utf8')]))
+  const recovery = held()
+  assert.match(recovery['MEMORY.md'], /Deliver on Thursday/)
+  const backup = Object.keys(recovery).find(name => name.endsWith('.bak'))
+  assert.equal(recovery[backup], before)
+  assert.match(await s.tool('remember', { text: 'Another fact' }), /could not be fully rolled back/)
+  assert.match(await s.tool('move', { entry: 'Deliver on Friday', topic: 'ops' }), /could not be fully rolled back/)
+  assert.match(await s.tool('forget', { entry: 'Deliver on Friday' }), /could not be fully rolled back/)
+  assert.throws(() => s.archive(), /could not be fully rolled back/)
+  assert.deepEqual(held(), recovery, 'the body, duplicate topic, and recovery backup remain byte-for-byte unchanged')
+  assert.equal(s.read('journal.jsonl'), journal)
+  assert.doesNotMatch(JSON.stringify((await s.view()).entries), /Deliver on Thursday/)
+})
 
 test('another Bot freezes committed team memory while its replacement is pending and then rolled back', async t => {
   const s = start(t)

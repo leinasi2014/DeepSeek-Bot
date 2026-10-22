@@ -547,7 +547,7 @@ export function install(rt) {
   async function writeText(path, text) {
     await writeTextTo(path, text, rt.warn)
   }
-  const { journal, commit, read: readCommitted, list: listCommitted } = memoryFiles(root, writeText, rt.warn)
+  const { journal, commit, read: readCommitted, list: listCommitted, assertWritable } = memoryFiles(root, writeText, rt.warn)
   let writing = Promise.resolve()
   const queued = (job) => {
     const run = writing.then(job)
@@ -560,6 +560,7 @@ export function install(rt) {
   const writable = (scope, actor) => {
     const readOnly = rt.readOnly()
     if (readOnly !== undefined) throw new Error(`Memory cannot change now: ${readOnly}`)
+    assertWritable()
     const botActor = actor?.id === 'user' ? undefined : actor?.id
     const gone = [scope.kind === 'bot' ? scope.botId : undefined, botActor].some(id => id !== undefined && rt.botOf(id) === undefined)
     if (gone) throw Object.assign(new Error('That Bot has been deleted'), { code: GONE })
@@ -783,12 +784,14 @@ export function install(rt) {
 
   // A deleted Bot's memory moves to the archive, whole.
   function archiveBotMemory(botId) {
+    assertWritable()
     const bot = rt.botOf(botId)
     for (const sessionId of [botId, rt.chatOf(botId), ...(bot?.segments ?? []).map(segment => segment.sessionId), ...rt.groupSessionsOf(botId)]) renewMemory(sessionId)
     summaries.delete(botId)
     news.delete(botId)
     return queued(async () => {
       if (rt.readOnly() !== undefined) return
+      assertWritable()
       await unlink(join(root, 'summaries', `${safeId(botId)}.json`)).catch(() => {})
       const dir = dirOf(ownScope(botId))
       if (!existsSync(dir)) return
