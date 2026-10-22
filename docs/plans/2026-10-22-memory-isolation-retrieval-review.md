@@ -3,7 +3,7 @@
 - 日期：2026-10-22
 - 相关：本设计稿（设计阶段，未实现）；参照 `docs/plans/2026-10-09-context-and-memory.md`、`2026-10-16-bot-handoffs.md`
 - 代码基线：`dev` @ `ba9757b`（含 PR #48/#49/#50 的记忆一致性修复）
-- 状态：**设计评审通过（R1–R7 全部关闭）。代码尚未实现，运行测试待实施，未合并、未部署。**
+- 状态：**设计评审通过（R1–R7），其中 R1 的两条注记已按用户原生 Git 实测撤回改写（修订 9）。代码尚未实现，运行测试待实施，未合并、未部署。最终一致性检查由用户进行。**
 
 ## 为什么
 
@@ -35,17 +35,29 @@ resolve(cwd) -> { status: 'ok', hash, root, kind: 'git'|'marker'|'self' }
    - `.git` 是文件 → 读首行 `gitdir: <path>`。**实测两种写法都有**：本机 git 2.55 写的是**绝对路径 + 正斜杠**（`gitdir: C:/.../worktrees/wt1`），而部分 Git 版本或手写仓库用相对路径。因此解析器**两态都要支持**：`path.isAbsolute(...)` 为真直接取，否则相对 `.git` 文件所在目录解析。再读 `<gitdir>/commondir`（内容是相对路径，如 `../..`，相对 `<gitdir>` 解析）；**没有 `commondir` 就用 `gitdir` 本身**。
    - **必须从 cwd 向上找**：ds-bot 自身就是例子——`ds-bot/` 下面没有 `.git`，仓库根在父目录 `deepseek-bot/.git`。
 3. 没找到 `.git` → 从 cwd 向上找**最近的一层**含标记物的目录：`package.json`、`Cargo.toml`、`go.mod`、`pyproject.toml`、`*.csproj`。
-   - **有界**：遇到 `teamFolder` 或盘根即停，且**向上最多 3 层**。理由：一个被随手丢在 `D:\Dev` 或更上层的 `package.json` 会把分组目录误判成项目根。**`.git` 搜索不受此限**——Git 自身的目录结构就是它的界。
+   - **边界只有两个**：遇到 `teamFolder` 的祖先或盘根即停。**不设层数上限**——同一非 Git 项目的深层目录必须归到同一个根，任意层数上限会把它们切成不同项目。`.git` 搜索同样受这两个边界约束。
 4. 都没有：
    - **cwd 等于团队工作区（`folders.js:23` `teamFolder()`）→ `none`**：显式认定为「分组目录」，不是一个项目。`D:\Dev\dsh-plugins` 就是这种：它按 `AGENTS.md` 不建总仓库。
    - **cwd 不是团队工作区 → 以 cwd 自身为根**（`kind: 'self'`），不向上吞并整个盘。
 5. `hash = sha256(realpathSync.native(root))` 前 16 位小写 hex。**scope key = `project:<hash>`，目录名 = 纯 `<hash>`**（Windows 目录名不允许冒号）。
 
-**子模块：有 `commondir` 就归父仓库**
+**子模块：按实际 common dir 判定，普通子模块独立**
 
-子模块的 `.git` 文件指向 `<parent>/.git/modules/<name>`，该目录下有 `commondir` 指向父仓库。按上面的规则会解析到**父仓库根**，即子模块与父仓库共用一个 project id。这是有意的：子模块是父仓库记录的一次 checkout，项目约定本该共享。这一条明确写下，避免实现者自行发挥。
+我上一版写「子模块必定有 `commondir` 指父仓库、与父仓库同 id」，**这是错的**。用户在本机用原生 Git 建了真实 submodule 实测（`D:/Temp/2026-10-22-ds-bot-memory-design/git-layout-probe`），我打开该目录复核如下：
 
-**本机未验证**：`git submodule add` 在本机报 `sh.exe` 错误，子模块的实际文件布局**没有实测**，上段是按 Git 文档的已知结构写的。实现期须补一条真实子模块用例（用例 61）。
+| 对象 | `.git` | `commondir` | `git rev-parse --git-common-dir` |
+|---|---|---|---|
+| 父仓库 `parent/` | 目录 | 无 | `.git`（即 `parent/.git`） |
+| 子模块 `parent/sub/` | 文件：`gitdir: ../.git/modules/sub` | **不存在** | `parent/.git/modules/sub` |
+
+因此「普通子模块与父仓库同 id」**没有依据**。规则改为：
+
+- **一律按实际解析出的 common dir 取 hash**，不从 `modules/` 路径反推父仓库，也不对 `modules` 做特殊处理。
+- 普通子模块的 common dir 是 `parent/.git/modules/sub` → **独立项目**。
+- 同一仓库的 **worktree** 共享同一个 common dir → **同 id**（这条已实测：`.git` 文件 → `gitdir` → `commondir` = `../..` → 主仓库 `.git`）。
+- 也就是说，判定只有一条：**解析结果落在同一个 common dir 就是同一个项目**，与目录形状无关。
+
+参考：<https://git-scm.com/docs/gitsubmodules>、<https://git-scm.com/docs/gitrepository-layout>（`modules/` 下是子模块自己的仓库布局）。
 
 **`cwd === teamFolder` 不再直接判 `none`。** 这是 R1 的核心修正：从单仓库启动 DSH 时，团队工作区往往就是那个仓库的根。必须先走第 2、3 步；只有「团队工作区且整条向上链都没有 `.git` 和标记物」才判 `none`。
 
@@ -483,16 +495,18 @@ CREATE TABLE files (
 | 58 | 入队 `ok`、执行时变 `unresolved` | 回 `WAITING`，不计数、不丢弃 |
 | 59 | `projectMemory:false` 时面板选项目 | 拒绝（三查里的「未被配置关闭」） |
 | 60 | 索引不可用且扫描也失败 | **显式报错**；绝不返回静默空列表 |
-| 61 | 真实子模块（父仓库 `modules/N` + `commondir`） | 与父仓库同 hash；`git submodule add` 本机未跑通，实现期须补 |
-| 62 | `.git` 文件写绝对路径（git 2.55 的实际形态） | 正确解析 |
-| 63 | `.git` 文件写相对路径 | 相对 `.git` 所在目录解析 |
+| 61 | **真实子模块**（`parent/sub`，`gitdir: ../.git/modules/sub`，无 `commondir`） | 解析到 `parent/.git/modules/sub` → **与父仓库不同的 hash**（已实测，独立项目） |
+| 62 | `.git` 文件写绝对路径（git 2.55 的 worktree 形态） | 正确解析 |
+| 63 | `.git` 文件写相对路径（子模块形态） | 相对 `.git` 所在目录解析 |
 | 64 | cwd 在 `ds-bot/`（`.git` 在父目录） | 向上找到 `deepseek-bot` 仓库根 |
-| 65 | 同一目录三种大小写写法 | `realpathSync.native` 收敛为同一 hash；用非 native 的写法应作为反例被单测拒绝 |
+| 65 | 同一目录三种大小写写法 | `realpathSync.native` 收敛为同一 hash；非 native 的写法作为反例被单测拒绝 |
 | 66 | 主仓库 `.git` 为目录、无 `commondir` | 直接用该目录，不报错 |
 | 67 | journal 某行损坏 | 跳过坏行并计数，其余记录仍可读；不整批放弃 |
 | 68 | 后端无 `node:sqlite`（模拟导入失败） | `warn` + 返回 null + 扫 Markdown；**不崩**（不写「Electron 可用」） |
+| 69 | 非 Git 项目，文件在根下第 5 层子目录 | 仍归到同一个根（**不设层数上限**） |
+| 70 | 非 Git 项目，cwd 在 `teamFolder` 的祖先侧 | 搜索在 `teamFolder` 边界停止，不越界认出外部项目 |
 
-无法在本阶段验证的：桌面 Electron 端 sqlite（只影响「已验证平台」表述）、崩溃注入点（需实现留钩子）、大小写敏感目录（`fsutil` 需管理员权限）、真实子模块（`git submodule add` 报 `sh.exe` 错）。均为实现期验收项。
+无法在本阶段验证的：桌面 Electron 端 sqlite（只影响「已验证平台」表述）、崩溃注入点（需实现留钩子）、大小写敏感目录（`fsutil` 需管理员权限）。子模块已由用户实测，不再是未验证项。
 
 ## 成本与风险
 
@@ -514,14 +528,14 @@ CREATE TABLE files (
 
 ## 评审状态（R1–R7）
 
-**设计结论：R1–R7 全部通过复审。设计阶段结束。**
+**设计结论：R1–R7 全部通过复审；R1-a/R1-b 两条注记已被实测推翻并改写（修订 9），不影响 R1 其余结论。设计阶段结束，文档冻结，等用户做最终一致性检查。**
 **代码：尚未实现；运行测试：待实施。**
 
 | # | 评审问题 | 本稿处置 | 复审方 | 状态 |
 |---|---|---|---|---|
 | R1 | `cwd==teamFolder` 直接 `none`；Git 与标记物优先级；缓存冻结；Windows 大小写 | §1：先解析 Git/标记物，teamFolder 不再短路；Git 优先；`none/unresolved` 10s 过期；**不折叠大小写**，用 realpath 实际值 | 架构师 | **通过**（附 3 注记） |
-| R1-a | 标记物向上搜索无界，上层散落的 `package.json` 会误判 | §1 加界：遇 teamFolder 或盘根即停，最多 3 层；`.git` 不受此限 | 架构师 | 已收（本轮） |
-| R1-b | 子模块有 `commondir` 时归属未写明 | §1 明示：有 `commondir` 则归父仓库，子模块与父仓库同 id | 架构师 | 已收（本轮） |
+| R1-a | 标记物向上搜索无界，上层散落的 `package.json` 会误判 | §1：边界只用 teamFolder 祖先与盘根，**不设层数**（层数上限会把深层目录切成不同项目） | 架构师 | **已撤回并改写**（本轮） |
+| R1-b | 子模块归属 | **前一版结论是错的**：普通子模块没有 `commondir`，common dir 是 `parent/.git/modules/sub`。§1 改为「一律按实际 common dir 判定」：子模块独立、worktree 共享 | 架构师 | **已撤回并改写**（本轮） |
 | R1-c | 同步 `sectionFor` 拿不到 cwd（`resolveAgent` 是异步） | §1：Session 建立/换段时缓存 `sessionId → resolve(cwd)`，渲染读缓存 | 架构师 | 已收（本轮），仍需实现期验证 |
 | R2 | 快照只校验 `teamRule`；面板摘要按 bot 键 | §7：快照首行带版本+排序 scope 集合；摘要键加 scopeSetHash；异步回包比对后落地 | 架构师 | **通过**（附注记） |
 | R2-a | scope 标识不能替代原有 `teamRule`/角色校验 | §7 明写：两者任一不符都重建；旧无 v2 头快照视为过期 | 架构师 | 已收（本轮） |
@@ -561,6 +575,7 @@ CREATE TABLE files (
 - 2026-10-22（修订 3）：JiuwenSwarm 引用降级。
 - 2026-10-22（修订 4）：收回桌面探针授权阻塞，改运行时探测；面板显式项目上下文；幂等定死逐项恢复；补逐项关闭表。
 - 2026-10-22（修订 5）：按 R1–R7 全面修订——项目身份重写（Git 优先、teamFolder 不短路、大小写不折叠、缓存过期）；快照与面板摘要加 scope 版本；索引改为内容比对并删除两套派生状态；提取计划持久化与强杀恢复边界；候选绑定/重校验/全链路脱敏/WAITING 收窄/review 抢写约束；面板与 API 权限边界；查询语义七条。删除「对方没有实现」的断言，改为固定 commit 引用。**该轮评审未通过。**
-- 2026-10-22（修订 6）：收架构师 R1/R2 三条注记（标记物搜索加界、子模块归父仓库、同步 cwd 缓存）；收本轮补充检查点：R3 比较完整文件集合 + 队列边界一致视图 + 不断电原子承诺、R4 补回 candidateId 规则与 temp+rename/done 顺序/三项恢复核对/损坏隔离/冲突停止、R5 file 真实路径校验 + 换段后待答卡片 + unverified 不入库 + 失败根因不连带、R2 保留 teamRule 校验。新增 13 条验收用例（40–52）。**评审状态：R1/R2 已通过，R3–R7 待插件工程师与测试工程师交回。**
+- 2026-10-22（修订 6）：收架构师 R1/R2 三条注记（标记物搜索加界、子模块归属、同步 cwd 缓存；其中前两条在修订 9 被实测推翻并改写）；收本轮补充检查点：R3 比较完整文件集合 + 队列边界一致视图 + 不断电原子承诺、R4 补回 candidateId 规则与 temp+rename/done 顺序/三项恢复核对/损坏隔离/冲突停止、R5 file 真实路径校验 + 换段后待答卡片 + unverified 不入库 + 失败根因不连带、R2 保留 teamRule 校验。新增 13 条验收用例（40–52）。**评审状态：R1/R2 已通过，R3–R7 待插件工程师与测试工程师交回。**
 - 2026-10-22（修订 7）：收测试工程师 R5/R6/R7 复审。把「原文支持该主张」落成两道闸（evidence 逐字子串为机械闸、模型 yes/no 为可复核闸）；project 校验改为四种转移，`unresolved→ok` 重绑定不丢候选；补用例 53–60（evidence 伪造、闸二 no/yes、project 四种转移、`projectMemory:false`、扫描失败显式报错）；用例 17 明确「非空或显式报错，二者其一」。R1/R2/R5/R6/R7 通过，R3/R4 待交回。
-- 2026-10-22（修订 8，本稿）：收插件工程师 R3/R4 与运行时核实。①桌面端明确记为「未知」，不按可用设计（`lib/bin.js:36` 无 electron 依赖、本机无桌面安装），验收只写「探测失败不崩且回退」；②`realpathSync.native` 与非 native 行为不同的实测表；③`.git` 文件绝对/相对两种写法都要支持（git 2.55 实测为绝对路径）；④否掉「journal 钩子」备选并说明四个理由；⑤journal 只写不读，恢复要新写读端且跳过坏行；⑥五处硬编码 own+team 必须一起改；⑦`waitsWork` 命名与 `waitingView` 不适合当闸门，需新增 `pendingWorkOf`。新增用例 61–68。**R1–R7 全部通过，设计阶段结束。**
+- 2026-10-22（修订 8）：收插件工程师 R3/R4 与运行时核实。①桌面端明确记为「未知」，不按可用设计（`lib/bin.js:36` 无 electron 依赖、本机无桌面安装），验收只写「探测失败不崩且回退」；②`realpathSync.native` 与非 native 行为不同的实测表；③`.git` 文件绝对/相对两种写法都要支持（git 2.55 实测为绝对路径）；④否掉「journal 钩子」备选并说明四个理由；⑤journal 只写不读，恢复要新写读端且跳过坏行；⑥五处硬编码 own+team 必须一起改；⑦`waitsWork` 命名与 `waitingView` 不适合当闸门，需新增 `pendingWorkOf`。新增用例 61–68。
+- 2026-10-22（修订 9，本稿）：按用户原生 Git 实测撤回并改写两处 R1 注记。①**子模块判定错误**：普通子模块 `.git` 为 `gitdir: ../.git/modules/sub`，该 gitdir **没有 `commondir`**，其 common dir 就是 `parent/.git/modules/sub`，与父仓库 `parent/.git` 不同 → 子模块**独立**；改为「一律按实际 common dir 判定，不从 `modules/` 猜父仓库」。worktree 共享 common dir 的结论不变。②**删除「向上最多 3 层」这一无依据限制**，边界只保留 teamFolder 祖先与盘根，避免同一非 Git 项目的深层目录被切成不同项目。用例 61、69、70 相应改写，子模块不再是「未验证项」。
