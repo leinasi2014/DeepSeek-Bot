@@ -155,13 +155,21 @@ test('scope: the automatic review defaults to project and rejects unresolved', a
     return { ctx, home, rt }
   }
 
+  // Wait for the review to settle on its observable outcome — the memory file (or the
+  // journal record) — instead of a fixed sleep: the write lands slightly after the
+  // status turns idle, and a fixed 50 ms read races it (seen once as ENOENT).
+  const waitFor = async (fn, what) => {
+    for (let tries = 0; tries < 200 && !fn(); tries += 1) await new Promise(resolve => setTimeout(resolve, 20))
+    assert.ok(fn(), `the review did not settle: ${what}`)
+  }
+
   // A healthy project session: the review add lands in the project memory.
   {
     const s = startReview(scopeSessions.sA, [reply])
     t.after(async () => { await s.ctx.dispose(); rmSync(s.home, { recursive: true, force: true }) })
     s.ctx.emit('agent/status', { agent: { id: 'sA', session: scopeSessions.sA }, status: 'idle' })
-    await new Promise(resolve => setTimeout(resolve, 50))
     const alpha = s.rt.projectScope.resolve(scopeSessions.sA)
+    await waitFor(() => existsSync(join(s.home, 'memory', 'projects', alpha.hash, 'MEMORY.md')), 'the project entry never landed')
     assert.match(readFileSync(join(s.home, 'memory', 'projects', alpha.hash, 'MEMORY.md'), 'utf8'), /The deploy window is 8pm/)
     assert.equal(existsSync(join(s.home, 'memory', 'bots', 'b2')), false)
   }
@@ -171,7 +179,7 @@ test('scope: the automatic review defaults to project and rejects unresolved', a
     const s = startReview(brokenSession, [reply])
     t.after(async () => { await s.ctx.dispose(); rmSync(s.home, { recursive: true, force: true }) })
     s.ctx.emit('agent/status', { agent: { id: 'sBroken', session: brokenSession }, status: 'idle' })
-    await new Promise(resolve => setTimeout(resolve, 50))
+    await waitFor(() => existsSync(join(s.home, 'memory', 'journal.jsonl')) && /project-unresolved/.test(readFileSync(join(s.home, 'memory', 'journal.jsonl'), 'utf8')), 'the skip was never journaled')
     assert.equal(existsSync(join(s.home, 'memory', 'bots', 'b2')), false)
     const log = readFileSync(join(s.home, 'memory', 'journal.jsonl'), 'utf8')
     assert.match(log, /"reason":"project-unresolved"/)
@@ -186,7 +194,7 @@ test('scope: the automatic review defaults to project and rejects unresolved', a
     s.rt.isMain = () => false
     t.after(async () => { await s.ctx.dispose(); rmSync(s.home, { recursive: true, force: true }) })
     s.ctx.emit('agent/status', { agent: { id: 'sA', session: scopeSessions.sA }, status: 'idle' })
-    await new Promise(resolve => setTimeout(resolve, 50))
+    await waitFor(() => existsSync(join(s.home, 'memory', 'journal.jsonl')) && /team-write-denied/.test(readFileSync(join(s.home, 'memory', 'journal.jsonl'), 'utf8')), 'the refusal was never journaled')
     assert.equal(existsSync(join(s.home, 'memory', 'team')), false, 'team not written')
     assert.equal(existsSync(join(s.home, 'memory', 'bots', 'b2')), false, 'own not written')
     const alpha = s.rt.projectScope.resolve(scopeSessions.sA)
