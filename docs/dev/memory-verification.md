@@ -15,7 +15,7 @@
 | 项 | 状态 | 证据 | 备注 |
 |---|---|---|---|
 | 既有代码基线（未合并新功能时） | 实测 | `npm test` 727/727 | 只证明基线没坏 |
-| #52 单测与行为测试 | 实测 | **登记头 `edb6345`**（Chief 最终裁定的 #52 头，含 team 用例）：`memory-project.test.js` **8/8**、全量 **747/747 pass / 0 fail / 0 skip**（独立 detached worktree 复跑）。我另外实测 `27e599b`（架构师 revert 后的头）为 **746/746**、用例 7/7——少的那条正是被 revert 掉的 team 用例 | Chief 裁定 `edb6345` 为最终头；截至本表更新时，缓存的上游跟踪引用仍为 `ed06b97`（同样不含 team 修复、实测 746），需架构师把 `feat-52` 归位到 `edb6345` 才能落地。头链：`5542df2`→`edb6345`→`27e599b`→`e604034`→`4db72d4`→`49e9801`→`ed06b97` |
+| #52 单测与行为测试 | 实测 | **登记头 `edb6345`**（Chief 最终裁定的 #52 头，含 team 用例）：`memory-project.test.js` **8/8**、全量 **747/747 pass / 0 fail / 0 skip**。架构师本地最新头 `b6379c8`（revert 的 revert）我实测同为 **747/747、8/8**，且 `git diff --stat edb6345 b6379c8` **无任何差异**——文件树与登记头等价；`memory.js` 中 `team-write-denied` 命中 1 | 反之 `27e599b`（单次 revert 头）实测 **746/746**、用例 7/7，少的那条正是被撤掉的 team 用例，**不应作为合并基准**。头链：`5542df2`→`edb6345`→`27e599b`→`e604034`→`4db72d4`→`49e9801`→`ed06b97`→`b6379c8`。远端因网络不可达未能实时核对（`github.com:443` 连接超时），以本地实测与树比较为准 |
 | #53 接线后全量测试 | 实测 | `c0a3f11`（Chief 登记头）与恢复后的 `4b6f1eb`（`Restore the team-write refusal, which the maintainer kept in scope`）我都实测：均 **758/758 pass / 0 fail / 0 skip**；`build-client --check` 0、`lint` 0 | 两个头都含 team 修复；`2943fc2` 为接线提交（755） |
 | #54 接线后全量测试 | 实测 | `16ee6ae`（Chief 登记头）与恢复后的 `114a4a0`（`Merge the memory index branch with the team-write refusal restored`）均 **782/782 pass / 0 fail / 0 skip**。演进：761→762→773→776→779（`754ffb5` 三处补证：原始 cwd 冻结、相对 ref 走同一文件边界、`memory-task-reverify`）→782 | 两个头都含 team 修复；779→782 的 +3 来自并入 #53/#52 与一条 wiring 时序修复 |
 | `node:sqlite` + FTS5 trigram 在 Node 侧可用 | 实测 | 设计 §8 记录的探针：建表、长中文 MATCH、短中文 LIKE、scope 过滤均通过 | 只覆盖 Node/Web 侧 |
