@@ -21,7 +21,7 @@
 // model only, and never the real DSH_HOME.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -324,19 +324,13 @@ test('permissions: a junction inside the folder that leads outside is refused', 
   mkdirSync(outside, { recursive: true })
   mkdirSync(join(repo, '.git'), { recursive: true })
   writeFileSync(join(outside, 'notes.txt'), 'the suite passed: tests 12/12')
-  // A link named inside the working folder that points outside it. Windows serves a
-  // directory junction through cmd.exe; a POSIX runner has symlinks, which is the same
-  // escape once the real path is resolved. Both are refused for the same reason, so the
-  // assertion below is about the rule, not about the platform's flavour of link.
-  const junction = join(work, 'link')
-  if (process.platform === 'win32') {
-    const { execFileSync } = await import('node:child_process')
-    execFileSync('cmd.exe', ['/c', 'mklink', '/J', junction, outside])
-  } else {
-    const { symlinkSync } = await import('node:fs')
-    symlinkSync(outside, junction, 'dir')
-  }
   t.after(() => { rmSync(repo, { recursive: true, force: true, maxRetries: 5 }) })
+  // A link named inside the working folder that points outside it. Node can make both
+  // kinds itself, so the case needs no shell: a directory junction on Windows, a
+  // directory symlink elsewhere. Both are the same escape once the real path resolves,
+  // so the assertions below are about the rule, not the platform's flavour of link.
+  const junction = join(work, 'link')
+  symlinkSync(outside, junction, process.platform === 'win32' ? 'junction' : 'dir')
   const s = startTask({ cwd: work, items: [{ claim: 0, topic: '', text: '穿链接的证据', outcome: 'verified' }], support: ['yes'] })
   t.after(() => s.stop())
   const claim = { kind: 'file', statement: '测试通过', evidence: 'tests 12/12', ref: 'link/notes.txt' }
