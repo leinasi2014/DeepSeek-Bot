@@ -1676,3 +1676,39 @@ test('giving up a semantically invalid batch continues with the remaining new li
   assert.equal(JSON.parse(read('reviewed.json'))['chat:b2'], 27)
   assert.equal(JSON.parse(read('rejections.json'))['chat:b2'], undefined)
 })
+
+test('a failed skip cursor write waits for another turn before retrying the batch', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-'))
+  mkdirSync(join(home, 'memory'), { recursive: true })
+  const cursorPath = join(home, 'memory', 'reviewed.json')
+  writeFileSync(cursorPath, JSON.stringify({ 'chat:b2': 19 }))
+  const notes = Array.from({ length: 8 }, (_, at) => ({ event: { seq: 20 + at, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: `Note ${at + 1} ${'x'.repeat(2480)}` }] } } }))
+  const bad = JSON.stringify({ changes: [{ op: 'remove', entry: 999 }] })
+  // If the failed cursor write requeues the same batch, these spare answers let it
+  // settle, and the model-call count proves the extra background requests happened.
+  const { ctx, call, read, requests, journal, stop } = start({ home, replies: [bad, bad, bad, bad, JSON.stringify({ changes: [] })], history: { b2: notes }, config: { memoryReviewDelayMs: 0 } })
+  t.after(() => stop())
+  await call('state', {})
+  for (let at = 0; at < 3; at += 1) {
+    if (at === 2) {
+      rmSync(cursorPath)
+      mkdirSync(cursorPath)
+    }
+    ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'working' })
+    ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
+    await reviewed(call)
+  }
+  assert.equal(requests.length, 3, 'a failed cursor replacement must not start another model request')
+  assert.deepEqual(JSON.parse(read('rejections.json'))['chat:b2'], { count: 3, at: 19 })
+  assert.equal(journal().filter(entry => entry.reason === 'invalid-review').length, 1, 'the same failed skip is not journaled again in the background')
+  rmSync(cursorPath, { recursive: true })
+  writeFileSync(cursorPath, JSON.stringify({ 'chat:b2': 19 }))
+  ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'working' })
+  ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
+  await reviewed(call)
+  assert.equal(requests.length, 5, 'an external turn retries the blocked batch, then the remaining lines continue')
+  assert.match(requests[3].messages[0].content[0].text, /oldest first \(newer messages come in the next review\):\nUser: Note 1 /)
+  assert.match(requests[4].messages[0].content[0].text, /oldest first:\nUser: Note 7 /)
+  assert.equal(JSON.parse(read('reviewed.json'))['chat:b2'], 27)
+  assert.equal(JSON.parse(read('rejections.json'))['chat:b2'], undefined)
+})

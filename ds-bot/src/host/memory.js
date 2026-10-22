@@ -1573,15 +1573,13 @@ export function install(rt) {
             // Only a batch that was cut short is marked as such.
             ...(more ? { truncated: true } : {}),
           })
-          // The cursor first: if that write fails the counter stays, so the next review
-          // starts from the same place instead of silently skipping lines nobody read.
-          // Hand the rest over before anything below can fail: a failed write must not
-          // leave the remaining lines unread for good.
-          if (more) queueReview(sessionId, room === undefined ? seen : { botId: bot.id, roomId: room.id, room })
           // Disk first, then memory: if the write fails, memory keeps the old cursor and the
-          // batch is retried rather than skipped in name only.
+          // batch waits for another turn rather than requeueing itself without progress.
           await writeText(cursorsPath, JSON.stringify({ ...cursorsNow(), [key]: through }))
           cursorsNow()[key] = through
+          // The rest is safe to queue now. Do it before clearing the refusal count, so
+          // failure to clear that count cannot leave the remaining lines unread.
+          if (more) queueReview(sessionId, room === undefined ? seen : { botId: bot.id, roomId: room.id, room })
           try {
             delete rejections[key]
             await saveRejections(rejections)
