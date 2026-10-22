@@ -26,7 +26,8 @@
 - 从会话工作目录向上找 `.git`。
 - `.git` 是目录：该目录即仓库元数据目录。
 - `.git` 是文件：读取首行 `gitdir: <path>`，相对路径相对于 `.git` 文件所在目录解析；再读 `<gitdir>/commondir`（内容通常为 `../..`，相对 `<gitdir>` 解析），得到 **common dir**。
-- 项目 id = `proj:` + `sha256(规范化后的 common dir)` 前 16 位；`win32` 上先转小写。
+- 项目 **hash** = `sha256(规范化后的 common dir)` 前 16 位（小写 hex）；`win32` 上规范化时先转小写。目录名用它。
+- **scope key** = `project:<hash>`，只出现在 journal 与索引的 `scope` 列，不用于文件名（Windows 目录名不允许冒号）。
 
 主仓库与它的所有 worktree 因此得到同一个 id。已实测：worktree 的 `.git` 文件为 `gitdir: D:/.../main/.git/worktrees/wt`，`<gitdir>/commondir` 为 `../..`，`git rev-parse --git-common-dir` 返回主仓库 `.git`。
 
@@ -41,17 +42,29 @@
 - 仅在 `process.platform === 'win32'` 时把 realpath 结果转小写再取 hash；不做文件系统大小写探测，不做路径前缀替换。其他平台原样。
 - 适用范围写进注释与单测：两种大小写写法必须得到同一 id。
 
-**同步解析**
+**单一规范化规则：只有一个函数，读数与写数都调它**
 
-提示词 section 是同步的（`dsh-system-prompt/lib/types/index.d.ts:60`：`text: string | ((context) => string)`），所以项目身份必须能同步取到：
+提示词 section 是同步的（`dsh-system-prompt/lib/types/index.d.ts:60`：`text: string | ((context) => string)`），所以项目身份必须能同步取到。做法是**把整条链路做成同步**，不给读写留两套算法：
 
-- `resolveSync(sessionId)`：`ctx.sessions.get(sessionId)?.header?.cwd`（`dsh-session/lib/types/index.d.ts:447`；`session.header` 始终存在，同文件 `:116-119`）。
-- 异步 realpath 只用于**写入时**校正与 `projects.json` 更新。
-- 同步解析失败一律按「无项目」处理，不阻塞提示词渲染、不报错。
+```
+resolve(cwd) -> { status: 'ok', id, root } | { status: 'none' } | { status: 'unresolved', reason }
+```
+
+1. 取 cwd：`ctx.sessions.get(sessionId)?.header?.cwd`（`dsh-session/lib/types/index.d.ts:447`；`session.header` 始终存在，同文件 `:116-119`）。
+2. `realpathSync.native(cwd)`；`win32` 上再 `toLowerCase()`。**realpath 与大小写只在这里做一次**，之后不再出现第二种写法。
+3. 向上找 `.git` 或标记物（全同步：`statSync`/`readFileSync`/`readdirSync`）。
+4. 得到 `root` 后再 `realpathSync.native(root)`、`win32` 小写，取 `sha256` 前 16 位为 `id`。
+5. 结果按 `cwd` 字符串缓存（进程内 Map，含 `status`），失效只在 cwd 变化时发生。
+
+- 读数（提示词）与写数（`remember`、自动 review、面板）调的是**同一个函数**，不存在「读按 cwd hash、写按 commonDir 校正」的第二条路径。
+- `none`：cwd 等于团队工作区目录（`folders.js:23` 的 `teamFolder()`），即没有专属工作文件夹的会话。这类会话没有项目范围。
+- `unresolved`：cwd 缺失、不可读，或 `.git` 解析失败。**此时不把项目内容默认写进全局 own**：`remember` / `move` / `forget` 的隐式 project 目标一律拒绝并说明「这个会话的项目无法识别，请显式给出 scope 或检查工作文件夹」；`recall` 仍可读 own + team。提示词 section 遇到 `unresolved` 只渲染 own + team，不报错。
+
+**`.git` 文件没有 commondir 时**（子模块、`git init --separate-git-dir` 等）：直接用 `gitdir` 指向的目录作为根，不再向上读 `commondir`。判定顺序固定为：`.git` 是目录 → 用它；`.git` 是文件 → 解析 `gitdir:` → **有 `commondir` 就用它，没有就用 `gitdir`**。
 
 **搬动与重命名**
 
-- `projects.json` 只记录 `id → 明文路径 + 最后确认时间`，不参与判定。
+- `projects.json` 只记录 `project:<hash> → 明文路径 + 最后确认时间`，不参与判定。
 - 路径变了就是新 id，新项目记忆从空开始。
 - 同一团队已存在 **basename 相同**的旧路径时，提示一次「复用旧记忆 / 新建」，由用户选择。
 - **不自动合并**。basename 相同只作提示线索，不构成同一项目的证明。
@@ -67,6 +80,23 @@
 - Main Bot 的跨 Bot 读写权限**不延伸到项目记忆**：项目记忆的边界是项目，不是 Bot。这样「一个插件的约定串进另一个插件」在读写两侧都不可能发生。
 - 默认检索范围：有项目时为 `own + project + team`；无项目时仍为 `own + team`。
 - 有项目时，`remember` 的**默认写入目标改为 project**；`own` 留给跨项目的个人偏好，`team` 留给团队通用。提示词规则同步修改。
+
+**所有第一方写入都必须显式携带 project，不能只靠默认参数**
+
+改 `remember` 的默认值和提示词**不足以**隔离：现有还有两条自动写 own / team 的路径，实测行号如下。
+
+| 写入路径 | 现有代码 | 现状 | 本项目要求 |
+|---|---|---|---|
+| `remember` / `forget` / `move` | `memory.js:949/985/1008` | 工具参数决定 scope | 有项目时缺省=project；显式 `own`/`team` 仍可用 |
+| 按回合的自动 review | `memory.js:1417`：`const scope = op === 'add' ? (change.team === true && teamWrites ? TEAM : ownScope(bot.id)) : …` | **`ownScope(bot.id)` 是从这里硬编码的**，不看项目 | 该 Session 有项目且 `change.team !== true` 时写 project；`change.team === true` 仍是 team |
+| 记忆面板「问或更新」 | `memory.js:1259`：同一个硬编码 `ownScope(bot.id)` | 同上 | 面板按**当前 Bot 打开的那个会话**解析项目；无明确会话时不写 project，只写 own/team |
+| 面板单条删除 | `memory.js:1290`：`body.scope === 'team' ? TEAM : ownScope(bot.id)` | 只认两值 | 增加 `'project'`，且只能删该会话所属项目 |
+| 删 Bot 归档 | `memory.js:786-803`，`rename` 走 `projects/` 下需一并处理 | 只归档 own | 归档 own；项目记忆**不随 Bot 删除**，属项目 |
+
+约束落点：把 scope 决定收成**一个函数** `writeScopeOf(sessionId, requested)`，上述四条路径全部调用它，不再各自拼 `ownScope(bot.id)`。这样「所有第一方写入」只有一个判定点，可被单测穷举。
+
+- Main Bot 的跨 Bot 读写权限**不延伸到项目记忆**：项目记忆的边界是项目，不是 Bot。这样「一个插件的约定串进另一个插件」在读写两侧都不可能发生。
+- **「不串项目」的保证只覆盖新写入**：历史 own/team 中的项目内容不会被自动隔离，见「已知限制」。
 
 ### 3. 任务完成与经验复盘
 
@@ -86,7 +116,7 @@
 - 参数：`result`（一句话结果）、`claims[]`（每条含 `kind`、`ref`、`statement`）、可选 `notes`。
 - `kind`：`answer`（纯问答、设计结论）、`file`、`command`、`test`、`user`（用户原话）。
 - 调用即写 journal `op:'task-candidate'`，**当轮不写任何记忆**。
-- 候选 id = `sessionId + callId`（`exec.callId` 在 `dsh-tools/lib/types/index.d.ts:217` 为只读必填），重启、换段、重试均不变。
+- 候选 id = `sessionId + callId`（`exec.callId` 在 `dsh-tools/lib/types/index.d.ts:217` 为只读必填）。它只覆盖**同一次工具调用的重放**：同一 turn 内的重试、进程重启后重放同一份日志，id 不变。**换段后 Bot 重新调用 `complete_task` 会拿到新的 `callId`，id 就变了**，此时靠内容去重（见下）。
 
 **证据只看日志，不看模型自报**
 
@@ -120,35 +150,58 @@ PENDING --证据成立--> WRITTEN
 - 语义无效复用现有量级：`memory.js:52` 的 `REJECTIONS_MAX = 3`。
 - 不新建任务引擎：没有任务列表、状态面板、跨会话推进。
 
-**幂等**
+**幂等：按「候选 + 条目」定位，不按「候选」整条跳过**
 
-- 写入条目时，journal 记录带 `candidate: <id>`。
-- 恢复判据：**journal 中已有该候选的条目写入记录，即视为已入库**（`commit` 先改文件并追加 journal，二者同一次提交），补写 `reviewed` 标记即可；没有记录则重做。
-- 因此「写记忆成功、写标记前崩溃」不会重复写入；「标记写了但条目没写」不可能出现，因为标记只在条目提交之后写。
-- 同一任务重复提交：候选 id 相同直接跳过；不同 id 但内容相同，由现有 `matchEntries` 整句比对返回 `changed:false`（`memory.js:646-647`）兜底。
+一条候选可以有多条 claims，每条落成一个条目。若只用 candidate id 判「已入库」，写完第一条就崩溃时，恢复会因「这个 candidate 已有记录」而跳过剩下的条目——**必须按条目定位**。
+
+- 条目稳定标识 = `entryId = sha256(candidateId + claimIndex)` 前 16 位，写进 journal 的 `op:'task-review'` 记录。
+- 恢复时逐条比对：**该 `entryId` 已有写入记录** → 跳过该条；没有 → 写入。因此崩溃在任何一条之后都能继续，不会重复也不会漏。
+- 另一个解法是整批原子提交（`memory-files.js:73` 的 `commit(changes[], record)` 本来就接受多个 change，一次 journal 记录）。**推荐用批量提交**：候选的全部条目放在同一次 `commit` 里，天然原子，`entryId` 只作校验用。两种都行，实现选一种并在代码注释里写明。
+- **二次提交去重边界**：`sessionId + callId` 只能覆盖**同一次工具调用的重放**（同一 turn 内重试、进程重启后重放日志）。换段后 Bot 重新调用 `complete_task` 会得到新的 `callId`，候选 id 不同——这段去重靠内容：现有 `matchEntries` 整句比对在 `memory.js:646-647` 返回 `changed:false`，不会写出第二条同文条目。**但同义不同措辞的重复提交不会被发现**，这是明确边界，不承诺。为避免这类重复，提醒提示词：同一任务只调用一次 `complete_task`。
 
 ### 4. 存储与数据模型
 
+**根目录**：`ds-bot/index.js:52` 是 `const home = config.home ?? join(dshHome, 'bot')`，`memory.js:504` 是 `const root = join(home, 'memory')`。所以记忆根是 **`<botHome>/memory`**，默认 **`<DSH_HOME>/bot/memory`**（`config.home` 可覆盖 `bot` 这一层）。
+
+**scope key 与目录名分开**
+
+`proj:<hash>` 只作 **scope key**（写进 journal、索引 `scope` 列）。目录名用**纯 hash**，因为 Windows 目录名不允许冒号：
+
 ```
-<DSH_HOME>/memory/
-  bots/<botId>/MEMORY.md + <topic>.md     现有，不动
-  team/MEMORY.md + <topic>.md             现有，不动
-  projects/<projectId>/MEMORY.md + <topic>.md   新增，结构与上面同构
-  journal.jsonl                            现有；新增 op: task-candidate / task-review
-  snapshots/                               现有，按 Session 冻结
-  reviewed.json / rejections.json          现有
-  projects.json                            新增：id → 明文路径
-  index.sqlite                             新增：可重建的派生索引
-  index-dirty.json                         新增：待刷新范围（持久化）
+<botHome>/memory/
+  bots/<botId>/MEMORY.md + <topic>.md        现有，不动
+  team/MEMORY.md + <topic>.md                现有，不动
+  projects/<hash>/MEMORY.md + <topic>.md     新增，结构同构；<hash> 为 16 位 hex，无冒号
+  journal.jsonl                              现有；新增 op: task-candidate / task-review
+  snapshots/                                 现有，按 Session 冻结
+  reviewed.json / rejections.json             现有
+  projects.json                              新增：project:<hash> → 明文路径
+  index.sqlite                               新增：可重建的派生索引
+  index-dirty.json                           新增：待刷新范围（持久化）
+  index-hashes.json                          新增：文件内容哈希（见第 5 节）
 ```
 
-索引表：
+`dirOf(scope)` 对 project 分支拼 `projects/<hash>`，`scopeKey(scope)` 返回 `project:<hash>`。两者由同一个 `hash` 派生，不存在第二种写法。
+
+**索引表（含排序所需字段）**
 
 ```sql
-CREATE VIRTUAL TABLE entries USING fts5(text, scope UNINDEXED, file UNINDEXED, line UNINDEXED, tokenize='trigram');
-CREATE TABLE files (scope TEXT, file TEXT, mtime REAL, size INTEGER, PRIMARY KEY (scope, file));
+CREATE VIRTUAL TABLE entries USING fts5(
+  text,                       -- 条目正文，检索对象
+  scope UNINDEXED,            -- scope key：bot:<id> / team / project:<hash>
+  file UNINDEXED,             -- 相对 root 的文件路径
+  line UNINDEXED,             -- 在该文件中的行号，用于回读校验
+  added UNINDEXED,            -- 条目元数据里的 added 日期，排序用
+  tokenize = 'trigram'
+);
+CREATE TABLE files (
+  scope TEXT, file TEXT,
+  mtime REAL, size INTEGER,   -- 辅助信号，不作唯一依据
+  PRIMARY KEY (scope, file)
+);
 ```
 
+- `added` 进 `entries` 是因为排序规则里有「同分按 added 新到旧」；没有这一列，排序要在内存里补取，等于每查一次多读一遍文件。
 - `trigram` 分词：中文三字以上无需切词；两字以下回退 `LIKE`（照 `chat-index.js:23-42` 的手法）。
 - 权限过滤在 SQL 层：`scope IN (<本次白名单>)` 先过滤再 `MATCH`。白名单由调用方传入，索引内容不参与权限判断。
 - 排序只有两条：`rank`（BM25），同分按 `own > project > team`，再按 `added` 新到旧。不预置短语加权，等测试数据说话。
@@ -160,7 +213,7 @@ CREATE TABLE files (scope TEXT, file TEXT, mtime REAL, size INTEGER, PRIMARY KEY
 - **旁路也要标脏**：`archiveBotMemory`（`memory.js:800`）走 `rename`，必须单独标脏并删除该 scope 的索引行。
 - **刷新时机**：每次 `recall` 前先 flush `dirty`：重扫这些文件的**全部行**，不是只补命中项——否则「新增条目」和「改写后命中查询词」都会漏。
 - **删除兜底**：查询命中后对命中文件做存在性检查，文件已不存在则丢弃该批行并标脏。
-- **启动时**：索引缺失或版本不符则全量重建；随后对全部记忆文件做一次**内容哈希比对**（约 40 个不超过 16k 的文件，毫秒级），覆盖「运行期外被改写」。
+- **启动时**：索引缺失或版本不符则全量重建；随后对全部记忆文件各算一次内容哈希，与 `index-hashes.json` 比对，覆盖「运行期外被改写」。哈希存 `index-hashes.json`（`{ "scope|file": "sha256" }`），和索引一起可删可重建。这里没有性能断言：文件数上限是每 scope 40 个主题（`memory.js:37` `topics: 40`，`memory.js:652` 按 scope 判），加上 `MEMORY.md`，成本随 scope 数线性增长，实现时按实际规模测。
 - **运行期手工改写**：`mtime + size` 无法可靠发现同大小同时间戳的改写。**明确提供显式重建**（记忆面板的「重建索引」或对应端点），并在已知限制中写明。这是本设计的已知缺口，不用轮询伪装成已解决。
 - **索引更新失败**：该 scope 标脏并**整体回退到扫 Markdown**（现有 `recall` 逻辑，`memory.js:1092-1105`），下次再试。绝不返回半新半旧的结果。
 
@@ -225,7 +278,7 @@ CREATE TABLE files (scope TEXT, file TEXT, mtime REAL, size INTEGER, PRIMARY KEY
 | # | 用例 | 断言 |
 |---|---|---|
 | 1 | 项目 A 写入，项目 B 会话 `recall` 全量列举 | 零 A 条目；SQL 白名单外不可见 |
-| 2 | 同仓库两个 worktree 各写一条 | 落在同一 `projects/<id>`；相互可见 |
+| 2 | 同仓库两个 worktree 各写一条 | 落在同一 `projects/<hash>`；相互可见 |
 | 3 | 非 Git 目录两层子目录 | 最近标记物那层为根，不与父项目合并 |
 | 4 | win32 两种大小写路径 | 同一 id |
 | 5 | 中文两字词、三字以上词、英文单词 | 均召回；一字词走 `LIKE` 不报错 |
@@ -238,10 +291,16 @@ CREATE TABLE files (scope TEXT, file TEXT, mtime REAL, size INTEGER, PRIMARY KEY
 | 12 | 工具成功但输出显示测试失败（`isError === false`） | **不判 verified**；无其他证据则保持候选 |
 | 13 | 纯问答任务，用户消息确认决定 | 以用户锚点为证据记 `verified`，不强制命令 |
 | 14 | 候选跨段引用 `part N #seq` | 经 `partsOf` 映射后可解析；不存在则 `INVALID` |
-| 15 | 写记忆成功后、写标记前崩溃，重启再提交同候选 | journal 中该候选条目恰一条 |
-| 16 | 子任务未回 / 问题待答 | `WAITING`，不计数、不丢弃；子任务交回后继续 |
-| 17 | 三次语义无效 | `SKIPPED`，journal 带全文，可人工补记 |
-| 18 | 密钥形态文本 | 永不入库（复用 `looksSecret`） |
+| 15 | 一条候选含 3 条 claims，写完第 1 条后崩溃，重启恢复 | 第 2、3 条仍被写入；每条恰好一次 |
+| 16 | 同一 `callId` 重放（进程重启后重放日志） | 不重复写入 |
+| 17 | 换段后 Bot 再次调用 `complete_task`，内容与上次逐字相同 | 靠 `matchEntries` 整句比对不写第二条；**措辞不同则不保证**，用例只断言逐字相同的情形 |
+| 18 | 子任务未回 / 问题待答 | `WAITING`，不计数、不丢弃；子任务交回后继续 |
+| 19 | 三次语义无效 | `SKIPPED`，journal 带全文，可人工补记 |
+| 20 | 密钥形态文本 | 永不入库（复用 `looksSecret`） |
+| 21 | 自动 review（`memory.js:1417` 路径）在有项目的会话里运行 | 写入落在 project，不落 own |
+| 22 | 面板「问或更新」（`memory.js:1259` 路径）在有项目的会话里运行 | 写入落在 project；无明确会话时不写 project |
+| 23 | 删 Bot 归档（`memory.js:800` 的 `rename` 旁路） | project 记忆不受影响；索引对应 scope 被标脏 |
+| 24 | 项目会话里 `.git` 解析失败 | 隐式 project 写入被拒绝并给出提示，不落 own |
 
 无法在现阶段验证的：桌面端 `node:sqlite`（用例 8/9 的桌面形态）、崩溃注入点（需实现留钩子）、win32 大小写（可单测，实现期做）。
 
@@ -266,17 +325,39 @@ CREATE TABLE files (scope TEXT, file TEXT, mtime REAL, size INTEGER, PRIMARY KEY
 ## 尚未解决 / 未完成
 
 1. **桌面 Electron 端 `node:sqlite`**：`chat-index.js:76`、`usage.js:241` 只证明了 Node/Web 侧；当前 `dev` 无 `app/` 目录（`git ls-tree -d dev` 仅 `.agents/.github/docker/docs/ds-bot/scripts`），无法查 Electron 版本。列为阻塞前提。
-2. **资料员核实未完成**：JiuwenSwarm 本地无克隆，模型侧遇 429 限流。本设计不依赖其结论：只借鉴方向性思路（以仓库/目录为项目边界、任务经验复盘），未复制其代码或文本；待其恢复后补出处与「已实现 / 文档描述」的区分。
-3. **插件工程师核实未完成**：429 中断；已核部分由 Chief 复核并写入本稿（`waits` 参数是 work id、`state.questions` 以 Session id 为键、`commit` 是唯一写漏斗）。
+2. **资料员核实未完成**：本地无 JiuwenSwarm 克隆，模型侧遇 429 限流；后经远端抓取已拿到部分原文（见下），但**出处与「已实现 / 文档描述」的逐条区分尚未交回**。本设计不依赖其结论：只借鉴方向性思路（以仓库/目录为项目边界、任务经验复盘），未复制其代码或文本。
+3. **插件工程师核实未完成**：429 中断，未交完整报告。已由 Chief 复核并写入本稿的部分：`waits` 参数是 work id 而非 Bot id、`state.questions` 以 Session id 为键、`commit` 是唯一写漏斗、`archiveBotMemory` 走 `rename` 旁路、worktree 的 `.git`/`commondir` 实测格式。
 4. **测试注入点**：需在实现中预留，属实现验收项。
+5. **面板写入的 project 归属**：面板以「某个 Bot」为操作对象，而项目身份属于会话。本稿规定「按当前打开的会话解析项目，无明确会话时不写 project」，**这条是设计选择、尚未经过实现验证**，列为评审待确认项。
+6. **批量提交 vs 逐条恢复**：第 3 节给了两种幂等实现（整批 `commit` 原子提交 / 按 `entryId` 逐条恢复），未定选哪一个，属实现期决策。
+
+## 评审状态
+
+**本次评审未全部通过。** 以下问题在本次修订中已解决，可按「已解决」计：
+
+| 问题 | 处理 |
+|---|---|
+| 存储根写成 `<DSH_HOME>/memory` | 改为 `<botHome>/memory`，默认 `<DSH_HOME>/bot/memory`（`index.js:52` + `memory.js:504`） |
+| 目录名用 `proj:<hash>`（Windows 非法） | scope key 用 `project:<hash>`，目录用纯 16 位 hex |
+| 同步与异步两套算法 | 合并为单一 `resolve(cwd)` 同步函数，读写同一入口 |
+| `.git` 文件无 `commondir` | 回落用 `gitdir` 本身 |
+| 自动 review / 面板绕过隔离 | 新增 `writeScopeOf(sessionId, requested)` 单一判定点，`memory.js:1259/1290/1417` 全部改走它 |
+| 多 claims 崩溃后漏写 | 按 `entryId = hash(candidateId + claimIndex)` 逐条恢复，或整批原子提交 |
+| `sessionId + callId` 的保证过强 | 限定为「同一次工具调用重放」，换段重调靠内容去重，并写明同义不同措辞的边界 |
+| 索引缺 `added` 字段 | 已补进 `entries` 表 |
+| 内容哈希无存放位置 | 已指定 `index-hashes.json` |
+| 「40 个主题 / 毫秒级」表述不准 | 40 是每 scope 上限（`memory.js:37/652`）；删除未测量的性能断言 |
+
+**仍未通过、需后续处理的**：桌面端 sqlite 可用性（P0 阻塞）、面板 project 归属规则（第 5 条）、幂等实现二选一（第 6 条）、资料员与工程师的完整核实报告。
 
 ## 评审结论（四角色）
 
 - **架构师**：给出 V2 总体设计（三文件、三态状态机、scope 白名单、快照冻结共存）。Chief 采纳其模块划分与状态机，修正其证据闸（不再四条件 AND）、`waits` 签名、索引失效方式、非 Git 根判定。
 - **插件工程师**：核实到源码级并实测了 worktree 的 `.git`/`commondir` 格式；429 中断，未交完整报告；关键结论由 Chief 复核补入。
-- **测试工程师**：提出 T1–T5 与崩溃注入方案，指出 `isError` 与 `exitCode` 的判定缺口；按用户最后一条纠正后，本稿改为**按主张逐条判定**（见第 3 节表格）。
+- **测试工程师**：提出 T1–T5 与崩溃注入方案，指出 `isError` 与 `exitCode` 的判定缺口；按后续纠正，本稿改为**按主张逐条判定**（见第 3 节表格）。其 T2/T5 已被证伪并替换。
 - **资料员**：未完成（见「尚未解决」第 2 条）。
 
 ## 变更
 
 - 2026-10-22：初稿。按最终口径删除全部向量/embedding 内容；完成判定改为显式候选 + 按主张的证据核验；索引一致性改为已提交视图 + 写入漏斗标脏 + 显式重建。
+- 2026-10-22（修订 2）：按评审意见修正存储根、目录名、单一规范化算法、`.git` 无 `commondir` 的回落、第一方写入的 project 传递、多 claims 幂等、索引字段与哈希位置；删除未测量的性能断言；新增「评审状态」一节，明确本次评审**未全部通过**。
