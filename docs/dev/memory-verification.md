@@ -24,6 +24,8 @@
 | 同大小同 mtime 的手工改写可被发现 | 推断 | 设计 §4 规定以内容 hash 为唯一新鲜度依据，不用 mtime/size | 待 #53 用例实测 |
 | 归档后清理死 scope 的索引行 | 推断 | #53 实现里有显式回收，见 `memory-index.js` 与归档调用点 | 待用例实测 |
 | 强杀后逐项续写、每条恰好一次 | 推断 | 设计 §6 的逐项状态机与固定 `review_id` | 待 #54 故障注入实测 |
+| 项目无法判定时不落 own（工具路径） | 实测 | #52 的 `memory-project.test.js`：unresolved 拒绝隐式写入 | 见 #52 分支 |
+| 项目无法判定时不落 own（自动复盘路径） | **待修复** | 审查发现 `applyReview` 在 `projectOf().status !== 'ok'` 时落 `ownScope(bot.id)`，unresolved 也会走到这里，与设计 §2 不符 | 架构师在 #52 修：skip + journal，补 broken gitdir 回归；修复前不得合并 PR #57 |
 
 **结论：上表中「实测」的项只覆盖测试套件与静态检查；新功能的隔离 smoke、UI 截图、桌面端探针都还没有跑。不要把本文件的 755/755 读成新功能验收通过。**
 
