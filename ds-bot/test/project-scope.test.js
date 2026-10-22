@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { after, test } from 'node:test'
@@ -14,6 +14,11 @@ const folder = (name) => {
   mkdirSync(path, { recursive: true })
   return path
 }
+// The resolver returns native real paths, so every expected path goes through
+// the same view before they are compared: a symlinked temp folder (some Linux
+// runners) or an 8.3 short name (Windows) would otherwise make a correct
+// answer look wrong.
+const real = path => realpathSync.native(path)
 const file = (path, text) => {
   mkdirSync(dirname(path), { recursive: true })
   writeFileSync(path, text)
@@ -100,7 +105,7 @@ test('the team workspace with nothing in it is no project; a folder of its own i
   const found = resolve(notes)
   assert.equal(found.status, 'ok')
   assert.equal(found.kind, 'self')
-  assert.equal(found.root, notes)
+  assert.equal(found.root, real(notes))
 })
 
 test('the team workspace that is a repository is a project', () => {
@@ -119,18 +124,26 @@ test('a marker above the team folder does not swallow folders below it', () => {
   file(join(team, 'project-a', 'package.json'), '{}')
   const resolve = makeResolver({ teamFolder: () => team }).resolve
   const other = folder(join('team-marked', 'project-b'))
-  assert.equal(resolve(other).root, other)
+  assert.equal(resolve(other).root, real(other))
 })
 
 test('a missing folder is unresolved and the case of a folder is the case on disk', () => {
   const resolve = makeResolver().resolve
   assert.equal(resolve(join(temp, 'not-there')).status, 'unresolved')
   const lower = folder('casetest')
-  // On a case-insensitive filesystem both spellings reach the folder; the answer
-  // is the name it was created with, and one hash for both.
+  // A case-insensitive filesystem (Windows, macOS) answers both spellings with
+  // the name on disk, so both are one project; a case-sensitive one (Linux CI)
+  // answers that the other spelling is not there. Both keep the real case,
+  // each in its own way, so the assertion follows the filesystem at hand.
   const upper = join(dirname(lower), 'CASETEST')
-  assert.equal(resolve(upper).root, lower)
-  assert.equal(resolve(upper).root, resolve(lower).root)
+  if (existsSync(upper)) {
+    assert.equal(resolve(upper).root, real(lower))
+    assert.equal(resolve(upper).root, resolve(lower).root)
+  } else {
+    assert.equal(resolve(upper).status, 'unresolved')
+    assert.equal(resolve(lower).root, real(lower))
+    assert.equal(resolve(lower).root, resolve(lower).root)
+  }
 })
 
 test('answers expire, so a folder that gains a repository is found again', () => {
