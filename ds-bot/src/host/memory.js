@@ -2324,7 +2324,28 @@ export function install(rt) {
     const kept = []
     retryable.forEach((entry, index) => {
       if (support[index] === 'yes') {
-        accepted.push({ scope: scopeKey(taskScopeOf(record)), claim: entry.claim, topic: entry.topic ?? '', text: entry.text, outcome: entry.outcome === 'failed' ? 'failed' : 'verified', evidence: entry.evidence })
+        const outcome = entry.outcome === 'failed' ? 'failed' : 'verified'
+        // The same metadata the extraction writes, because this entry reaches the
+        // Markdown through the same freeze: without `source`, `outcome` and `added` a
+        // re-verified lesson would be indistinguishable from an anonymous one. The date
+        // is taken here, once, and frozen with the plan; apply never recomputes it.
+        const source = String(entry.source ?? record.claims?.[entry.claim]?.ref ?? 'the conversation')
+        accepted.push({
+          scope: scopeKey(taskScopeOf(record)),
+          claim: entry.claim,
+          topic: entry.topic ?? '',
+          text: entry.text,
+          outcome,
+          source,
+          meta: {
+            kind: 'howto',
+            claim: entry.claim,
+            evidence: String(entry.evidence ?? '').slice(0, 200),
+            source: source.slice(0, 200),
+            outcome,
+            added: today(),
+          },
+        })
       } else {
         kept.push(entry)
       }
@@ -2334,12 +2355,26 @@ export function install(rt) {
       await taskReview.save(record)
       return { ok: true, status: record.status, rechecked: 0 }
     }
-    // Frozen from what was already stored: no extraction, no new wording.
-    record.plan = taskReview.freeze(record, accepted)
+    // Frozen from what was already stored: no extraction, no new wording. The limits run
+    // once more over what will actually be written, exactly as on the extract path; a
+    // lesson that fails here is kept as an `unverified` record, never written.
+    const frozen = taskReview.freeze(record, accepted)
+    if (frozen.refused.length > 0) {
+      record.unverified = [...record.unverified, ...frozen.refused].slice(0, TASK_CLAIMS_MAX * 2)
+    }
+    if (frozen.items.length === 0) {
+      // Nothing survived: an empty plan would be applied zero times and the candidate
+      // marked DONE with nothing written, so it is held instead.
+      record.status = TASK_STATUS.held
+      record.heldAt = new Date().toISOString()
+      await taskReview.save(record)
+      return { ok: true, status: record.status, rechecked: 0, refused: frozen.refused.length }
+    }
+    record.plan = { version: frozen.version, frozenAt: frozen.frozenAt, items: frozen.items }
     record.status = TASK_STATUS.planned
     await taskReview.save(record)
     void runSessionTasks(record.sessionId)
-    return { ok: true, status: record.status, rechecked: accepted.length }
+    return { ok: true, status: record.status, rechecked: frozen.items.length, refused: frozen.refused.length }
   }
 
   Object.assign(rt, {

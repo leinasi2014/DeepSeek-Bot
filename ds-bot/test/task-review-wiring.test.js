@@ -295,5 +295,36 @@ test('an explicit re-verify reuses the stored lesson without extracting again', 
   idle(s.ctx)
   await until(() => s.plans()[0]?.status === 'DONE')
   assert.equal(s.requests.filter(request => String(request.system).startsWith('You turn a reported')).length, extractions, 'the lesson is reused, not extracted again')
-  assert.equal(parseMemory(readFileSync(s.memoryPathOf(s.plans()[0]), 'utf8')).entries.length, 1)
+  const written = parseMemory(readFileSync(s.memoryPathOf(s.plans()[0]), 'utf8'))
+  assert.equal(written.entries.length, 1)
+  // Re-verified or extracted, an entry carries the same metadata: a lesson that came
+  // back through the explicit retry must not be the one line without a source or a date.
+  const line = readFileSync(s.memoryPathOf(s.plans()[0]), 'utf8')
+  assert.match(line, /source: part 1 #11/)
+  assert.match(line, /outcome: verified/)
+  assert.match(line, /added: \d{4}-\d{2}-\d{2}/)
+})
+
+test('a re-verify whose lesson the freeze refuses is held instead of marked done with nothing written', async t => {
+  const s = start({ items: ONE_ITEM, support: [['no'], ['yes']] })
+  t.after(() => s.stop())
+  await s.tool('complete_task', report, 'b2', 'call-reverify-refused')
+  idle(s.ctx)
+  await until(() => s.plans()[0]?.status === 'HELD')
+  const id = s.plans()[0].candidateId
+  // The candidate file is plain JSON a person can edit; the stored quote is made too
+  // long for the memory limits after the gates refused it, so only the freeze-time
+  // re-check can catch it.
+  const planPath = join(s.planDir(), `${id}.json`)
+  const stored = JSON.parse(readFileSync(planPath, 'utf8'))
+  stored.unverified[0].text = `发布脚本的教训：${'很长的说明'.repeat(90)}`
+  writeFileSync(planPath, `${JSON.stringify(stored, null, 2)}\n`)
+  const rechecked = await s.json('memory-task-reverify', { candidateId: id })
+  assert.equal(rechecked.value.ok, true)
+  assert.equal(rechecked.value.rechecked, 0, 'nothing was frozen')
+  const after = s.plans()[0]
+  assert.equal(after.status, 'HELD', 'an empty plan is never stored as PLANNED')
+  assert.equal(after.plan, null, 'no plan is stored')
+  assert.equal(existsSync(s.memoryPathOf(after)), false, 'nothing was written to memory')
+  assert.equal(after.unverified.at(-1).reason, 'invalid-at-freeze')
 })
