@@ -15,7 +15,7 @@
 | 项 | 状态 | 证据 | 备注 |
 |---|---|---|---|
 | 既有代码基线（未合并新功能时） | 实测 | `npm test` 727/727 | 只证明基线没坏 |
-| #52 单测与行为测试 | 实测 | `npm test` 744/744（修复前）→ **745/745**（`d4ca7d9` 后）；含 A/B 项目零泄漏、worktree 同 id、子模块独立 id、unresolved 拒写、快照 scope 头、面板越权 session 拒绝、review 路径 skip + journal | 见 #52 分支提交说明 |
+| #52 单测与行为测试 | 实测 | `npm test` 744/744（修复前）→ 745/745（`d4ca7d9`）→ 746/746（`5542df2`）→ **746/746**（当前头 `27e599b`，我本机实测 pass 746 / fail 0 / skip 0）；含 A/B 项目零泄漏、worktree 同 id、子模块独立 id、unresolved 拒写、快照 scope 头、面板越权 session 拒绝、review 路径 skip + journal、project 目标 edit/move/remove 各一条 | 当前头 `27e599b` 已 revert `5542df2` 的 team 修复，测试数同为 746 是巧合（+1 用例 −1 用例） |
 | #53 接线后全量测试 | 实测 | `npm test` 755/755；`build-client --check` 退出 0；`npm run lint` 退出 0 | 见 `feat/53-memory-index` 的 `2943fc2` |
 | #54 接线后全量测试 | 实测 | `npm test` 761/761（`cd7bd21`）→ 762/762（`7c61fd7` 补 file 路径校验）→ 773/773（并入 `d4ca7d9`）→ **776/776**（`1eb28cc`，并入 #53 索引 11 例 + HELD/补证 3 例）；`lint` 0、`build-client --check` 0。我在本机对 `1eb28cc` 干净树复跑：**776 pass / 0 fail / 0 skip** | 工作区另有未提交改动时全量为 779/777/2 fail，失败项是 `a relative file claim is judged against the cwd frozen at enqueue`——属在补的功能，不是 `1eb28cc` 的回归 |
 | `node:sqlite` + FTS5 trigram 在 Node 侧可用 | 实测 | 设计 §8 记录的探针：建表、长中文 MATCH、短中文 LIKE、scope 过滤均通过 | 只覆盖 Node/Web 侧 |
@@ -32,7 +32,7 @@
 | 项目无法判定时不落 own（工具路径） | 实测 | #52 的 `memory-project.test.js`：unresolved 拒绝隐式写入 | 见 #52 分支 |
 | 项目无法判定时不落 own（自动复盘路径，add） | 实测 | `d4ca7d9`。skip 判定在 `memory.js:1566`：`op === 'add'` 且非显式 `team`，或 `target?.scope === 'project'`；命中即 `journal({op:'skip', scope:'project:unresolved', reason:'project-unresolved', problem})` 后 `continue`，不再走 `:1582-1583` 的 `ownScope` 回落。用例「the memory review skips project writes when the project is unresolved, and journals them」用 broken gitdir（`.git` 写 `gitdir: ../nowhere`）真走 review 通道，断言 `memory/bots/b2` 不存在、team 那条仍落盘、`problem` 含 `nowhere`、`after` 存全文 | — |
 | edit/move/remove 在 unresolved 时各有一条独立用例 | 实测（test-only `edb6345`） | 用例「review changes to project entries are skipped when the project breaks before they apply」：先经工具写入 project 的两条（MEMORY.md 一条 + topic 一条），在 review 已列出条目、回复未落之间把 `.git` 改成断链并 `clearCache()`，再一次性提交 edit/move/remove 三条，断言 project 的 MEMORY.md 与 topic **逐字未变**、`memory/bots/b2` 不存在、journal 里三条的 `(intendedOp, scope)` 恰为 `[['edit','project:unresolved'],['move','project:unresolved'],['remove','project:unresolved']]` | 三条 op 各自断言，不是抽样 |
-| 显式 `team:true` 但 Bot 无 team 写权限时落到 own | **既有行为，本次不改** | 这是 #52 之前就有的结构（`change.team === true && teamWrites ? TEAM : ownScope`），与项目隔离无关，只影响显式点名 team 却无权限的 Bot。Chief 2026-10-22 裁定维持现状；架构师曾做的 `team-write-denied` skip + journal 及用例已按要求撤回 | 写入 `docs/plans/` 的设计 §2「显式 own/team 仍须通过原有授权」在授权失败时的落点，仍是本次未覆盖的既有行为；如需改变需另开 issue |
+| 显式 `team:true` 但 Bot 无 team 写权限时落到 own | **当前头为「既有行为」；修复被 reverted，状态待定** | 事实链：`5542df2` 曾实现 skip + `journal({scope:'team', reason:'team-write-denied'})`，并有一条非 Main Bot fixture 用例断言 own 与 team 目录都不创建、journal 带 reason；随后 Chief 改判「既有行为、本次不改」，架构师照办 `27e599b` **revert** 了该修复，`memory.js` 里已无 `team-write-denied` 分支，那条用例一并删除。当前 `origin/feat/52-project-scope` = `27e599b`，我本机实测 `npm test` **746/746 pass / 0 fail** | 与 Chief 最新「接受 `5542df2` 行为变更」的裁定**冲突**：代码是撤回态。在明确下一步前，本表按**代码实际状态**记录，不写「已修复」 |
 
 **结论：上表中「实测」的项只覆盖测试套件与静态检查；新功能的隔离 smoke、UI 截图、桌面端探针都还没有跑。不要把本文件里的 745/755/762/773/776 读成新功能验收通过——它们只是各分支不同阶段的全量测试数，且都在本机临时目录里跑；各分支尚未合入 `dev`，合入后数字还会变。**
 
@@ -67,7 +67,7 @@ node --experimental-test-module-mocks --import ./test/harness-resolve.mjs --test
 | 身份 | none/unresolved 后补 Git 能恢复；真实大小写；hash 碰撞拒绝 | `project-scope.test.js`「answers expire, so a folder that gains a repository is found again」、「a missing folder is unresolved and the case of a folder is the case on disk」、「the session scope serves reads and writes, and refuses a hash collision」 | 实测 |
 | 范围 | A 写 B 零可见 | `memory-project.test.js`「a Session saves to its project by default, and only its project is visible to it」 | 实测 |
 | 范围 | 所有第一方入口默认 project；显式 own/team 仍可用 | `memory-project.test.js`「an explicit own or team scope still writes there, from a project session」；`memory-acceptance.test.js`「scope: the automatic review defaults to project and rejects unresolved」 | 实测 |
-| 范围 | 显式 team 仍须通过原有授权 | 授权失败时的落点属**既有行为**（落 own），本次不改，见上方证据表同名条目；Chief 2026-10-22 裁定 | 既有行为，不在本次范围 |
+| 范围 | 显式 team 仍须通过原有授权 | 授权失败时的落点：`5542df2` 修成 skip + journal，`27e599b` 又 revert 回落 own。当前代码为落 own，见上方证据表同名条目 | **待定**（代码与最新裁定不一致） |
 | 范围 | project 目标的 edit/move/remove 在 unresolved 时不改投 own | `memory-project.test.js`「review changes to project entries are skipped when the project breaks before they apply」 | 实测（test-only `edb6345`） |
 | 范围 | unresolved 不落 own（工具/面板/复盘三路） | `memory-project.test.js`「a session whose project cannot be told apart writes nothing by default」；`memory-acceptance.test.js`「scope: an unresolved project never falls back to own, tool or panel」 | 实测 |
 | 范围 | 面板假 hash/错 session 拒绝；项目列表由服务端算 | `memory-acceptance.test.js`「scope: the panel project list is server-computed from the Bot's own sessions」、「scope: the panel writes a project entry only through a session that works in it」 | 实测 |
