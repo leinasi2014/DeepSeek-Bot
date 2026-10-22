@@ -88,11 +88,12 @@ node --experimental-test-module-mocks --import ./test/harness-resolve.mjs --test
 
 **当前 skip 总数**：`memory-acceptance.test.js` 里 **18 条**（缓存 3、验收 3、等待 3、恢复 7、上限 2；`Select-String -Pattern 'test\.skip\('` 实数 18，`^test\('` 真用例 6 条）。这 18 条**一条都不算通过**。其中「检索」「一致性」「权限」三组的实质覆盖已在映射到的用例里，但**在这份文件里它们不是 skip 了，而是换成了指向既有用例的映射，不曾在 feat-55 里新增断言**——要新增断言的只剩这 18 条。
 
-**feat-55 合并后实测（两个头，数字不同，不要混用）**
-- `cb0468d`（**含** team 守卫，`memory.js` 命中 1，`memory-project.test.js` 8 例）：**806 tests / 788 pass / 0 fail / 18 skip**（exit 0），`npm run build` exit 0、`npm run lint` exit 0（仅 warning）。
-- 当前头 `85f6579`（**不含** team 守卫：`d0acd7b` 又把它删掉了，`memory.js` 命中 **0**，`memory-project.test.js` 只剩 7 例）：**805 tests / 787 pass / 0 fail / 18 skip**（exit 0），同一套 `memory-acceptance.test.js` 里那条 team 断言现在固定的是「team 被拒时落会话项目」（`assert.match(... 'the ruled-in fallback: the add lands in the session project')`）。
+**feat-55 合并后实测（三个状态，数字不同，不要混用）**
+- `cb0468d`（已提交，**含** team 守卫，`memory.js` 命中 1，`memory-project.test.js` 8 例）：**806 / 788 pass / 0 fail / 18 skip**（exit 0），`npm run build` exit 0、`npm run lint` exit 0（仅 warning）。
+- 当前已提交头 `e9da76a`（**不含** team 守卫：`d0acd7b` 又把它删掉了，`memory.js` 命中 **0**，`memory-project.test.js` 7 例）：**805 / 787 pass / 0 fail / 18 skip**（exit 0）。与 X 定稿相反，**不能作为验收头**。
+- QA 正在工作区暂存中的 X 内容（`memory.js`/`memory-project.test.js`/`memory.test.js` 三个 blob 与 `114a4a0:` 逐字相同，`memory-acceptance.test.js` 已是 skip+journal 版）：我实测 **806 tests / 788 pass / 0 fail / 18 skip，连跑两次都 exit 0**。这**还不是提交**，只是证明「把守卫带回来」这条路是绿的。
 
-**这是与本项目 X 定稿（保留 team 拒写）相反的状态，必须修**：合入 `b6379c8`（revert `ed06b97`）应把守卫带回、把这条断言改回 skip + journal（`team-write-denied`）。**验收判据（合完直接数）**：`git grep -c team-write-denied` 应在三个文件各命中 1 处——`src/host/memory.js`、`test/memory-project.test.js`、`test/memory.test.js`（我在 `b6379c8`/`4b6f1eb`/`114a4a0` 三支上都实测是 1/1/1），且 `memory-project.test.js` 回到 **8 例**、全量回到 **806 / 788 / 0 / 18**。在修好之前，**当前头不能作为最终验收头，也不能上云**。788 是「已实现并跑过」的部分，18 skip 是尚未转真的条目，两者不相加冒充全绿。**注意**：若在 feat-55 工作区里跑出 fail，先看 `git status`——QA 可能正在把剩下的 `acceptance:`/`waiting:` 组转成真断言，未提交状态下的失败属在写用例，不是已提交头的回归。
+**验收判据（合完后直接数）**：`git grep -c team-write-denied` 应在三个文件各命中 1 处——`src/host/memory.js`、`test/memory-project.test.js`、`test/memory.test.js`（我在 `b6379c8`/`4b6f1eb`/`114a4a0` 三支实测都是 1/1/1），`memory-project.test.js` 回到 **8 例**，全量回到 **806 / 788 / 0 / 18**。**一次失败不算数**：我第一次跑这份暂存内容时 `scope: the automatic review defaults to project and rejects unresolved` 曾挂过一次（`ENOENT … memory/projects/<hash>/MEMORY.md`，读文件早于写入），随后两次连跑全绿——这条用例本身就有竞态，验收时以连跑 2 次以上都绿为准。788 是「已实现并跑过」的部分，18 skip 是尚未转真的条目，两者不相加冒充全绿。**注意**：若在 feat-55 工作区里跑出 fail，先看 `git status`——QA 可能正在把剩下的 `acceptance:`/`waiting:` 组转成真断言，未提交状态下的失败属在写用例，不是已提交头的回归。
 
 ## 外部参考的核实方式
 
