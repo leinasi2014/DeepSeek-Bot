@@ -135,7 +135,10 @@ test('a verified claim writes one entry with its review id, and the plan is kept
   // Nothing is written in the reporting turn itself.
   assert.equal(existsSync(s.memoryFile()), false)
   idle(s.ctx)
-  await until(() => existsSync(s.memoryFile()))
+  // The entry lands first; the record is marked DONE once the whole frozen plan has been
+  // applied, so both have to hold before the state is read — APPLYING in between is a
+  // legitimate state a crash could leave behind.
+  await until(() => existsSync(s.memoryFile()) && s.plans()[0]?.status === 'DONE')
   const text = readFileSync(s.memoryFile(), 'utf8')
   assert.match(text, /- 发布用 scripts\/ship\.sh，测试通过后再发布 \[kind: howto; claim: 0; evidence: tests 12\/12; review_id: [0-9a-f]{16}\]/)
   assert.equal(parseMemory(text).entries.length, 1)
