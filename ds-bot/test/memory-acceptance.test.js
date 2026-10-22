@@ -324,10 +324,18 @@ test('permissions: a junction inside the folder that leads outside is refused', 
   mkdirSync(outside, { recursive: true })
   mkdirSync(join(repo, '.git'), { recursive: true })
   writeFileSync(join(outside, 'notes.txt'), 'the suite passed: tests 12/12')
-  // A junction named inside the working folder that points outside it.
+  // A link named inside the working folder that points outside it. Windows serves a
+  // directory junction through cmd.exe; a POSIX runner has symlinks, which is the same
+  // escape once the real path is resolved. Both are refused for the same reason, so the
+  // assertion below is about the rule, not about the platform's flavour of link.
   const junction = join(work, 'link')
-  const { execFileSync } = await import('node:child_process')
-  execFileSync('cmd.exe', ['/c', 'mklink', '/J', junction, outside])
+  if (process.platform === 'win32') {
+    const { execFileSync } = await import('node:child_process')
+    execFileSync('cmd.exe', ['/c', 'mklink', '/J', junction, outside])
+  } else {
+    const { symlinkSync } = await import('node:fs')
+    symlinkSync(outside, junction, 'dir')
+  }
   t.after(() => { rmSync(repo, { recursive: true, force: true, maxRetries: 5 }) })
   const s = startTask({ cwd: work, items: [{ claim: 0, topic: '', text: '穿链接的证据', outcome: 'verified' }], support: ['yes'] })
   t.after(() => s.stop())
