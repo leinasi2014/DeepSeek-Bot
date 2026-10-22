@@ -12,10 +12,11 @@
 // instead. A broken index therefore never turns into "there is no memory": only a
 // Markdown read that fails twice is reported as an error.
 import { createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { mkdir, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
 
-export const INDEX_VERSION = 1
+export const INDEX_VERSION = 2
 // The same limits recall has always used (memory.js): query text, words, and results.
 export const QUERY_TEXT_MAX = 120
 export const QUERY_TERMS_MAX = 6
@@ -40,7 +41,7 @@ const keyOf = (scope, file) => `${scope}\u0000${file}`
 const plain = ({ count: _count, ...row }) => row
 const BOT_PREFIX = 'bot:'
 
-// memoryIndex({ root, readScopes, parse, runInMemoryQueue, warn })
+// memoryIndex({ root, readScopes, parse, format, runInMemoryQueue, warn })
 //
 // - `readScopes(scopes)` is synchronous and returns `[{ scope, files: [{ file, topic,
 //   content }] }]` from the committed view, so a commit in flight reads as it was
@@ -50,7 +51,7 @@ const BOT_PREFIX = 'bot:'
 // - `runInMemoryQueue(fn)` runs a synchronous `fn` after every queued memory write, and
 //   resolves with its value. The collection must not await: that is what keeps a queue
 //   move's two writes (memory.js:767/771) out of the same snapshot.
-export function memoryIndex({ root, readScopes, parse, runInMemoryQueue, warn = () => {} }) {
+export function memoryIndex({ root, readScopes, parse, format, runInMemoryQueue, readOnly = () => false, warn = () => {} }) {
   const indexPath = join(root, 'index.sqlite')
   const queued = runInMemoryQueue ?? (fn => Promise.resolve().then(fn))
   const warned = new Set()
@@ -69,12 +70,17 @@ export function memoryIndex({ root, readScopes, parse, runInMemoryQueue, warn = 
   function open() {
     if (opened !== undefined) return Promise.resolve(opened)
     opening ??= (async () => {
+      // A read-only host must not create the file at all, not even to fall back later.
+      if (readOnly()) {
+        warnOnce('read-only memory folder: recall scans the Markdown', 'the index is not opened')
+        return null
+      }
       let DatabaseSync
       try {
         ({ DatabaseSync } = await import('node:sqlite'))
         await mkdir(root, { recursive: true })
       } catch (error) {
-        warnOnce('no memory index, recall scans the Markdown', error)
+        warnOnce(`no memory index at ${root}, recall scans the Markdown`, error)
         return null
       }
       // A damaged file is rebuilt from the Markdown once.
@@ -83,7 +89,7 @@ export function memoryIndex({ root, readScopes, parse, runInMemoryQueue, warn = 
           if (fresh) await unlink(indexPath).catch(() => {})
           return create(new DatabaseSync(indexPath))
         } catch (error) {
-          if (fresh) warnOnce('no memory index, recall scans the Markdown', error)
+          if (fresh) warnOnce(`no memory index at ${indexPath}, recall scans the Markdown`, error)
         }
       }
       return null
@@ -104,7 +110,7 @@ export function memoryIndex({ root, readScopes, parse, runInMemoryQueue, warn = 
       db.exec(`
         DROP TABLE IF EXISTS entries;
         DROP TABLE IF EXISTS files;
-        CREATE VIRTUAL TABLE entries USING fts5(text, topic, scope UNINDEXED, file UNINDEXED, line UNINDEXED, added UNINDEXED, tokenize = 'trigram');
+        CREATE VIRTUAL TABLE entries USING fts5(text, topic, entry UNINDEXED, scope UNINDEXED, file UNINDEXED, line UNINDEXED, added UNINDEXED, tokenize = 'trigram');
         CREATE TABLE files (scope TEXT NOT NULL, file TEXT NOT NULL, hash TEXT NOT NULL, PRIMARY KEY (scope, file));
         PRAGMA user_version = ${INDEX_VERSION};`)
     }
@@ -112,7 +118,7 @@ export function memoryIndex({ root, readScopes, parse, runInMemoryQueue, warn = 
       db,
       known: db.prepare('SELECT scope, file, hash FROM files WHERE scope IN (SELECT value FROM json_each(?))'),
       scopes: db.prepare('SELECT DISTINCT scope FROM files'),
-      insert: db.prepare('INSERT INTO entries (text, topic, scope, file, line, added) VALUES (?, ?, ?, ?, ?, ?)'),
+      insert: db.prepare('INSERT INTO entries (text, topic, entry, scope, file, line, added) VALUES (?, ?, ?, ?, ?, ?, ?)'),
       deleteFile: db.prepare('DELETE FROM entries WHERE scope = ? AND file = ?'),
       deleteScope: db.prepare('DELETE FROM entries WHERE scope = ?'),
       setHash: db.prepare('INSERT OR REPLACE INTO files (scope, file, hash) VALUES (?, ?, ?)'),
@@ -128,7 +134,7 @@ export function memoryIndex({ root, readScopes, parse, runInMemoryQueue, warn = 
       scope,
       files: (files ?? []).map((file) => {
         const content = String(file.content ?? '')
-        return { file: file.file, topic: file.topic ?? '', content, hash: hashOf(content), entries: parse(content).entries }
+        return { file: file.file, topic: file.topic ?? '', content, hash: hashOf(content), entries: parse(content).entries.map(entry => ({ ...entry, entry: format(entry.text, entry.meta ?? {}) })) }
       }),
     }))
   }
@@ -164,7 +170,7 @@ export function memoryIndex({ root, readScopes, parse, runInMemoryQueue, warn = 
           continue
         }
         for (const entry of write.file.entries) {
-          index.insert.run(entry.text, write.file.topic, write.scope, write.name, entry.line + 1, entry.meta?.added ?? '')
+          index.insert.run(entry.text, write.file.topic, entry.entry, write.scope, write.name, entry.line + 1, entry.meta?.added ?? '')
         }
         index.setHash.run(write.scope, write.name, write.file.hash)
       }
@@ -194,7 +200,7 @@ export function memoryIndex({ root, readScopes, parse, runInMemoryQueue, warn = 
     const rank = long.length > 0 ? 'rank, ' : ''
     args.push(ownScope, limit)
     return {
-      sql: `SELECT scope, file, line, text, topic, added FROM entries
+      sql: `SELECT scope, file, line, text, topic, entry, added FROM entries
         WHERE ${where.join(' AND ')}
         ORDER BY ${rank}CASE WHEN scope = ? THEN 0 WHEN scope LIKE 'project:%' THEN 1 ELSE 2 END, added DESC, scope, file, line
         LIMIT ?`,
@@ -213,7 +219,7 @@ export function memoryIndex({ root, readScopes, parse, runInMemoryQueue, warn = 
           const hay = squash(`${entry.text} ${file.topic}`)
           const count = terms.reduce((hits, term) => (hay.includes(term) ? hits + 1 : hits), 0)
           if (count === 0) continue
-          scored.push({ scope, file: file.file, line: entry.line + 1, text: entry.text, topic: file.topic, added: entry.meta?.added ?? '', count })
+          scored.push({ scope, file: file.file, line: entry.line + 1, text: entry.text, topic: file.topic, entry: entry.entry, added: entry.meta?.added ?? '', count })
         }
       }
     }
@@ -262,6 +268,9 @@ export function memoryIndex({ root, readScopes, parse, runInMemoryQueue, warn = 
   // `scope LIKE 'bot:%'` with no MATCH by returning no rows, so the predicate has to be
   // plain equality.
   async function cleanup(liveBotIds) {
+    // Nothing to clean when no index was ever built: opening it here would only create a
+    // file in a folder that may be read-only, during startup.
+    if (!existsSync(indexPath)) return { ok: false }
     const index = await open()
     if (index === null) return { ok: false }
     const live = new Set([...liveBotIds].map((id) => {

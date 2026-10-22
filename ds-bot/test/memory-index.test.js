@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { memoryIndex, termsOf } from '../src/host/memory-index.js'
-import { parseMemory } from '../src/host/memory.js'
+import { formatEntry, parseMemory } from '../src/host/memory.js'
 
 // A clean root, closed first and only then removed: an open SQLite file cannot be deleted
 // on Windows. node:test runs after-hooks in registration order, so one hook does both.
@@ -32,6 +32,7 @@ function fixture(t, { root: givenRoot, temp: givenTemp, files, parse = parseMemo
       files: Object.entries(state.files[scope]).map(([file, content]) => ({ file, topic: file === 'MEMORY.md' ? '' : file.slice(0, -3), content })),
     })),
     parse: content => parse(content),
+    format: formatEntry,
     runInMemoryQueue: fn => fn(),
     warn: message => warnings.push(String(message)),
   })
@@ -60,6 +61,8 @@ test('a long term is matched by the index and a short Chinese term falls back to
   assert.equal(long.ok, true)
   assert.equal(long.degraded, false, 'the index answered, no scan')
   assert.deepEqual(rows(long), ['bot:a|MEMORY.md|项目记忆用 Git 派生 id'])
+  assert.equal(long.rows[0].entry, formatEntry('项目记忆用 Git 派生 id', {}), 'the formatted line travels with the hit')
+  assert.equal(long.rows[0].entry.includes('added:'), false, 'a fixture without metadata has no bracket')
   // Two characters cannot match a trigram: only the literal pass can find it.
   const short = await f.index.query({ scopes: ['bot:a'], ownScope: 'bot:a', query: '记忆' })
   assert.deepEqual(rows(short), ['bot:a|MEMORY.md|项目记忆用 Git 派生 id'])
@@ -143,6 +146,7 @@ test('a Markdown read that fails twice is reported, never answered with an empty
     root: temp.dir,
     readScopes: () => { throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }) },
     parse: parseMemory,
+    format: formatEntry,
     runInMemoryQueue: fn => fn(),
   })
   temp.close(() => index.close())
@@ -173,6 +177,7 @@ test('a failed refresh publishes nothing and the recall still answers from the s
       files: Object.entries(files[scope]).map(([file, content]) => ({ file, topic: file === 'MEMORY.md' ? '' : file.slice(0, -3), content })),
     })),
     // The binding fails inside the transaction, after MEMORY.md's rows were inserted.
+    format: formatEntry,
     parse: content => {
       const parsed = parseMemory(content)
       if (broken && content.includes('坏条目')) return { ...parsed, entries: parsed.entries.map(entry => ({ ...entry, meta: { added: Symbol('bad') } })) }
@@ -212,6 +217,7 @@ test('cleanup drops the rows of deleted Bots and keeps team and project scopes',
       files: Object.entries(files[scope]).map(([file, content]) => ({ file, topic: file === 'MEMORY.md' ? '' : file.slice(0, -3), content })),
     })),
     parse: parseMemory,
+    format: formatEntry,
     runInMemoryQueue: fn => fn(),
     warn: () => {},
   })

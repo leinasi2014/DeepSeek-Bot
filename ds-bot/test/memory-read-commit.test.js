@@ -98,12 +98,15 @@ test('another Bot freezes committed team memory while its replacement is pending
     assert.match(frozen, /Deliver on Friday/)
     assert.doesNotMatch(frozen, /Deliver on Thursday/)
     assert.deepEqual((await s.view()).entries.map(entry => [entry.text, entry.scope]), [['Deliver on Friday', 'team']])
-    assert.match(await s.tool('recall', { scope: 'team', query: 'Friday' }), /Deliver on Friday/)
+    // recall collects inside the write queue now, so it waits for this pending commit
+    // rather than reading past it; the committed view is asserted through the readers
+    // above, and recall is checked once the write has settled.
   } finally {
     resume()
   }
   assert.match(await changing, /ENOSPC/)
   fault = undefined
+  assert.match(await s.tool('recall', { scope: 'team', query: 'Friday' }), /Deliver on Friday/)
   assert.equal(s.section('b2'), frozen)
   assert.equal(s.read('snapshots', 'b2.md'), frozen)
   assert.match(s.read('team', 'MEMORY.md'), /Deliver on Friday/)
@@ -139,8 +142,9 @@ for (const operation of ['replace', 'add-topic', 'remove-topic']) {
           assert.doesNotMatch(frozen, /\[\[ops\]\]/)
         }
         assert.deepEqual((await s.view()).entries.map(entry => [entry.text, entry.topic]), [['Deliver on Friday', operation === 'remove-topic' ? 'ops' : null]])
-        assert.match(await s.tool('recall', { query: 'Friday' }), /Deliver on Friday/)
-        assert.doesNotMatch(await s.tool('recall', { query: 'Thursday' }), /Deliver on Thursday/)
+        // recall now collects inside the write queue (memory index), so it waits for this
+        // commit instead of reading past it; the synchronous readers above are what see
+        // the committed view while the write is pending. recall is checked after resume.
         const topic = await s.tool('recall', { topic: 'ops' })
         assert.match(topic, operation === 'remove-topic' ? /Deliver on Friday/ : /No topic/)
       } finally {
@@ -152,6 +156,10 @@ for (const operation of ['replace', 'add-topic', 'remove-topic']) {
       else assert.match(answer, /^(Saved|Updated|Removed)/)
       const expected = fail ? ['Deliver on Friday'] : operation === 'replace' ? ['Deliver on Thursday'] : operation === 'add-topic' ? ['Deliver on Friday', 'Deliver on Thursday'] : []
       assert.deepEqual((await s.view()).entries.map(entry => entry.text), expected)
+      // The queued recall settles with the same set the panel shows.
+      const recalled = await s.tool('recall', { query: 'Deliver' })
+      for (const text of expected) assert.match(recalled, new RegExp(text))
+      if (expected.length === 0) assert.match(recalled, /Nothing/)
       assert.equal(s.section('b2'), frozen, 'first render freezes the committed pre-change view even after a successful change')
       assert.equal(s.read('snapshots', 'b2.md'), frozen)
       assert.equal(s.section('m1'), chief, 'existing snapshots stay byte-stable')
