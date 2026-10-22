@@ -15,9 +15,9 @@
 | 项 | 状态 | 证据 | 备注 |
 |---|---|---|---|
 | 既有代码基线（未合并新功能时） | 实测 | `npm test` 727/727 | 只证明基线没坏 |
-| #52 单测与行为测试 | 实测 | Chief 指定的合并头 `edb6345`：`memory-project.test.js` **8/8**、全量 **747/747**（team 修复 `5542df2` + edit/move/remove 用例均在内）。我另行实测 `4db72d4`（一度是 origin 头）：单跑 **7/7**、全量 **746/746**——该头再次 revert 了 team 修复 | 头链：`5542df2`(team 修复) → `edb6345`(纯测试 +71) → `27e599b`(revert) → `e604034`(恢复) → `4db72d4`(再次撤回)。**以 `edb6345` 为登记基准**（Chief 2026-10-22 指定 747） |
+| #52 单测与行为测试 | 实测 | `edb6345`（纯测试提交，第 8 条用例即在此）：我在**独立 detached worktree** 干净树复跑，全量 **747/747 pass / 0 fail / 0 skip**，`memory-project.test.js` **8/8**。另测 `4db72d4`（曾一度是 origin 头，再次 revert team 修复）：单跑 7/7、全量 746/746 | 头链：`5542df2`(team 修复) → `edb6345`(纯测试 +71) → `27e599b`(revert) → `e604034`(恢复) → `4db72d4`(再次撤回)。**登记基准 `edb6345` = 747**。为避免踩他人脏 worktree，我另建临时 worktree 验证后已 `worktree remove` |
 | #53 接线后全量测试 | 实测 | `2943fc2` 时 755/755；当前头 `46a9690`（并入 #52 的 `e604034`）我在本机实测 **758 pass / 0 fail / 0 skip**；`build-client --check` 0、`lint` 0 | `2943fc2` 是接线提交，`46a9690` 为并入修复后的合并提交 |
-| #54 接线后全量测试 | 实测 | 演进：761（`cd7bd21`）→ 762（`7c61fd7`）→ 773（并入 `d4ca7d9`）→ 776（`1eb28cc`）→ **779**（`754ffb5`，Chief 登记基准：cwd 冻结、相对 ref 越界、reverify 复用三条新用例）→ **782**（当前 origin 头 `5be01ab`，`bb896b0` 并入 #53、`46a9690` 并入 #52 的 `e604034`，再含 wiring 测试时序修复）。我在本机对 `5be01ab` 实测：**782 pass / 0 fail / 0 skip**；`lint` 0、`build-client --check` 0 | 与 Chief 登记的 779 差异来源已核：779 是 `754ffb5`，之后又并入了 #53/#52 与一条 wiring 修复，故当前头为 782，非回归 |
+| #54 接线后全量测试 | 实测 | `754ffb5`（三处补证：原始 cwd 冻结、相对 ref 走同一文件边界、`memory-task-reverify`）在**独立 detached worktree** 干净树复跑：全量 **779/779 pass / 0 fail / 0 skip**。演进：761（`cd7bd21`）→ 762（`7c61fd7`）→ 773（并入 `d4ca7d9`）→ 776（`1eb28cc`）→ **779（`754ffb5`，登记基准）**；其后 `5be01ab` 并入 #53/#52 并含一条 wiring 时序修复，我实测 782 | 779 与 782 差 3 来自后续并入，非回归；以 `754ffb5` 的 779 为登记值 |
 | `node:sqlite` + FTS5 trigram 在 Node 侧可用 | 实测 | 设计 §8 记录的探针：建表、长中文 MATCH、短中文 LIKE、scope 过滤均通过 | 只覆盖 Node/Web 侧 |
 | **桌面 Electron 端的 `node:sqlite`** | **未验证** | 无 | 本机无 DSH 的 `app/` checkout，跑不了探针；桌面端必须走扫描回退 |
 | 原生 Windows 隔离 smoke | **未验证** | 无 | `dev/bench.sh` 需要 `deepseek-harness` checkout 与本机不符，尚未跑；不得计为通过 |
