@@ -111,7 +111,8 @@ test('scope: the panel project list is server-computed from the Bot\'s own sessi
   const s = startScoped(t)
   const view = await s.endpoint('memory-view', { botId: 'b2', session: 'sA' })
   const alpha = s.rt.projectScope.resolve(scopeSessions.sA)
-  assert.deepEqual(view.projects, [{ hash: alpha.hash, root: alpha.root, session: 'sA' }])
+  // The host names each project; the panel shows that name and never derives one (#61).
+  assert.deepEqual(view.projects, [{ hash: alpha.hash, root: alpha.root, session: 'sA', name: 'alpha' }])
   // sLost resolves to nothing, so it never appears as a project choice.
 })
 

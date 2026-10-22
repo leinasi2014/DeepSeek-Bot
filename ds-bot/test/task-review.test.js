@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { candidateIdOf, reviewIdOf, STATUS, taskReview } from '../src/host/task-review.js'
-import { formatEntry, parseMemory } from '../src/host/memory.js'
+import { formatEntry, looksSecret, parseMemory } from '../src/host/memory.js'
 
 // A memory root whose scopes are plain text files, so the review can be driven without a
 // Session, a model, or a DSH_HOME. `calls` records every write the review attempted.
@@ -13,6 +13,8 @@ function harness(t, {
   check = async () => ({ ok: true, project: 'project:a' }),
   extract,
   fail = undefined,
+  entryProblem = () => undefined,
+  secretEntry = () => false,
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'ds-bot-task-review-'))
   t.after(() => rmSync(root, { recursive: true, force: true }))
@@ -54,6 +56,8 @@ function harness(t, {
     readScope,
     parse: parseMemory,
     format: formatEntry,
+    entryProblem,
+    secretEntry,
     now: () => '2026-10-22T00:00:00.000Z',
   })
   return { root, review, calls, files: state.files, scopeFiles }
@@ -248,4 +252,70 @@ test('a candidate with a frozen plan ignores the explicit retry', async t => {
   const retried = await h.review.retry(candidateId)
   assert.equal(retried.status, STATUS.done)
   assert.equal(h.calls.extract, 1, 'a frozen plan is never extracted again')
+})
+
+test('an item past the limits is refused at freeze, so no plan is written and nothing applies', async t => {
+  // The memory module's own limit says "too long"; the freeze step must run it again
+  // because the plan file is plain JSON a person can edit between extract and apply.
+  const h = harness(t, {
+    entryProblem: text => (text.length > 20 ? 'An entry holds at most 20 characters' : undefined),
+    extract: () => ({ items: [{ scope: 'project:a', text: '这一条教训明显超过了二十个字符的长度上限而且还要更长一些', outcome: 'verified', source: 'part 1 #2' }] }),
+  })
+  const { candidateId } = await h.review.enqueue(candidate)
+  const record = await h.review.process(candidateId)
+  assert.equal(record.status, STATUS.held, 'nothing survived the freeze-time check')
+  assert.equal(record.plan, null, 'no empty plan is stored')
+  assert.equal(h.calls.apply.length, 0, 'nothing was applied')
+  assert.equal(record.unverified.at(-1).reason, 'invalid-at-freeze')
+  assert.match(record.unverified.at(-1).problem, /at most 20 characters/)
+})
+
+test('a lesson that looks like a secret is refused at freeze', async t => {
+  const h = harness(t, {
+    secretEntry: text => /sk-[A-Za-z0-9]{8}/.test(text),
+    extract: () => ({ items: [{ scope: 'project:a', text: 'token sk-abcdefgh', outcome: 'verified', source: 'part 1 #2' }] }),
+  })
+  const { candidateId } = await h.review.enqueue(candidate)
+  const record = await h.review.process(candidateId)
+  assert.equal(record.status, STATUS.held)
+  assert.equal(record.plan, null)
+  assert.equal(h.calls.apply.length, 0)
+  assert.equal(record.unverified.at(-1).reason, 'invalid-at-freeze')
+})
+
+test('an all-digit review id is not read as a secret, and the entry is written', async t => {
+  // `review_id` is 16 lower-case hex characters; about one in a thousand of them is all
+  // digits, and the memory module reads 15 digits in a row as an ID number. This
+  // candidateId was searched for so that reviewIdOf gives exactly such an id: checking it
+  // like content refused the whole lesson with "the entry looks like a secret".
+  const allDigits = { ...candidate, callId: 'reverify-141' }
+  const id = candidateIdOf(allDigits.sessionId, allDigits.callId)
+  const reviewId = reviewIdOf(id, 0)
+  assert.match(reviewId, /^\d{16}$/, 'the fixture still produces an all-digit id')
+  assert.equal(looksSecret(`review_id: ${reviewId}`), true, 'the raw shape is what the memory rule reads')
+  const h = harness(t, { secretEntry: looksSecret })
+  const { candidateId } = await h.review.enqueue(allDigits)
+  const record = await h.review.process(candidateId)
+  assert.equal(record.status, STATUS.done)
+  assert.equal(record.plan.items.length, 1, 'the entry survives the freeze')
+  assert.match(record.plan.items[0].line, new RegExp(`review_id: ${reviewId}`))
+})
+
+test('the secret check still reads the other metadata values and the text', async t => {
+  // The `review_id` exclusion must not weaken the check: a digit run in a real value is
+  // still refused, whether it sits in the metadata or in the entry text itself.
+  const source = harness(t, {
+    secretEntry: looksSecret,
+    extract: () => ({ items: [{ scope: 'project:a', text: '用脚本发布', outcome: 'verified', meta: { kind: 'howto', source: '1234567890123456' } }] }),
+  })
+  const first = await source.review.process((await source.review.enqueue(candidate)).candidateId)
+  assert.equal(first.status, STATUS.held)
+  assert.equal(first.unverified.at(-1).reason, 'invalid-at-freeze')
+  const body = harness(t, {
+    secretEntry: looksSecret,
+    extract: () => ({ items: [{ scope: 'project:a', text: '账号 1234567890123456', outcome: 'verified', source: 'part 1 #2' }] }),
+  })
+  const second = await body.review.process((await body.review.enqueue({ ...candidate, callId: 'c2' })).candidateId)
+  assert.equal(second.status, STATUS.held)
+  assert.equal(second.unverified.at(-1).reason, 'invalid-at-freeze')
 })

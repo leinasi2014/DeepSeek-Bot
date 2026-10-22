@@ -124,6 +124,41 @@ async function rt_forget(s, body) {
   await s.rt.memoryEndpoint('memory-forget', body)
 }
 
+// The panel shows the name the host decided, never one it derives itself (#61): two
+// repositories whose folders are both called `same` must still read as two projects, and
+// neither may be labelled `.git` — which is what the Git identity actually points at.
+test('two projects with the same folder name get distinct names, and none is ".git"', async t => {
+  const ctx = fakeContext()
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-names-rt-'))
+  const one = join(home, 'work', 'same')
+  const two = join(home, 'personal', 'same')
+  mkdirSync(join(one, '.git'), { recursive: true })
+  mkdirSync(join(two, '.git'), { recursive: true })
+  const sessions2 = { x1: { id: 'x1', header: { cwd: one } }, x2: { id: 'x2', header: { cwd: two } } }
+  const rt = {
+    ctx, home, config: { memoryReview: false }, state: { rooms: {} },
+    load: async () => {}, readOnly: () => undefined, warn: () => {},
+    botOf: id => bots[id], findBot: name => Object.values(bots).find(bot => bot.name === name),
+    selfOf: () => 'b2',
+    isMain: () => false, chatOf: botId => `chat-${botId}`, groupSessionsOf: () => [],
+    sessionsOfBot: () => ['x1', 'x2'],
+    groupOwners: new Map(), roomOf: () => undefined, partsOf: id => [{ sessionId: id }],
+    clock: () => '12:00', teamFolder: () => join(home, 'team'),
+    sessionFolder: session => sessions2[session?.id ?? session]?.header?.cwd,
+    async* eventsBackwards() { /* no saved history in this fixture */ },
+  }
+  installProjectScope(rt)
+  installMemory(rt)
+  t.after(async () => { await ctx.dispose(); rmSync(home, { recursive: true, force: true }) })
+  const view = await rt.memoryEndpoint('memory-view', { botId: 'b2', session: 'x1' })
+  const names = view.projects.map(project => project.name)
+  assert.equal(names.length, 2)
+  assert.ok(names.every(name => name !== '.git'), `names are real names, not ".git": ${names.join(', ')}`)
+  assert.equal(new Set(names).size, 2, `two projects stay apart: ${names.join(', ')}`)
+  assert.ok(names.some(name => name.endsWith('work/same')), names.join(', '))
+  assert.ok(names.some(name => name.endsWith('personal/same')), names.join(', '))
+})
+
 // A review of a conversation whose project cannot be told apart (a broken gitdir)
 // must skip its project changes with a journal record, not save them to the Bot's
 // own memory — the same refusal the tools make.

@@ -32,7 +32,7 @@ import { speakerOf } from '../shared/mentions.js'
 import { output } from './tools.js'
 import { memoryFiles } from './memory-files.js'
 import { memoryIndex } from './memory-index.js'
-import { STATUS as TASK_STATUS, taskReview as createTaskReview } from './task-review.js'
+import { STATUS as TASK_STATUS, taskReview as createTaskReview, metaForSecretCheck } from './task-review.js'
 import { within } from './folders.js'
 
 // Fixed sizes, in characters. Both MEMORY.md files ride in every request of every
@@ -749,13 +749,25 @@ export function install(rt) {
     const items = []
     candidates.forEach((entry, index) => {
       if (support[index] !== 'yes') { drop('model-unsupported', { claim: entry.claim, text: entry.text, topic: entry.topic, outcome: entry.outcome, evidence: entry.evidence, statement: claims[entry.claim].statement, kind: claims[entry.claim].kind, context: entry.context }); return }
+      // The date is taken once, here, and frozen into the plan below: a candidate that
+      // waits past midnight keeps the day it was reviewed, not the day it applied.
+      // `source` and `outcome` belong in the entry itself, not only in the plan file: a
+      // lesson that failed and one that held must be told apart in the Markdown.
+      const source = String(claims[entry.claim].ref ?? 'the conversation')
       items.push({
         scope: scopeKey(scope),
         topic: entry.topic,
         text: entry.text,
         outcome: entry.outcome,
-        source: String(claims[entry.claim].ref ?? 'the conversation'),
-        meta: { kind: 'howto', claim: entry.claim, evidence: entry.evidence.slice(0, 200) },
+        source,
+        meta: {
+          kind: 'howto',
+          claim: entry.claim,
+          evidence: entry.evidence.slice(0, 200),
+          source: source.slice(0, 200),
+          outcome: entry.outcome,
+          added: today(),
+        },
       })
     })
     return { items, dropped }
@@ -770,7 +782,9 @@ export function install(rt) {
       writable(scope, { id: 'user', name: 'user' })
       const problem = entryProblem(item.text)
       if (problem !== undefined) throw Object.assign(new Error(problem), { code: 'memory/invalid' })
-      const metaText = Object.entries(item.meta ?? {}).map(([key, value]) => `${key}: ${value}`).join(' ')
+      // `review_id` is the host's own hash, not content: left out of the secret check for
+      // the same reason as at freeze time — an all-digit id reads as an ID number.
+      const metaText = Object.entries(metaForSecretCheck(item.meta)).map(([key, value]) => `${key}: ${value}`).join(' ')
       if (secretEntry(item.text) || secretEntry(metaText)) throw Object.assign(new Error('This entry looks like a secret'), { code: 'memory/invalid' })
       const files = loadScope(scope)
       const main = files[0]
@@ -820,6 +834,11 @@ export function install(rt) {
     },
     parse: parseMemory,
     format: formatEntry,
+    // The limits the tools use, so the plan is checked against the same rules before it
+    // is frozen — the plan file can be edited by hand, and the extraction may be old.
+    // Wrapped, not passed directly: those two are defined further down in this module.
+    entryProblem: text => entryProblem(text),
+    secretEntry: text => secretEntry(text),
     warn: rt.warn,
   })
   // Candidates are resumed after the team loads, and again whenever the files change on
@@ -1161,10 +1180,30 @@ export function install(rt) {
   // re-frozen instead of going on with the last project's memory in its prompt.
   const snapshotHeader = (botId, projectScope) => `<!-- ds-bot:memory v2 scopes=${[projectScope === undefined ? undefined : scopeKey(projectScope), `bot:${botId}`, 'team'].filter(Boolean).sort().join(',')} -->`
   // A Git identity is the .git folder; what a person reads is the repository's name.
-  const projectName = (root) => {
+  // Two repositories can share a folder name, so the tail of the path is kept until the
+  // names differ: `alpha`, or `work/alpha` and `personal/alpha`. The one place that names
+  // a project is here — the panel only shows what this returns, so the two cannot drift
+  // apart again (issue #61).
+  const projectTail = (root) => {
     const parts = String(root ?? '').split(/[\\/]/).filter(Boolean)
-    const git = parts.at(-1) === '.git' ? parts.at(-2) : parts.at(-1)
-    return git ?? 'this project'
+    if (parts.at(-1) === '.git') parts.pop()
+    return parts
+  }
+  const projectName = (root) => projectTail(root).at(-1) ?? 'this project'
+  const projectNames = (roots) => {
+    const tails = roots.map(projectTail)
+    const names = new Map()
+    tails.forEach((tail, index) => {
+      let depth = 1
+      while (depth < tail.length) {
+        const name = tail.slice(-depth).join('/')
+        const clashes = tails.some((other, otherIndex) => otherIndex !== index && other.slice(-depth).join('/') === name)
+        if (!clashes) break
+        depth += 1
+      }
+      names.set(index, tail.slice(-depth).join('/'))
+    })
+    return names
   }
   function memorySection(bot, projectScope) {
     const own = ownScope(bot.id)
@@ -1667,14 +1706,17 @@ export function install(rt) {
     return undefined
   }
   // Each project the Bot works in, with one conversation that reaches it: the
-  // panel names that conversation, and the server names the project.
+  // panel names that conversation, and the server names the project. `name` is decided
+  // here, once, for every project of this Bot — the panel never derives one again.
   const projectsOfBot = (bot) => {
     const found = new Map()
     for (const id of rt.sessionsOfBot?.(bot.id) ?? []) {
       const project = projectOf(id)
       if (project.status === 'ok' && !found.has(project.hash)) found.set(project.hash, { hash: project.hash, root: project.root, session: id })
     }
-    return [...found.values()]
+    const listed = [...found.values()]
+    const names = projectNames(listed.map(project => project.root))
+    return listed.map((project, index) => ({ ...project, name: names.get(index) }))
   }
 
   // The summary is written again when the entries or the interface language change;
@@ -2284,7 +2326,28 @@ export function install(rt) {
     const kept = []
     retryable.forEach((entry, index) => {
       if (support[index] === 'yes') {
-        accepted.push({ scope: scopeKey(taskScopeOf(record)), claim: entry.claim, topic: entry.topic ?? '', text: entry.text, outcome: entry.outcome === 'failed' ? 'failed' : 'verified', evidence: entry.evidence })
+        const outcome = entry.outcome === 'failed' ? 'failed' : 'verified'
+        // The same metadata the extraction writes, because this entry reaches the
+        // Markdown through the same freeze: without `source`, `outcome` and `added` a
+        // re-verified lesson would be indistinguishable from an anonymous one. The date
+        // is taken here, once, and frozen with the plan; apply never recomputes it.
+        const source = String(entry.source ?? record.claims?.[entry.claim]?.ref ?? 'the conversation')
+        accepted.push({
+          scope: scopeKey(taskScopeOf(record)),
+          claim: entry.claim,
+          topic: entry.topic ?? '',
+          text: entry.text,
+          outcome,
+          source,
+          meta: {
+            kind: 'howto',
+            claim: entry.claim,
+            evidence: String(entry.evidence ?? '').slice(0, 200),
+            source: source.slice(0, 200),
+            outcome,
+            added: today(),
+          },
+        })
       } else {
         kept.push(entry)
       }
@@ -2294,12 +2357,26 @@ export function install(rt) {
       await taskReview.save(record)
       return { ok: true, status: record.status, rechecked: 0 }
     }
-    // Frozen from what was already stored: no extraction, no new wording.
-    record.plan = taskReview.freeze(record, accepted)
+    // Frozen from what was already stored: no extraction, no new wording. The limits run
+    // once more over what will actually be written, exactly as on the extract path; a
+    // lesson that fails here is kept as an `unverified` record, never written.
+    const frozen = taskReview.freeze(record, accepted)
+    if (frozen.refused.length > 0) {
+      record.unverified = [...record.unverified, ...frozen.refused].slice(0, TASK_CLAIMS_MAX * 2)
+    }
+    if (frozen.items.length === 0) {
+      // Nothing survived: an empty plan would be applied zero times and the candidate
+      // marked DONE with nothing written, so it is held instead.
+      record.status = TASK_STATUS.held
+      record.heldAt = new Date().toISOString()
+      await taskReview.save(record)
+      return { ok: true, status: record.status, rechecked: 0, refused: frozen.refused.length }
+    }
+    record.plan = { version: frozen.version, frozenAt: frozen.frozenAt, items: frozen.items }
     record.status = TASK_STATUS.planned
     await taskReview.save(record)
     void runSessionTasks(record.sessionId)
-    return { ok: true, status: record.status, rechecked: accepted.length }
+    return { ok: true, status: record.status, rechecked: frozen.items.length, refused: frozen.refused.length }
   }
 
   Object.assign(rt, {
