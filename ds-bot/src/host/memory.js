@@ -1598,6 +1598,22 @@ export function install(rt) {
       const target = numbered[Number(change?.entry) - 1]
       const text = cleanEntry(change?.text)
       const projectWrite = projectOf(sessionId)
+      // An explicit team choice the Bot cannot write is refused outright — skipped
+      // with a record, never quietly redirected to its own memory, which would swap
+      // the scope the model named for another one.
+      if (op === 'add' && change.team === true && !teamWrites) {
+        rt.warn('ds-bot: memory review of %s skipped a change: it may not write the team memory', bot.name)
+        await journal({
+          op: 'skip',
+          scope: 'team',
+          file: topic === undefined ? MAIN : `${topic}.md`,
+          ...actorOf(actor),
+          after: text,
+          intendedOp: op,
+          reason: 'team-write-denied',
+        })
+        continue
+      }
       // A change that belongs to the session's project is skipped when the project
       // cannot be told apart — recorded like a full file, so a person can write it by
       // hand. Neither an add nor a change to a project entry may slip into the Bot's
