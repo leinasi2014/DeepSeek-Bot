@@ -3,7 +3,7 @@
 - 日期：2026-10-22
 - 相关：本设计稿（设计阶段，未实现）；参照 `docs/plans/2026-10-09-context-and-memory.md`、`2026-10-16-bot-handoffs.md`
 - 代码基线：`dev` @ `ba9757b`（含 PR #48/#49/#50 的记忆一致性修复）
-- 状态：**设计评审中。** R1/R2/R5/R6/R7 已通过本轮复审，R3/R4 待插件工程师交回；代码未实现、运行测试未实施、未合并、未部署。
+- 状态：**设计评审通过（R1–R7 全部关闭）。代码尚未实现，运行测试待实施，未合并、未部署。**
 
 ## 为什么
 
@@ -31,8 +31,9 @@ resolve(cwd) -> { status: 'ok', hash, root, kind: 'git'|'marker'|'self' }
 
 1. `realpathSync.native(cwd)`。**以它返回的实际大小写作为唯一键，不做大小写折叠**（见下）。
 2. **从 cwd 向上逐层找 `.git`，中途遇到标记物不停。** 这是「Git 优先于仓库内 `package.json`」的落点：monorepo 里 `packages/a/package.json` 不会把子包切成独立项目。
-   - `.git` 是目录 → 该目录即元数据目录。
-   - `.git` 是文件 → 读首行 `gitdir: <path>`（相对路径相对 `.git` 所在目录）；再读 `<gitdir>/commondir`（相对 `<gitdir>`）得 common dir；**没有 `commondir` 就用 `gitdir` 本身**（子模块、`--separate-git-dir`）。
+   - `.git` 是目录 → 该目录即元数据目录（主仓库与普通仓库都是这种，且此时**没有** `commondir`）。
+   - `.git` 是文件 → 读首行 `gitdir: <path>`。**实测两种写法都有**：本机 git 2.55 写的是**绝对路径 + 正斜杠**（`gitdir: C:/.../worktrees/wt1`），而部分 Git 版本或手写仓库用相对路径。因此解析器**两态都要支持**：`path.isAbsolute(...)` 为真直接取，否则相对 `.git` 文件所在目录解析。再读 `<gitdir>/commondir`（内容是相对路径，如 `../..`，相对 `<gitdir>` 解析）；**没有 `commondir` 就用 `gitdir` 本身**。
+   - **必须从 cwd 向上找**：ds-bot 自身就是例子——`ds-bot/` 下面没有 `.git`，仓库根在父目录 `deepseek-bot/.git`。
 3. 没找到 `.git` → 从 cwd 向上找**最近的一层**含标记物的目录：`package.json`、`Cargo.toml`、`go.mod`、`pyproject.toml`、`*.csproj`。
    - **有界**：遇到 `teamFolder` 或盘根即停，且**向上最多 3 层**。理由：一个被随手丢在 `D:\Dev` 或更上层的 `package.json` 会把分组目录误判成项目根。**`.git` 搜索不受此限**——Git 自身的目录结构就是它的界。
 4. 都没有：
@@ -44,21 +45,34 @@ resolve(cwd) -> { status: 'ok', hash, root, kind: 'git'|'marker'|'self' }
 
 子模块的 `.git` 文件指向 `<parent>/.git/modules/<name>`，该目录下有 `commondir` 指向父仓库。按上面的规则会解析到**父仓库根**，即子模块与父仓库共用一个 project id。这是有意的：子模块是父仓库记录的一次 checkout，项目约定本该共享。这一条明确写下，避免实现者自行发挥。
 
+**本机未验证**：`git submodule add` 在本机报 `sh.exe` 错误，子模块的实际文件布局**没有实测**，上段是按 Git 文档的已知结构写的。实现期须补一条真实子模块用例（用例 61）。
+
 **`cwd === teamFolder` 不再直接判 `none`。** 这是 R1 的核心修正：从单仓库启动 DSH 时，团队工作区往往就是那个仓库的根。必须先走第 2、3 步；只有「团队工作区且整条向上链都没有 `.git` 和标记物」才判 `none`。
 
-**Windows 大小写：不折叠**
+**Windows 大小写：必须用 `realpathSync.native`，且不折叠**
 
-`realpathSync.native` 已经返回本机的实际大小写，那才是这个目录的真实名字。Windows 支持按目录启用区分大小写，两个只在大小写上不同的目录可以同时存在且是两个项目。因此：
+本机实测（Node 24.20.0，win32）——**两个同名 API 行为不同，这是坑**：
 
-- **不对 realpath 结果做 `toLowerCase()`**，直接用它作键。
-- 同一目录的不同写法（`D:\DEV\x` 与 `d:\dev\x`）经 realpath 后收敛到同一个实际大小写，自然同 id——不需要折叠也行。
+| 输入 | `realpathSync.native` | `realpathSync`（非 native） |
+|---|---|---|
+| `...\mixedcase` | `...\MiXeDCase` | `...\mixedcase` |
+| `...\MIXEDCASE` | `...\MiXeDCase` | `...\MIXEDCASE` |
+| `...\MiXeDcAsE` | `...\MiXeDCase` | `...\MiXeDcAsE` |
+
+结论与规则：
+
+- **只用 `realpathSync.native`**。非 native 版本原样保留调用方大小写，用它算 hash 会让同一目录产生多个 id——这是必须避开的实现陷阱。
+- native 给出的是磁盘上的**实际大小写**，三种写法已收敛到同一个值，因此**不必再 `toLowerCase()`**。
+- **也不能无条件折叠**：Windows 支持按目录启用区分大小写，两个只在大小写上不同的目录可以同时存在且是两个项目，折叠会把它们并成一个。本机 `fsutil file setCaseSensitiveInfo` 需管理员权限、**未能实测**，故按「可能成立」保守处理。
+- 顺手剥掉 `\\?\` 长路径前缀再算 hash。
 - realpath 失败（目录不存在、不可读）→ `unresolved`，不做「猜测式」兜底。
 
 **缓存**
 
 - `status: 'ok'` 按 cwd 字符串缓存，进程内长期有效。
 - **`none` / `unresolved` 只缓存 10 秒**，并在工作文件夹变更、换段（`parts.js:545/720` 的 `renewMemory` 调用点）时清除。这样「同一个 cwd 后来补了 `.git`」不会被永久冻结为错误结论。
-- **同步上下文怎么拿到 cwd**：`sectionFor`（`memory.js:838`）是同步函数，不能 `await rt.resolveAgent`。改为在 **Session 建立时与换段时**缓存 `sessionId → resolve(cwd)` 的结果（cwd 取自 `ctx.sessions.get(id)?.header?.cwd`，`dsh-session/lib/types/index.d.ts:447`，同步可读），键随 Session 生命周期；工作文件夹变更与换段按 `parts.js:545/720` 的现有调用点清除。提示词渲染直接读这份缓存。
+- **同步上下文怎么拿到 cwd**：`sectionFor`（`memory.js:838`）当前只收 `sessionId`，且是同步函数，不能 `await rt.resolveAgent`。**但 hook 的上下文里已有 agent**：`memory.js:887` 的 `text: context => sectionFor(context?.agent?.id)`，把签名改成收 `agent` 后，`ctx.sessions.get(agent.id)` 同步可取 `header.cwd`，`folders.js:28-29` 的 `sessionFolder` 与 `workingDirectory.get` 也都是同步的。因此 **project 段可以直接同步进冻结快照，不需要额外缓存层**。
+- 仍保留一层 `sessionId → resolve(cwd)` 的进程内缓存，只为省掉每次渲染的 realpath 与目录探测；`none`/`unresolved` 的短过期规则照旧。
 - 读数（提示词 section）与写数（`remember`、自动 review、面板）调**同一个函数**，没有第二条算法。
 
 **搬动与重命名**
@@ -86,10 +100,13 @@ resolve(cwd) -> { status: 'ok', hash, root, kind: 'git'|'marker'|'self' }
 | 写入路径 | 现有代码 | 现状 | 本项目要求 |
 |---|---|---|---|
 | `remember` / `forget` / `move` | `memory.js:949/985/1008` | 工具参数决定 scope | 有项目时缺省 = project |
-| 按回合的自动 review | `memory.js:1417` | `ownScope(bot.id)` 硬编码 | 有项目且 `change.team !== true` → project |
-| 记忆面板「问或更新」 | `memory.js:1259` | 同上硬编码 | 走同一判定点 |
+| 按回合的自动 review | `memory.js:1417`（读取在 `:1527-1528`） | `ownScope(bot.id)` 硬编码 | 有项目且 `change.team !== true` → project |
+| 记忆面板「问或更新」 | `memory.js:1250-1251`（写入在 `:1259`） | 同上硬编码 | 走同一判定点 |
+| 记忆面板摘要 | `memory.js:1218-1219`、`:816-819`（`memorySection`） | 只读 own + team | 读 project |
 | 面板单条删除 | `memory.js:1290` | 只认 team/own | 增加 project，且只能删该会话所属项目 |
 | 删 Bot 归档 | `memory.js:786-803` | `rename` 旁路 | 只归档 own；项目记忆不随 Bot 删除 |
+
+**硬编码 own+team 的位置共五处，必须一起改**：`memorySection:816`、`memoryView:1218`、`memoryAsk:1250`、`reviewSession:1527`、`applyReview:1417`。只在 `remember` 的默认值上加 project，结果是**面板看不到、摘要不含、复盘也写不进** project——这是该默认值的真实成本，不能省。
 
 收成一个函数 `writeScopeOf(sessionId, requested)`，上表路径全部调用它。这样「所有第一方写入」只有一个可被单测穷举的判定点。
 
@@ -171,8 +188,11 @@ PENDING --语义无效--> 计数，3 次后 SKIPPED（journal 带全文，可人
 PENDING --证据成立--> PLAN_WRITTEN --> APPLYING --> DONE
 ```
 
-- **`WAITING` 只看本候选自己**：只查本候选所属的 work（`handoffs.js:71` 的 `waits(workId)`，参数是 work id 而非 Bot）与该候选**当前所属 Session** 上的待答卡片。`state.questions` 以 Session id 为键（`parts.js:806` 换段时会把卡片搬到新段），所以**不能只查候选入队时的旧 sessionId**：还要查该 Bot 当前在用的会话（`rt.chatOf(botId)` + `rt.groupSessionsOf(botId)`，与 `handoffs.js:142` 的取法一致）里是否有同一 `questionId` 的卡片。**不扫该 Bot 其他群聊里无关的问题。**
-- **`WAITING` 的唤醒**：① 事件——子任务交回（`handoffs.js:39` `closeWork`）、问题被回答（`channel.js` 的 `answer-question`）、换段完成；② 重启——启动时扫 `task-plans/` 与 journal 中的 `task-candidate` 重建队列；③ 兜底——下一次该会话 idle。
+- **`WAITING` 只看本候选自己**：只查本候选所属的 work 与该候选**当前所属 Session** 上的待答卡片。
+  - `waits` 的导出名是 **`waitsWork`**（`handoffs.js:71` 定义、`:185` 导出），且它收的是 **work id**，不是 Bot id。`held` 未导出；`waitingView`/`statusOf` 虽导出，但 `waitingView` 走 `held(busyWith(...))`（`:114-117`），会**排除正在回合里的 work**——调用 `complete_task` 的 Bot 此刻正好在回合里，因此**不能拿它当闸门**。需要新增 `pendingWorkOf(botId)`（约 3 行：遍历 `works()`，判 `work.to === botId && work.open.length > 0`）。
+  - `state.questions` 以 Session id 为键（`tools.js:543`、`channel.js:272`），换段时 `parts.js:805-808` 把卡片搬到 `freshId`。所以**不能只查候选入队时的旧 sessionId**：还要查该 Bot 当前在用会话（`rt.chatOf(botId)` + `rt.groupSessionsOf(botId)`）里是否有同一 `questionId` 的卡片。**不扫该 Bot 其他群聊里无关的问题。**
+- **`WAITING` 的唤醒**：① 事件——子任务交回（`handoffs.js:39` `closeWork`）、问题被回答（`channel.js` 的 `answer-question`）、换段完成；② 重启——启动时扫 `task-plans/` 重建队列；③ 兜底——下一次该会话 idle。
+- **journal 目前只写不读**：`memory-files.js` 里只有 `journal()` 写入（`:9`、`:31-71`），**全仓没有解析器**（测试与 bench 里有各自的读取小工具，不在产品代码里）。因此「重启后读 journal 恢复」必须**新写一个读端**：逐行 `JSON.parse`，**坏行跳过并计数**（记 `op:'journal-skipped'` 或只在诊断里报告），不能因一行损坏整批放弃。恢复的主依据是 `task-plans/`，journal 是补充与审计。
 - **`memoryReview: false` 同时关闭新复盘**（`memory.js:503` 的 `reviewOn` 是现成开关）。如需分开，再加 `taskReview`，默认取 `reviewOn` 的值。本稿默认跟随，不新增配置项。
 - 语义无效复用 `REJECTIONS_MAX = 3`（`memory.js:52`）的量级。
 
@@ -261,10 +281,12 @@ CREATE VIRTUAL TABLE entries USING fts5(
 );
 CREATE TABLE files (
   scope TEXT, file TEXT,
-  hash TEXT,       -- 已提交内容的 sha256，一致性判定用
+  hash TEXT,       -- 已提交内容的 sha256，一致性判定的唯一依据
   PRIMARY KEY (scope, file)
 );
 ```
+
+`files` 表**只存 hash**，不存 mtime/size——本设计不用 mtime+size 判定新鲜度（同大小同时间戳的改写会漏）。`store.js:30` 的 `stamp()` 是 store 内部常量、未导出；即使将来需要时间戳，`memory-index` 也要自己写，不能引用它。
 
 ### 5. 索引一致性（R3）
 
@@ -284,9 +306,20 @@ CREATE TABLE files (
 
 这个方案**不需要任何写入钩子**，因此天然覆盖：
 
-- `memory.js:771` 的 `moveEntry` 直接 `writeText(main.path, next)`，不经 `commit`；
-- `memory.js:800` 的 `archiveBotMemory` 走 `rename`；
+- `memory.js:771` 的 `moveEntry` 直接 `writeText(main.path, next)`，不经 `commit`；它随后只写 journal（`:776`）；
+- `memory.js:800` 的 `archiveBotMemory` 走 `rename`，随后写 journal（`:801`）；
 - 用户手工改写，包括**同大小、同 mtime 的改写**（比 mtime+size 可靠，因为比的是内容）。
+
+**关于「挂在 journal 上」这个备选，明确否掉**
+
+有人会想「journal 是唯一全覆盖的漏斗，把失效钩子挂在 journal 记录上」——`add/replace/remove/move/archive` 确实都写 journal（`:670/704/720/776/801`），且 journal 落地时数据已在盘上。但它有四个问题：
+
+1. journal 目前**只写不读**，没有解析器；
+2. `journal()` 失败时 `move` 只 `warn` 不抛（`:777-779`），钩子会静默丢失；
+3. 它依赖「每个写路径都记得记一笔 journal」这一约定，未来新增路径容易漏——正是这次 `moveEntry` 暴露的同类问题；
+4. 手工改写根本不产生 journal。
+
+内容比对不依赖任何约定，代价是每次读一遍 Markdown。结论：**用内容比对，不用 journal 钩子。**
 
 **这不构成断电原子性保证**：普通 `fs` 写入（`writeText` 的 temp+rename，`memory.js:115-142`）只保证「不会留下半个目标文件」，不保证跨文件、跨 `journal` 的断电一致性。索引侧靠「下次比对内容」自我纠正；记忆侧靠既有 journal 与 `task-plans` 的恢复规则。
 
@@ -296,7 +329,8 @@ CREATE TABLE files (
 
 **排序与过滤**
 
-- 权限过滤在 SQL 层：`scope IN (<本次白名单>)` 先过滤，再 `MATCH`，再 `LIMIT`。**顺序不能倒**——先 LIMIT 再过滤会把别的项目的命中挤掉，返回不足量。
+- 权限过滤在 SQL 层：`scope IN (SELECT value FROM json_each(?))` 先过滤，再 `MATCH`，再 `LIMIT`。**顺序不能倒**——先 LIMIT 再过滤会把别的项目的命中挤掉，返回不足量。
+- 这个写法**不会让 FTS 掉出索引扫描**：已实测 `EXPLAIN QUERY PLAN` 仍是 `SCAN e VIRTUAL TABLE INDEX 0:M4`（与纯 `MATCH` 相同）；4000 行下 1.34 ms vs 字面量 `IN` 1.21 ms。**这是探针数据，不是产品性能承诺。**
 - 排序两条：`rank`（BM25），同分按 `own > project > team`，再按 `added` 新到旧。
 
 ### 6. 检索语义（R7）
@@ -308,7 +342,7 @@ CREATE TABLE files (
 | 空查询 | 仍返回「存了什么」的目录式列举（数量、大小、主题列表），不报错、不返回空 |
 | `topic` 参数 | 仍整份读一个主题，不受索引影响 |
 | 全词优先 | 先找含全部词的条目；没有才退化为「含最多词」 |
-| 短长混合查询 | ≥3 字走 FTS `MATCH`，1–2 字走 `LIKE`（`chat-index.js:23-42` 的既有手法）。已实测：trigram 下两字中文词命中为 0，`LIKE` 回退是必需项 |
+| 短长混合查询 | ≥3 字走 FTS `MATCH`，1–2 字走 `LIKE`（`chat-index.js:23-42` 的既有手法）。**已实测**（Node 24.20.0 / SQLite 3.53.4）：trigram 下 `"记忆"` 命中 0、`"项目记忆"` 命中 1、英文 `"id"` 命中 0，而 `LIKE '%记忆%'` 命中 1。**`LIKE` 回退是必需项，不是优化** |
 | 引号与通配符 | 查询里的 `"` 按 FTS 短语转义（双写）；`%` `_` `\` 按 `LIKE ... ESCAPE '\'` 转义。**一律当字面量**，不当通配符 |
 | 排序稳定 | 同分时分档 + 时间，最后按 `file`+`line` 兜底，保证同一查询结果顺序可复现 |
 | 出错 | 索引异常必须报「检索暂不可用」或走扫描，**绝不能返回「没有记忆」**——把异常伪装成空结果会误导模型 |
@@ -369,9 +403,11 @@ CREATE TABLE files (
 
 **运行时可探测，不是人为授权阻塞。** 已实测（本轮，DSH Web 运行时）：DSH Web 进程为 `node C:\Program Files\nodejs\node.exe ... dsh/lib/bin.js web`，Node **24.20.0**；同运行时 `node:sqlite` 可用，SQLite **3.53.4**，`fts5 ... trigram` 建表与 `MATCH` 正常；两字中文词在 trigram 下命中 0，四字词命中 1。这是 runtime 探针，**不是产品已通过测试**。
 
+**桌面端：明确记为「未知」，不按「可用」设计。** 证据：DSH CLI 包 `package.json` 的 `bin` 是 `lib/bin.js`、无 electron 依赖；`lib/bin.js:36` 写明 desktop profile「由 Electron 应用独占管理」；本机 3080 端口由 `node.exe`（PID 40284）提供，`AppData\Local`、`Programs`、`Roaming` 下均无桌面端安装。**因此 `chat-index.js:76` 与 `usage.js:241` 只能证明 Node/Web 侧，不能证明 Electron。** 设计要求：`memory-index` 启动时 `try { await import('node:sqlite') }`，失败则 `warn` 并返回 `null`，主路径回退扫 Markdown（与 `chat-index.js:71-101` 同款）；**验收只写「后端探测失败不崩且回退」，不写「Electron 可用」**。旁证：DSH 自己的 `dsh-session-query-sqlite/lib/index.js:50` 也是 `await import("node:sqlite")`，但它用 `unicode61`，不是 `trigram`。
+
 1. **P1 项目隔离**：`project-scope.js` + project 存储 + `recall`/`remember` 的 scope + 提示词 + `writeScopeOf` 收敛。此时仍用现有子串检索，可独立验收。
 2. **P2 全文索引**：`memory-index.js` + 内容比对刷新 + 重建端点 + 运行时探测。
-3. **P3 任务复盘**：`complete_task` + `task-review.js` + 证据核验 + 计划持久化与恢复。
+3. **P3 任务复盘**：`complete_task` + `task-review.js` + 证据核验 + 计划持久化与恢复（含**新写 journal 读端**）。
 4. **P4 验收与文档**：补齐用例、`docs/plans` 定稿、README（英文与中文同步）。
 
 每阶段单独 PR，指向 `dev`，不改 `CHANGELOG.md`。
@@ -447,8 +483,16 @@ CREATE TABLE files (
 | 58 | 入队 `ok`、执行时变 `unresolved` | 回 `WAITING`，不计数、不丢弃 |
 | 59 | `projectMemory:false` 时面板选项目 | 拒绝（三查里的「未被配置关闭」） |
 | 60 | 索引不可用且扫描也失败 | **显式报错**；绝不返回静默空列表 |
+| 61 | 真实子模块（父仓库 `modules/N` + `commondir`） | 与父仓库同 hash；`git submodule add` 本机未跑通，实现期须补 |
+| 62 | `.git` 文件写绝对路径（git 2.55 的实际形态） | 正确解析 |
+| 63 | `.git` 文件写相对路径 | 相对 `.git` 所在目录解析 |
+| 64 | cwd 在 `ds-bot/`（`.git` 在父目录） | 向上找到 `deepseek-bot` 仓库根 |
+| 65 | 同一目录三种大小写写法 | `realpathSync.native` 收敛为同一 hash；用非 native 的写法应作为反例被单测拒绝 |
+| 66 | 主仓库 `.git` 为目录、无 `commondir` | 直接用该目录，不报错 |
+| 67 | journal 某行损坏 | 跳过坏行并计数，其余记录仍可读；不整批放弃 |
+| 68 | 后端无 `node:sqlite`（模拟导入失败） | `warn` + 返回 null + 扫 Markdown；**不崩**（不写「Electron 可用」） |
 
-无法在本阶段验证的：桌面 Electron 端 sqlite（只影响平台声明）、崩溃注入点（需实现留钩子）。均为实现期验收项。
+无法在本阶段验证的：桌面 Electron 端 sqlite（只影响「已验证平台」表述）、崩溃注入点（需实现留钩子）、大小写敏感目录（`fsutil` 需管理员权限）、真实子模块（`git submodule add` 报 `sh.exe` 错）。均为实现期验收项。
 
 ## 成本与风险
 
@@ -470,7 +514,7 @@ CREATE TABLE files (
 
 ## 评审状态（R1–R7）
 
-**设计结论：R1/R2/R5/R6/R7 已通过复审；R3/R4 待插件工程师交回。**
+**设计结论：R1–R7 全部通过复审。设计阶段结束。**
 **代码：尚未实现；运行测试：待实施。**
 
 | # | 评审问题 | 本稿处置 | 复审方 | 状态 |
@@ -481,10 +525,12 @@ CREATE TABLE files (
 | R1-c | 同步 `sectionFor` 拿不到 cwd（`resolveAgent` 是异步） | §1：Session 建立/换段时缓存 `sessionId → resolve(cwd)`，渲染读缓存 | 架构师 | 已收（本轮），仍需实现期验证 |
 | R2 | 快照只校验 `teamRule`；面板摘要按 bot 键 | §7：快照首行带版本+排序 scope 集合；摘要键加 scopeSetHash；异步回包比对后落地 | 架构师 | **通过**（附注记） |
 | R2-a | scope 标识不能替代原有 `teamRule`/角色校验 | §7 明写：两者任一不符都重建；旧无 v2 头快照视为过期 | 架构师 | 已收（本轮） |
-| R3 | `moveEntry:771` 与 `rename` 旁路；两套派生状态 | §5：每次 `recall` 做已提交内容 hash 比对，hash 存 `files` 表，同事务刷新；删除 `index-dirty.json`/`index-hashes.json` | 插件工程师 | **核验中** |
+| R3 | `moveEntry:771` 与 `rename` 旁路；两套派生状态 | §5：每次 `recall` 做已提交内容 hash 比对，hash 存 `files` 表，同事务刷新；删除 `index-dirty.json`/`index-hashes.json` | 插件工程师 | **通过** |
+| R3-c | 「把失效钩子挂在 journal 上」这个备选是否更好 | §5 明确否掉：journal 只写不读、`move` 写 journal 失败仅 warn（`:777-779`）、依赖「每条路径记得记一笔」的约定、手工改写不产生 journal | 插件工程师 | 已收（本轮） |
 | R3-a | 需比较完整文件集合；删除/归档文件要同事务删旧行 | §5 第 2 步写明三种情形（多、缺、变），同一事务 | 插件工程师 | 已收（本轮） |
 | R3-b | 刷新可能采到 `moveEntry` 两步中间态 | §5 第 4 步：刷新前 `await` 既有写队列（`memory.js:551-556`）尾部 | 插件工程师 | 已收（本轮） |
-| R4 | `entryId` 稳定性依赖计划持久化；journal 不够 | §3：不可变 `task-plans/<candidateId>.json`；恢复只读计划、不再调模型 | 插件工程师 | **核验中** |
+| R4 | `entryId` 稳定性依赖计划持久化；journal 不够 | §3：不可变 `task-plans/<candidateId>.json`；恢复只读计划、不再调模型 | 插件工程师 | **通过** |
+| R4-f | journal 只写不读，无解析器 | §3：明确要新写读端，坏行跳过并计数，不整批放弃；恢复主依据是 `task-plans/` | 插件工程师 | 已收（本轮） |
 | R4-a | `candidateId` 生成规则被删 | §3 补回：`sha256(sessionId + '\n' + callId)` 前 32 位 hex，纯安全文件名 | 插件工程师 | 已收（本轮） |
 | R4-b | 计划写入/done 更新要 temp+rename，done 不得早于条目提交 | §3 写明；`done` 只在完整条目写成功后追加 | 插件工程师 | 已收（本轮） |
 | R4-c | 仅正文存在不足以确认链接与元数据 | §3 恢复核对三项：`entryId`/最终格式整行/`[[topic]]` 链接；缺则补，元数据不符按 `replaceEntry` 修 | 插件工程师 | 已收（本轮） |
@@ -516,4 +562,5 @@ CREATE TABLE files (
 - 2026-10-22（修订 4）：收回桌面探针授权阻塞，改运行时探测；面板显式项目上下文；幂等定死逐项恢复；补逐项关闭表。
 - 2026-10-22（修订 5）：按 R1–R7 全面修订——项目身份重写（Git 优先、teamFolder 不短路、大小写不折叠、缓存过期）；快照与面板摘要加 scope 版本；索引改为内容比对并删除两套派生状态；提取计划持久化与强杀恢复边界；候选绑定/重校验/全链路脱敏/WAITING 收窄/review 抢写约束；面板与 API 权限边界；查询语义七条。删除「对方没有实现」的断言，改为固定 commit 引用。**该轮评审未通过。**
 - 2026-10-22（修订 6）：收架构师 R1/R2 三条注记（标记物搜索加界、子模块归父仓库、同步 cwd 缓存）；收本轮补充检查点：R3 比较完整文件集合 + 队列边界一致视图 + 不断电原子承诺、R4 补回 candidateId 规则与 temp+rename/done 顺序/三项恢复核对/损坏隔离/冲突停止、R5 file 真实路径校验 + 换段后待答卡片 + unverified 不入库 + 失败根因不连带、R2 保留 teamRule 校验。新增 13 条验收用例（40–52）。**评审状态：R1/R2 已通过，R3–R7 待插件工程师与测试工程师交回。**
-- 2026-10-22（修订 7，本稿）：收测试工程师 R5/R6/R7 复审。把「原文支持该主张」落成两道闸（evidence 逐字子串为机械闸、模型 yes/no 为可复核闸）；project 校验改为四种转移，`unresolved→ok` 重绑定不丢候选；补用例 53–60（evidence 伪造、闸二 no/yes、project 四种转移、`projectMemory:false`、扫描失败显式报错）；用例 17 明确「非空或显式报错，二者其一」。R1/R2/R5/R6/R7 通过，R3/R4 待交回。
+- 2026-10-22（修订 7）：收测试工程师 R5/R6/R7 复审。把「原文支持该主张」落成两道闸（evidence 逐字子串为机械闸、模型 yes/no 为可复核闸）；project 校验改为四种转移，`unresolved→ok` 重绑定不丢候选；补用例 53–60（evidence 伪造、闸二 no/yes、project 四种转移、`projectMemory:false`、扫描失败显式报错）；用例 17 明确「非空或显式报错，二者其一」。R1/R2/R5/R6/R7 通过，R3/R4 待交回。
+- 2026-10-22（修订 8，本稿）：收插件工程师 R3/R4 与运行时核实。①桌面端明确记为「未知」，不按可用设计（`lib/bin.js:36` 无 electron 依赖、本机无桌面安装），验收只写「探测失败不崩且回退」；②`realpathSync.native` 与非 native 行为不同的实测表；③`.git` 文件绝对/相对两种写法都要支持（git 2.55 实测为绝对路径）；④否掉「journal 钩子」备选并说明四个理由；⑤journal 只写不读，恢复要新写读端且跳过坏行；⑥五处硬编码 own+team 必须一起改；⑦`waitsWork` 命名与 `waitingView` 不适合当闸门，需新增 `pendingWorkOf`。新增用例 61–68。**R1–R7 全部通过，设计阶段结束。**
