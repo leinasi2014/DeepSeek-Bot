@@ -872,29 +872,33 @@ test('an answer that is no list of changes keeps the review\'s place, and the ne
 })
 
 test('an answer with a malformed change, an unlisted entry, an entry too long, or a bad topic changes nothing and keeps the review\'s place', async (t) => {
-  const replies = [
+  const invalid = [
     JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }, { op: 'add' }] }),
     JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }, { op: 'remove', entry: 7 }] }),
     JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }, { op: 'add', text: `The user tells ${'a long story '.repeat(30)}` }] }),
     JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }, { op: 'add', text: 'The user writes C++', topic: 'C++' }] }),
     JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }, { op: 'edit', entry: 1, text: 'The user likes green tea', kind: 'fact' }] }),
-    JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }, { op: 'add', text: 'I use hunter2 as my password' }] }),
   ]
-  const { ctx, call, read, requests, stop } = start({ replies, config: { memoryReviewDelayMs: 0 } })
-  t.after(() => stop())
-  await call('state', {})
-  for (let tries = 0; tries < 5; tries += 1) {
-    ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
-    await reviewed(call)
-    assert.throws(() => read('bots', 'b2', 'MEMORY.md'), { code: 'ENOENT' })
-    assert.deepEqual(JSON.parse(read('reviewed.json')), { 'chat:b2': 9 })
+  for (const [at, answer] of invalid.entries()) {
+    await t.test(`invalid answer ${at + 1}`, async (t) => {
+      const replies = [answer, JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }, { op: 'add', text: 'I use hunter2 as my password' }] })]
+      const { ctx, call, read, requests, stop } = start({ replies, config: { memoryReviewDelayMs: 0 } })
+      t.after(() => stop())
+      await call('state', {})
+      ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
+      await reviewed(call)
+      assert.throws(() => read('bots', 'b2', 'MEMORY.md'), { code: 'ENOENT' })
+      assert.deepEqual(JSON.parse(read('reviewed.json')), { 'chat:b2': 9 })
+      assert.deepEqual(JSON.parse(read('rejections.json'))['chat:b2'], { count: 1, at: 9 })
+      ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
+      await reviewed(call)
+      // A password is only left out: the rest is written and the place moves on.
+      assert.equal(requests.length, 2)
+      assert.deepEqual(parseMemory(read('bots', 'b2', 'MEMORY.md')).entries.map(entry => entry.text), ['The user likes tea'])
+      assert.deepEqual(JSON.parse(read('reviewed.json')), { 'chat:b2': 11 })
+      assert.equal(JSON.parse(read('rejections.json'))['chat:b2'], undefined)
+    })
   }
-  ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
-  await reviewed(call)
-  // A password is only left out: the rest is written and the place moves on.
-  assert.equal(requests.length, 6)
-  assert.deepEqual(parseMemory(read('bots', 'b2', 'MEMORY.md')).entries.map(entry => entry.text), ['The user likes tea'])
-  assert.deepEqual(JSON.parse(read('reviewed.json')), { 'chat:b2': 11 })
 })
 
 test('a backlog past the text limit is reviewed in passes, oldest first', async (t) => {
@@ -1522,4 +1526,153 @@ test('after a cleared count, the next reviews each read their own new lines', as
   // The counter after the clear counts only the new batch: two failures at cursor 14,
   // nothing carried over from the two before the readable answer.
   assert.deepEqual(JSON.parse(read('rejections.json'))['chat:b2'], { count: 2, at: 14 }, 'the count restarted at the new batch')
+})
+
+test('three semantically invalid reviews give up the batch, redact secrets, and start the next batch fresh', async (t) => {
+  const invalid = [
+    { name: 'unlisted entry', change: { op: 'edit', entry: 999, text: 'The user likes tea' } },
+    { name: 'entry too long', change: { op: 'add', text: `The user says ${'a long story '.repeat(30)}` } },
+    { name: 'invalid topic', change: { op: 'add', text: 'The user writes C++', topic: 'C++' } },
+  ]
+  for (const { name, change } of invalid) {
+    await t.test(name, async (t) => {
+      const lines = [
+        { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Please remember this' }] } } },
+      ]
+      const bad = JSON.stringify({ changes: [change] })
+      const { ctx, call, read, requests, journal, stop } = start({ replies: [bad, bad, bad, bad], history: { b2: lines }, config: { memoryReviewDelayMs: 0 } })
+      t.after(() => stop())
+      await call('state', {})
+      for (let at = 0; at < 3; at += 1) {
+        lines.push({ event: { seq: 11 + at, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: at === 0 ? 'the password\nis DEMO_ONLY' : `retry ${at}` }] } } })
+        ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'working' })
+        ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
+        await reviewed(call)
+        if (at < 2) {
+          assert.deepEqual(JSON.parse(read('rejections.json'))['chat:b2'], { count: at + 1, at: 9 })
+          assert.equal(JSON.parse(read('reviewed.json'))['chat:b2'], 9)
+        }
+      }
+      const skips = journal().filter(entry => entry.reason === 'invalid-review')
+      assert.equal(skips.length, 1)
+      assert.match(skips[0].after, /Please remember this/)
+      assert.match(skips[0].after, /left out: looks like a secret/)
+      assert.doesNotMatch(skips[0].after, /DEMO_ONLY/)
+      assert.equal(JSON.parse(read('reviewed.json'))['chat:b2'], 13)
+      assert.equal(JSON.parse(read('rejections.json'))['chat:b2'], undefined)
+      assert.throws(() => read('bots', 'b2', 'MEMORY.md'), { code: 'ENOENT' })
+      lines.push({ event: { seq: 14, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'A new batch' }] } } })
+      ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'working' })
+      ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
+      await reviewed(call)
+      assert.equal(requests.length, 4)
+      assert.deepEqual(JSON.parse(read('rejections.json'))['chat:b2'], { count: 1, at: 13 })
+      assert.equal(journal().filter(entry => entry.reason === 'invalid-review').length, 1)
+    })
+  }
+})
+
+test('semantically invalid group reviews use their own rejection count', async (t) => {
+  const bad = JSON.stringify({ changes: [{ op: 'remove', entry: 999 }] })
+  const { ctx, call, read, requests, journal, stop } = start({ replies: [bad, bad, bad], config: { memoryReviewDelayMs: 0 } })
+  t.after(() => stop())
+  await call('state', {})
+  for (let at = 0; at < 3; at += 1) {
+    ctx.emit('agent/status', { agent: { id: 'g3' }, status: 'working' })
+    ctx.emit('agent/status', { agent: { id: 'g3' }, status: 'idle' })
+    await reviewed(call)
+    if (at < 2) assert.deepEqual(JSON.parse(read('rejections.json'))['group:r1:b3'], { count: at + 1, at: 0 })
+  }
+  assert.equal(requests.length, 3)
+  assert.deepEqual(JSON.parse(read('reviewed.json')), { 'group:r1:b3': 3 })
+  assert.equal(JSON.parse(read('rejections.json'))['group:r1:b3'], undefined)
+  assert.equal(journal().find(entry => entry.reason === 'invalid-review').scope, 'group:r1:b3')
+})
+
+test('a model connection failure neither counts nor clears a rejected answer', async (t) => {
+  const bad = JSON.stringify({ changes: [{ op: 'remove', entry: 999 }] })
+  const { ctx, call, read, requests, stop } = start({ replies: [bad, new Error('connection unavailable'), bad, JSON.stringify({ changes: [] })], config: { memoryReviewDelayMs: 0 } })
+  t.after(() => stop())
+  await call('state', {})
+  for (let at = 0; at < 4; at += 1) {
+    ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'working' })
+    ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
+    await reviewed(call)
+    if (at < 3) {
+      assert.deepEqual(JSON.parse(read('rejections.json'))['chat:b2'], { count: at < 2 ? 1 : 2, at: 9 })
+      assert.equal(JSON.parse(read('reviewed.json'))['chat:b2'], 9)
+    }
+  }
+  assert.equal(requests.length, 4)
+  assert.equal(JSON.parse(read('reviewed.json'))['chat:b2'], 11)
+  assert.equal(JSON.parse(read('rejections.json'))['chat:b2'], undefined)
+})
+
+test('a failed memory write neither counts nor clears a rejected answer', async (t) => {
+  const bad = JSON.stringify({ changes: [{ op: 'remove', entry: 999 }] })
+  const { ctx, home, call, read, requests, stop } = start({ replies: [bad, JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }] }), bad, JSON.stringify({ changes: [] })], config: { memoryReviewDelayMs: 0 } })
+  t.after(() => stop())
+  await call('state', {})
+  const journalPath = join(home, 'memory', 'journal.jsonl')
+  for (let at = 0; at < 4; at += 1) {
+    if (at === 1) mkdirSync(journalPath)
+    if (at === 2) rmSync(journalPath, { recursive: true })
+    ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'working' })
+    ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
+    await reviewed(call)
+    if (at < 3) {
+      assert.deepEqual(JSON.parse(read('rejections.json'))['chat:b2'], { count: at < 2 ? 1 : 2, at: 9 })
+      assert.equal(JSON.parse(read('reviewed.json'))['chat:b2'], 9)
+    }
+  }
+  assert.equal(requests.length, 4)
+  assert.equal(JSON.parse(read('reviewed.json'))['chat:b2'], 11)
+  assert.equal(JSON.parse(read('rejections.json'))['chat:b2'], undefined)
+})
+
+test('a failed skip journal keeps the rejected batch pending until the journal can be written', async (t) => {
+  const bad = JSON.stringify({ changes: [{ op: 'remove', entry: 999 }] })
+  const { ctx, home, call, read, journal, stop } = start({ replies: [bad, bad, bad, bad], config: { memoryReviewDelayMs: 0 } })
+  t.after(() => stop())
+  await call('state', {})
+  const journalPath = join(home, 'memory', 'journal.jsonl')
+  for (let at = 0; at < 4; at += 1) {
+    if (at === 2) mkdirSync(journalPath)
+    if (at === 3) rmSync(journalPath, { recursive: true })
+    ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'working' })
+    ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
+    await reviewed(call)
+    if (at === 2) {
+      assert.equal(JSON.parse(read('reviewed.json'))['chat:b2'], 9)
+      assert.deepEqual(JSON.parse(read('rejections.json'))['chat:b2'], { count: 3, at: 9 })
+    }
+  }
+  assert.equal(JSON.parse(read('reviewed.json'))['chat:b2'], 11)
+  assert.equal(JSON.parse(read('rejections.json'))['chat:b2'], undefined)
+  assert.equal(journal().filter(entry => entry.reason === 'invalid-review').length, 1)
+})
+
+test('giving up a semantically invalid batch continues with the remaining new lines', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-'))
+  mkdirSync(join(home, 'memory'), { recursive: true })
+  writeFileSync(join(home, 'memory', 'reviewed.json'), JSON.stringify({ 'chat:b2': 19 }))
+  const notes = Array.from({ length: 8 }, (_, at) => ({ event: { seq: 20 + at, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: `Note ${at + 1} ${'x'.repeat(2480)}` }] } } }))
+  const bad = JSON.stringify({ changes: [{ op: 'remove', entry: 999 }] })
+  const { ctx, call, read, requests, journal, stop } = start({ home, replies: [bad, bad, bad, JSON.stringify({ changes: [] })], history: { b2: notes }, config: { memoryReviewDelayMs: 0 } })
+  t.after(() => stop())
+  await call('state', {})
+  for (let at = 0; at < 3; at += 1) {
+    ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'working' })
+    ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
+    await reviewed(call)
+  }
+  assert.equal(requests.length, 4)
+  const skip = journal().find(entry => entry.reason === 'invalid-review')
+  assert.equal(skip.truncated, true)
+  assert.match(skip.after, /Note 1/)
+  assert.match(skip.after, /Note 6/)
+  assert.doesNotMatch(skip.after, /Note 7/)
+  assert.match(requests[3].messages[0].content[0].text, /oldest first:\nUser: Note 7 /)
+  assert.equal(JSON.parse(read('reviewed.json'))['chat:b2'], 27)
+  assert.equal(JSON.parse(read('rejections.json'))['chat:b2'], undefined)
 })
