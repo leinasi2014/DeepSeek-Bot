@@ -15,7 +15,7 @@
 | 项 | 状态 | 证据 | 备注 |
 |---|---|---|---|
 | 既有代码基线（未合并新功能时） | 实测 | `npm test` 727/727 | 只证明基线没坏 |
-| #52 单测与行为测试 | 实测 | **最终头 `27e599b`**（Chief 2026-10-22 末次裁定）：干净 detached worktree 复跑，全量 **746/746 pass / 0 fail / 0 skip**，`memory-project.test.js` **7/7**（含 `edb6345` 的第 8 条 edit/move/remove 回归；team 用例随 revert 撤掉，故比 747 少 1） | 头链：`5542df2`(team 修复)→`edb6345`(第 8 条回归)→**`27e599b`(revert team 修复，最终头)**。注：本地另有未推送的 `b6379c8`（revert 的 revert，树与 `edb6345` 相同），**未推 origin，不作为基准** |
+| #52 单测与行为测试 | 实测 | **最终头 `27e599b`**（Chief 2026-10-22 末次裁定）：干净 detached worktree 复跑，全量 **746/746 pass / 0 fail / 0 skip**，`memory-project.test.js` **7/7**（含 `edb6345` 的第 8 条 edit/move/remove 回归；team 用例随 revert 撤掉，故比 747 少 1） | 头链：`5542df2`(team 修复)→`edb6345`(第 8 条回归)→**`27e599b`(revert team 修复，最终头)**。**待归位**：我核对时 `feat-52` 工作区 HEAD 为未推送的 `b6379c8`（revert 的 revert，树同 `edb6345`，`team-write-denied` 命中 1）；须丢弃该提交、让远端落在 `27e599b`，本行数字才与远端一致 |
 | #53 接线后全量测试 | 实测 | 我实测 `c0a3f11` 与 `4b6f1eb`（`Restore the team-write refusal, which the maintainer kept in scope`）均 **758/758** | **待重算**：#52 最终头改为 `27e599b`（撤回 team 修复）后，#53 须按它重新并入，届时全量应为 **757**（758 − 1 条 team 用例）。上表 758 对应的是仍含 team 修复的旧头，不能当作最终值 |
 | #54 接线后全量测试 | 实测 | 我实测 `16ee6ae` 与 `114a4a0`（`Merge the memory index branch with the team-write refusal restored`）均 **782/782** | **待重算**：同上，#54 须并入按 `27e599b` 重做的 #53，届时应为 **781**。演进：761→762→773→776→779（`754ffb5` 三处补证）→782/781 |
 | `node:sqlite` + FTS5 trigram 在 Node 侧可用 | 实测 | 设计 §8 记录的探针：建表、长中文 MATCH、短中文 LIKE、scope 过滤均通过 | 只覆盖 Node/Web 侧 |
