@@ -16,8 +16,8 @@
 |---|---|---|---|
 | 既有代码基线（未合并新功能时） | 实测 | `npm test` 727/727 | 只证明基线没坏 |
 | #52 单测与行为测试 | 实测 | **A 案**（撤回态 `4db72d4`，树 `048340de…`，team 命中 0，项目用例 7 条）：**746/746**。**B 案**（恢复态 `b6379c8`，树 `44e60ac9…`，team 命中 1，项目用例 8 条）：**747/747**。两案均我本机 detached worktree 干净树实测 | **A/B 待 maintainer 定夺，本文并列记录，不写「已修复」**。⚠️ 远端 `ls-remote` 实查：`feat/52-project-scope` 指向 **`b6379c8`（B 案内容）**，而 `4db72d4` 仅为祖先；即口径写 A、远端实为 B。历史：`5542df2`→`edb6345`→`27e599b`→`e604034`→`4db72d4`→`49e9801`→`ed06b97`→`b6379c8` |
-| #53 接线后全量测试 | 实测 | 远端实查 head `2e3e9b2`（`Restore the team-write refusal, the final ruling`，team 命中 1）：**758/758**。A 案对应 head（team 命中 0）：**757/757** | 同一分支两案相差恰为 team 那 1 条用例；以定夺结果为准 |
-| #54 接线后全量测试 | 实测 | 远端实查 head `0d8dac0`（`Merge the memory index branch with the team-write refusal restored`，team 命中 1）：**782/782**。A 案对应 head（team 命中 0）：**781/781**。演进：761→762→773→776→779→782 | 同 #53 |
+| #53 接线后全量测试 | 实测 | 远端实查 head **`2e3e9b2`**（`Restore the team-write refusal, the final ruling`，team 命中 1）：**758/758**。A 案对应 head（team 命中 0）：**757/757** | 同一分支两案相差恰为 team 那 1 条用例；以定夺结果为准 |
+| #54 接线后全量测试 | 实测 | 远端实查 head **`0d8dac0`**（`Merge the memory index branch with the team-write refusal restored`，team 命中 1）：**782/782**。A 案对应 head（team 命中 0）：**781/781**。演进：761→762→773→776→779→782 | 同 #53。另：`task-review-wiring` 的「a verified claim writes one entry with its review id, and the plan is kept」曾 10 跑 1 挂（`APPLYING` vs `DONE`），根因是产品先写 Markdown、之后才落 `DONE`（`task-review.js:230-257`），用例等文件出现就断言、撞在两次写之间；**已改用例等两者同时成立**，属用例竞态而非产品缺陷（`APPLYING` 是崩溃恢复的合法中间态） |
 | `node:sqlite` + FTS5 trigram 在 Node 侧可用 | 实测 | 设计 §8 记录的探针：建表、长中文 MATCH、短中文 LIKE、scope 过滤均通过 | 只覆盖 Node/Web 侧 |
 | **桌面 Electron 端的 `node:sqlite`** | **未验证** | 无 | 本机无 DSH 的 `app/` checkout，跑不了探针；桌面端必须走扫描回退 |
 | 原生 Windows 隔离 smoke | **未验证** | 无 | `dev/bench.sh` 需要 `deepseek-harness` checkout 与本机不符，尚未跑；不得计为通过 |
