@@ -179,6 +179,56 @@ test('the memory review skips project writes when the project is unresolved, and
   assert.match(skipped.problem, /nowhere/)
 })
 
+// A review that names the team memory while the Bot may not write it skips the
+// change with a record; it never lands in the Bot's own memory instead.
+test('the memory review refuses a team write the Bot may not make, instead of saving it to own', async t => {
+  const ctx = fakeContext()
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-project-rt-'))
+  const replies = [JSON.stringify({ changes: [{ op: 'add', text: 'Ship on Friday', team: true }] })]
+  const rt = {
+    ctx, home, config: { memoryReviewDelayMs: 0 }, state: { rooms: {} },
+    load: async () => {}, readOnly: () => undefined, warn: () => {},
+    botOf: id => bots[id], findBot: () => undefined,
+    selfOf: id => (id === 'sA' ? 'b2' : undefined),
+    // No Main Bot, no group admin: the team write is not this Bot's to make.
+    isMain: () => false, isBotSession: () => true, chatOf: botId => `chat-${botId}`, groupSessionsOf: () => [],
+    sessionsOfBot: () => ['sA'],
+    chatOwners: new Map([['sA', 'b2']]), groupOwners: new Map(), pastOwners: new Map(),
+    roomOf: () => undefined, partsOf: id => [{ sessionId: id }],
+    clock: () => '12:00', teamFolder: () => join(work, 'team'),
+    sessionFolder: session => sessions[session?.id ?? session]?.header?.cwd,
+    desiredModel: async () => undefined, defaultModel: async () => 'deepseek/v4',
+    async* eventsBackwards() { /* no saved history in this fixture */ },
+    async* partLines() { yield { who: 'user', text: 'Tell the team to ship on Friday.', seq: 10 } },
+  }
+  Object.assign(ctx, {
+    llm: {
+      listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }],
+      listModels: async () => [{ id: 'v4' }],
+      resolveModelInfo: async () => ({ reasoning: { efforts: [{ id: 'off' }] } }),
+      async* stream() {
+        const reply = replies.shift()
+        yield { type: 'text-delta', index: 0, text: reply ?? '' }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    },
+  })
+  installProjectScope(rt)
+  installMemory(rt)
+  t.after(async () => { await ctx.dispose(); rmSync(home, { recursive: true, force: true }) })
+  ctx.emit('agent/status', { agent: { id: 'sA', session: sessions.sA }, status: 'idle' })
+  for (let tries = 0; tries < 200 && rt.memoryReviews() > 0; tries += 1) await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(rt.memoryReviews(), 0, 'the review finished')
+  // Neither the team memory nor the Bot's own was written.
+  assert.equal(existsSync(join(home, 'memory', 'bots', 'b2')), false)
+  assert.equal(existsSync(join(home, 'memory', 'team')), false)
+  const records = readFileSync(join(home, 'memory', 'journal.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
+  const skipped = records.find(record => record.reason === 'team-write-denied')
+  assert.equal(skipped.op, 'skip')
+  assert.equal(skipped.scope, 'team')
+  assert.equal(skipped.after, 'Ship on Friday')
+})
+
 // Entries listed from a project memory are refused when the project breaks before
 // the review applies its changes: the edit, the move, and the remove each skip with
 // a record, and the project's files are untouched. The listing happened while the

@@ -162,10 +162,9 @@ test('scope: the automatic review defaults to project and rejects unresolved', a
     assert.match(log, /"reason":"project-unresolved"/)
     assert.match(log, /The deploy window is 8pm/)
   }
-  // Pre-existing behavior, final ruling (branch heads 3383ef8/dbf545d line): a review
-  // add with team:true that the Bot may not write is not refused; in a session with a
-  // project it lands in that project's memory (own, when there is none). The refusal
-  // episode is preserved in the branch history (5542df2 → final revert).
+  // An explicit team add by a Bot that may not write the team is refused — skipped
+  // and journaled, never redirected to own or project (fix 5542df2, final ruling:
+  // the refusal stays; the revert episode is recorded in the branch history).
   {
     const teamReply = JSON.stringify({ changes: [{ op: 'add', text: 'Ship on Friday', team: true }] })
     const s = startReview(scopeSessions.sA, [teamReply])
@@ -173,10 +172,13 @@ test('scope: the automatic review defaults to project and rejects unresolved', a
     t.after(async () => { await s.ctx.dispose(); rmSync(s.home, { recursive: true, force: true }) })
     s.ctx.emit('agent/status', { agent: { id: 'sA', session: scopeSessions.sA }, status: 'idle' })
     await new Promise(resolve => setTimeout(resolve, 50))
-    assert.equal(existsSync(join(s.home, 'memory', 'team')), false, 'team not written without permission')
+    assert.equal(existsSync(join(s.home, 'memory', 'team')), false, 'team not written')
+    assert.equal(existsSync(join(s.home, 'memory', 'bots', 'b2')), false, 'own not written')
     const alpha = s.rt.projectScope.resolve(scopeSessions.sA)
-    assert.match(readFileSync(join(s.home, 'memory', 'projects', alpha.hash, 'MEMORY.md'), 'utf8'), /Ship on Friday/, 'the ruled-in fallback: the add lands in the session project')
-    assert.equal(existsSync(join(s.home, 'memory', 'bots', 'b2')), false)
+    assert.equal(existsSync(join(s.home, 'memory', 'projects', alpha.hash)), false, 'project not the fallback either')
+    const log = readFileSync(join(s.home, 'memory', 'journal.jsonl'), 'utf8')
+    assert.match(log, /"reason":"team-write-denied"/)
+    assert.match(log, /Ship on Friday/)
   }
 })
 
