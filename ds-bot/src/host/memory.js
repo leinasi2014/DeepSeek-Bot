@@ -1596,12 +1596,47 @@ export function install(rt) {
       const op = String(change?.op ?? '')
       const topic = (op === 'add' || op === 'move') && change?.topic !== undefined ? cleanTopic(String(change.topic)) : undefined
       const target = numbered[Number(change?.entry) - 1]
+      const text = cleanEntry(change?.text)
       const projectWrite = projectOf(sessionId)
+      // An explicit team choice the Bot cannot write is refused outright — skipped
+      // with a record, never quietly redirected to its own memory, which would swap
+      // the scope the model named for another one.
+      if (op === 'add' && change.team === true && !teamWrites) {
+        rt.warn('ds-bot: memory review of %s skipped a change: it may not write the team memory', bot.name)
+        await journal({
+          op: 'skip',
+          scope: 'team',
+          file: topic === undefined ? MAIN : `${topic}.md`,
+          ...actorOf(actor),
+          after: text,
+          intendedOp: op,
+          reason: 'team-write-denied',
+        })
+        continue
+      }
+      // A change that belongs to the session's project is skipped when the project
+      // cannot be told apart — recorded like a full file, so a person can write it by
+      // hand. Neither an add nor a change to a project entry may slip into the Bot's
+      // own memory instead; the tools refuse the same writes for the same reason.
+      if (projectWrite.status === 'unresolved' && (op === 'add' ? change.team !== true : target?.scope === 'project')) {
+        rt.warn('ds-bot: memory review of %s skipped a change: the project of %s cannot be told apart: %s', bot.name, sessionId, projectWrite.reason)
+        await journal({
+          op: 'skip',
+          scope: 'project:unresolved',
+          file: target?.file?.file ?? (topic === undefined ? MAIN : `${topic}.md`),
+          ...actorOf(actor),
+          after: text,
+          before: target?.text,
+          intendedOp: op,
+          reason: 'project-unresolved',
+          problem: projectWrite.reason,
+        })
+        continue
+      }
       const scope = op === 'add'
         ? (change.team === true && teamWrites ? TEAM : projectWrite.status === 'ok' ? projectWrite.scope : ownScope(bot.id))
         : target?.scope === 'team' ? TEAM : target?.scope === 'project' ? (projectWrite.status === 'ok' ? projectWrite.scope : ownScope(bot.id)) : ownScope(bot.id)
       const label = labelOf(scope, bot.id)
-      const text = cleanEntry(change?.text)
       // The review is the main writer: its changes need the type too, or a howto it saves
       // is stored as a fact.
       const meta = {

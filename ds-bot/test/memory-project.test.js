@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -14,6 +14,11 @@ const projectB = join(work, 'beta')
 mkdirSync(join(projectA, '.git'), { recursive: true })
 mkdirSync(join(projectB, '.git'), { recursive: true })
 mkdirSync(join(projectA, 'pkg'), { recursive: true })
+// A repository whose .git pointer leads nowhere: not "no project", but one whose
+// project cannot be told apart — the state a broken gitdir leaves a Session in.
+const broken = join(work, 'broken')
+mkdirSync(broken)
+writeFileSync(join(broken, '.git'), 'gitdir: ../nowhere\n')
 const lost = join(work, 'gone')
 
 // Sessions with a working folder, the way DSH reports one.
@@ -21,6 +26,7 @@ const sessions = {
   sA: { id: 'sA', header: { cwd: join(projectA, 'pkg') } },
   sB: { id: 'sB', header: { cwd: projectB } },
   sLost: { id: 'sLost', header: { cwd: join(lost, 'x') } },
+  sBroken: { id: 'sBroken', header: { cwd: broken } },
 }
 const bots = { b2: { id: 'b2', name: 'Writer' }, b3: { id: 'b3', name: 'Reader' } }
 
@@ -31,9 +37,9 @@ function start(t) {
     ctx, home, config: { memoryReview: false }, state: { rooms: {} },
     load: async () => {}, readOnly: () => undefined, warn: () => {},
     botOf: id => bots[id], findBot: name => Object.values(bots).find(bot => bot.name === name),
-    selfOf: id => (id === 'sA' ? 'b2' : id === 'sB' ? 'b3' : id === 'sLost' ? 'b2' : undefined),
+    selfOf: id => (id === 'sA' || id === 'sBroken' || id === 'sLost' ? 'b2' : id === 'sB' ? 'b3' : undefined),
     isMain: () => false, chatOf: botId => `chat-${botId}`, groupSessionsOf: () => [],
-    sessionsOfBot: botId => (botId === 'b2' ? ['sA', 'sLost'] : ['sB']),
+    sessionsOfBot: botId => (botId === 'b2' ? ['sA', 'sLost', 'sBroken'] : ['sB']),
     groupOwners: new Map(), roomOf: () => undefined, partsOf: id => [{ sessionId: id }],
     clock: () => '12:00', teamFolder: () => join(work, 'team'),
     sessionFolder: session => sessions[session?.id ?? session]?.header?.cwd,
@@ -117,3 +123,179 @@ test('the panel names a conversation and reads its project; a foreign session is
 async function rt_forget(s, body) {
   await s.rt.memoryEndpoint('memory-forget', body)
 }
+
+// A review of a conversation whose project cannot be told apart (a broken gitdir)
+// must skip its project changes with a journal record, not save them to the Bot's
+// own memory — the same refusal the tools make.
+test('the memory review skips project writes when the project is unresolved, and journals them', async t => {
+  const ctx = fakeContext()
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-project-rt-'))
+  const replies = [JSON.stringify({ changes: [
+    { op: 'add', text: 'The deploy window is 8pm to 11pm' },
+    { op: 'add', text: 'Ship on Friday too', team: true },
+  ] })]
+  const rt = {
+    ctx, home, config: { memoryReviewDelayMs: 0 }, state: { rooms: {} },
+    load: async () => {}, readOnly: () => undefined, warn: () => {},
+    botOf: id => bots[id], findBot: () => undefined,
+    selfOf: id => (id === 'sBroken' ? 'b2' : undefined),
+    // A Main Bot, so the team change in the reply lands; the project one must not.
+    isMain: () => true, isBotSession: () => true, chatOf: botId => `chat-${botId}`, groupSessionsOf: () => [],
+    sessionsOfBot: () => ['sBroken'],
+    chatOwners: new Map([['sBroken', 'b2']]), groupOwners: new Map(), pastOwners: new Map(),
+    roomOf: () => undefined, partsOf: id => [{ sessionId: id }],
+    clock: () => '12:00', teamFolder: () => join(work, 'team'),
+    sessionFolder: session => sessions[session?.id ?? session]?.header?.cwd,
+    desiredModel: async () => undefined, defaultModel: async () => 'deepseek/v4',
+    async* eventsBackwards() { /* no saved history in this fixture */ },
+    async* partLines() { yield { who: 'user', text: 'The deploy window is 8pm to 11pm, and ship on Friday.', seq: 10 } },
+  }
+  Object.assign(ctx, {
+    llm: {
+      listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }],
+      listModels: async () => [{ id: 'v4' }],
+      resolveModelInfo: async () => ({ reasoning: { efforts: [{ id: 'off' }] } }),
+      async* stream() {
+        const reply = replies.shift()
+        yield { type: 'text-delta', index: 0, text: reply ?? '' }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    },
+  })
+  installProjectScope(rt)
+  installMemory(rt)
+  t.after(async () => { await ctx.dispose(); rmSync(home, { recursive: true, force: true }) })
+  ctx.emit('agent/status', { agent: { id: 'sBroken', session: sessions.sBroken }, status: 'idle' })
+  for (let tries = 0; tries < 200 && rt.memoryReviews() > 0; tries += 1) await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(rt.memoryReviews(), 0, 'the review finished')
+  // The project change went nowhere near the Bot's own memory; the team change, an
+  // explicit choice, still landed.
+  assert.equal(existsSync(join(home, 'memory', 'bots', 'b2')), false)
+  assert.match(readFileSync(join(home, 'memory', 'team', 'MEMORY.md'), 'utf8'), /Ship on Friday too/)
+  const records = readFileSync(join(home, 'memory', 'journal.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
+  const skipped = records.find(record => record.reason === 'project-unresolved')
+  assert.equal(skipped.op, 'skip')
+  assert.equal(skipped.after, 'The deploy window is 8pm to 11pm')
+  assert.match(skipped.problem, /nowhere/)
+})
+
+// A review that names the team memory while the Bot may not write it skips the
+// change with a record; it never lands in the Bot's own memory instead.
+test('the memory review refuses a team write the Bot may not make, instead of saving it to own', async t => {
+  const ctx = fakeContext()
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-project-rt-'))
+  const replies = [JSON.stringify({ changes: [{ op: 'add', text: 'Ship on Friday', team: true }] })]
+  const rt = {
+    ctx, home, config: { memoryReviewDelayMs: 0 }, state: { rooms: {} },
+    load: async () => {}, readOnly: () => undefined, warn: () => {},
+    botOf: id => bots[id], findBot: () => undefined,
+    selfOf: id => (id === 'sA' ? 'b2' : undefined),
+    // No Main Bot, no group admin: the team write is not this Bot's to make.
+    isMain: () => false, isBotSession: () => true, chatOf: botId => `chat-${botId}`, groupSessionsOf: () => [],
+    sessionsOfBot: () => ['sA'],
+    chatOwners: new Map([['sA', 'b2']]), groupOwners: new Map(), pastOwners: new Map(),
+    roomOf: () => undefined, partsOf: id => [{ sessionId: id }],
+    clock: () => '12:00', teamFolder: () => join(work, 'team'),
+    sessionFolder: session => sessions[session?.id ?? session]?.header?.cwd,
+    desiredModel: async () => undefined, defaultModel: async () => 'deepseek/v4',
+    async* eventsBackwards() { /* no saved history in this fixture */ },
+    async* partLines() { yield { who: 'user', text: 'Tell the team to ship on Friday.', seq: 10 } },
+  }
+  Object.assign(ctx, {
+    llm: {
+      listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }],
+      listModels: async () => [{ id: 'v4' }],
+      resolveModelInfo: async () => ({ reasoning: { efforts: [{ id: 'off' }] } }),
+      async* stream() {
+        const reply = replies.shift()
+        yield { type: 'text-delta', index: 0, text: reply ?? '' }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    },
+  })
+  installProjectScope(rt)
+  installMemory(rt)
+  t.after(async () => { await ctx.dispose(); rmSync(home, { recursive: true, force: true }) })
+  ctx.emit('agent/status', { agent: { id: 'sA', session: sessions.sA }, status: 'idle' })
+  for (let tries = 0; tries < 200 && rt.memoryReviews() > 0; tries += 1) await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(rt.memoryReviews(), 0, 'the review finished')
+  // Neither the team memory nor the Bot's own was written.
+  assert.equal(existsSync(join(home, 'memory', 'bots', 'b2')), false)
+  assert.equal(existsSync(join(home, 'memory', 'team')), false)
+  const records = readFileSync(join(home, 'memory', 'journal.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
+  const skipped = records.find(record => record.reason === 'team-write-denied')
+  assert.equal(skipped.op, 'skip')
+  assert.equal(skipped.scope, 'team')
+  assert.equal(skipped.after, 'Ship on Friday')
+})
+
+// Entries listed from a project memory are refused when the project breaks before
+// the review applies its changes: the edit, the move, and the remove each skip with
+// a record, and the project's files are untouched. The listing happened while the
+// project was whole; the apply happens after its .git broke, which is the window
+// the write-time re-check exists for.
+test('review changes to project entries are skipped when the project breaks before they apply', async t => {
+  const ctx = fakeContext()
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-project-rt-'))
+  const bots2 = { b2: { id: 'b2', name: 'Writer' } }
+  const release = {}
+  const rt = {
+    ctx, home, config: { memoryReviewDelayMs: 0 }, state: { rooms: {} },
+    load: async () => {}, readOnly: () => undefined, warn: () => {},
+    botOf: id => bots2[id], findBot: () => undefined,
+    selfOf: id => (id === 'sA' ? 'b2' : undefined),
+    isMain: () => false, isBotSession: () => true, chatOf: botId => `chat-${botId}`, groupSessionsOf: () => [],
+    sessionsOfBot: () => ['sA'],
+    chatOwners: new Map([['sA', 'b2']]), groupOwners: new Map(), pastOwners: new Map(),
+    roomOf: () => undefined, partsOf: id => [{ sessionId: id }],
+    clock: () => '12:00', teamFolder: () => join(work, 'team'),
+    sessionFolder: session => sessions[session?.id ?? session]?.header?.cwd,
+    desiredModel: async () => undefined, defaultModel: async () => 'deepseek/v4',
+    async* eventsBackwards() { /* no saved history in this fixture */ },
+    async* partLines() { yield { who: 'user', text: 'Note the deploy rules.', seq: 10 } },
+  }
+  const requests = []
+  Object.assign(ctx, {
+    llm: {
+      listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }],
+      listModels: async () => [{ id: 'v4' }],
+      resolveModelInfo: async () => ({ reasoning: { efforts: [{ id: 'off' }] } }),
+      async* stream(request) {
+        requests.push(request)
+        const reply = await new Promise(resolve => { release.go = resolve })
+        yield { type: 'text-delta', index: 0, text: reply }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    },
+  })
+  installProjectScope(rt)
+  installMemory(rt)
+  t.after(async () => { await ctx.dispose(); rmSync(home, { recursive: true, force: true }) })
+  // Two entries in alpha's project memory: one in MEMORY.md, one in a topic, so an
+  // edit, a move, and a remove each have a target.
+  const tool = (name, args) => ctx.registeredTools.get(name).execute(args, { agent: { id: 'sA', session: sessions.sA } })
+  await tool('remember', { text: 'Deploy at 8pm' })
+  await tool('remember', { text: 'Use pnpm', topic: 'build' })
+  const alpha = rt.projectScope.resolve(sessions.sA)
+  const before = readFileSync(join(home, 'memory', 'projects', alpha.hash, 'MEMORY.md'), 'utf8')
+  const topicBefore = readFileSync(join(home, 'memory', 'projects', alpha.hash, 'build.md'), 'utf8')
+  ctx.emit('agent/status', { agent: { id: 'sA', session: sessions.sA }, status: 'idle' })
+  for (let tries = 0; tries < 200 && requests.length === 0; tries += 1) await new Promise(resolve => setTimeout(resolve, 10))
+  // The review has listed the entries; break the repository and let the reply land.
+  rmSync(join(projectA, '.git'), { recursive: true })
+  writeFileSync(join(projectA, '.git'), 'gitdir: ../nowhere\n')
+  rt.projectScope.clearCache()
+  release.go(JSON.stringify({ changes: [
+    { op: 'edit', entry: 1, text: 'Deploy at 9pm' },
+    { op: 'move', entry: 1, topic: 'ops', text: 'Deploy at 8pm' },
+    { op: 'remove', entry: 2, text: 'Use pnpm' },
+  ] }))
+  for (let tries = 0; tries < 200 && rt.memoryReviews() > 0; tries += 1) await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(rt.memoryReviews(), 0, 'the review finished')
+  assert.equal(readFileSync(join(home, 'memory', 'projects', alpha.hash, 'MEMORY.md'), 'utf8'), before)
+  assert.equal(readFileSync(join(home, 'memory', 'projects', alpha.hash, 'build.md'), 'utf8'), topicBefore)
+  assert.equal(existsSync(join(home, 'memory', 'bots', 'b2')), false, 'nothing slipped into own')
+  const records = readFileSync(join(home, 'memory', 'journal.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
+  const ops = records.filter(record => record.reason === 'project-unresolved').map(record => [record.intendedOp, record.scope])
+  assert.deepEqual(ops, [['edit', 'project:unresolved'], ['move', 'project:unresolved'], ['remove', 'project:unresolved']])
+})
