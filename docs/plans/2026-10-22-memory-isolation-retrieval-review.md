@@ -3,7 +3,7 @@
 - 日期：2026-10-22
 - 相关：本设计稿（设计阶段，未实现）；参照 `docs/plans/2026-10-09-context-and-memory.md`、`2026-10-16-bot-handoffs.md`
 - 代码基线：`dev` @ `ba9757b`（含 PR #48/#49/#50 的记忆一致性修复）
-- 状态：**设计评审通过（R1–R7），其中 R1 的两条注记已按用户原生 Git 实测撤回改写（修订 9）。代码尚未实现，运行测试待实施，未合并、未部署。最终一致性检查由用户进行。**
+- 状态：**设计评审通过（R1–R7）；R1 两条注记已按原生 Git 实测撤回改写（修订 9）；R3/R4 复核意见已并入（修订 10）。代码尚未实现，运行测试待实施，未合并、未部署。最终一致性检查由用户进行。**
 
 ## 为什么
 
@@ -204,7 +204,7 @@ PENDING --证据成立--> PLAN_WRITTEN --> APPLYING --> DONE
   - `waits` 的导出名是 **`waitsWork`**（`handoffs.js:71` 定义、`:185` 导出），且它收的是 **work id**，不是 Bot id。`held` 未导出；`waitingView`/`statusOf` 虽导出，但 `waitingView` 走 `held(busyWith(...))`（`:114-117`），会**排除正在回合里的 work**——调用 `complete_task` 的 Bot 此刻正好在回合里，因此**不能拿它当闸门**。需要新增 `pendingWorkOf(botId)`（约 3 行：遍历 `works()`，判 `work.to === botId && work.open.length > 0`）。
   - `state.questions` 以 Session id 为键（`tools.js:543`、`channel.js:272`），换段时 `parts.js:805-808` 把卡片搬到 `freshId`。所以**不能只查候选入队时的旧 sessionId**：还要查该 Bot 当前在用会话（`rt.chatOf(botId)` + `rt.groupSessionsOf(botId)`）里是否有同一 `questionId` 的卡片。**不扫该 Bot 其他群聊里无关的问题。**
 - **`WAITING` 的唤醒**：① 事件——子任务交回（`handoffs.js:39` `closeWork`）、问题被回答（`channel.js` 的 `answer-question`）、换段完成；② 重启——启动时扫 `task-plans/` 重建队列；③ 兜底——下一次该会话 idle。
-- **journal 目前只写不读**：`memory-files.js` 里只有 `journal()` 写入（`:9`、`:31-71`），**全仓没有解析器**（测试与 bench 里有各自的读取小工具，不在产品代码里）。因此「重启后读 journal 恢复」必须**新写一个读端**：逐行 `JSON.parse`，**坏行跳过并计数**（记 `op:'journal-skipped'` 或只在诊断里报告），不能因一行损坏整批放弃。恢复的主依据是 `task-plans/`，journal 是补充与审计。
+- **候选队列单独落盘，恢复不读 journal**：`task-candidates.json`（temp+rename）。journal 目前只写不读（产品代码只有 `memory-files.js:9/31-71` 的写入），且强杀可能留下半行，**不适合承担恢复**；它只作审计。
 - **`memoryReview: false` 同时关闭新复盘**（`memory.js:503` 的 `reviewOn` 是现成开关）。如需分开，再加 `taskReview`，默认取 `reviewOn` 的值。本稿默认跟随，不新增配置项。
 - 语义无效复用 `REJECTIONS_MAX = 3`（`memory.js:52`）的量级。
 
@@ -234,8 +234,9 @@ PENDING --证据成立--> PLAN_WRITTEN --> APPLYING --> DONE
 
 **持久化提取计划（R4）**
 
-- **`candidateId` 的确定生成规则**：`candidateId = sha256(sessionId + '\n' + callId)` 的前 32 位小写 hex。只含 `[0-9a-f]`，**天然是安全文件名**（不会再被拼进路径的其它部分），与 `memory.js:509` 的 `safeId` 同理但更严。同一 turn 内重试、进程重启后重放日志，`callId` 不变 → 同一 `candidateId` → 同一份计划。
-- 文件名：`task-plans/<candidateId>.json`，**写一次后不可变**：
+- **`candidateId` 的确定生成规则**：`candidateId = sha256(sessionId + '\n' + callId)` 的前 32 位小写 hex。只含 `[0-9a-f]`，**天然是安全文件名**，与 `memory.js:509` 的 `safeId` 同理但更严。
+- **它去重的是「重放」，不是「模型重发」**：同一份日志重放时 `callId` 不变 → 同一 `candidateId`。但 `callId` 由每次工具调用新生成（`dsh-tools/lib/types/index.d.ts:217`），`turns.js:55-72` 的 retry 是让模型**重新调用**，会拿到新 `callId` → **新候选、新计划**。这类重复靠 `addNow` 的整句全等去重兜底（`memory.js:646-647`，`squash()` 后比较）；**措辞不同不保证**，这一点已在「已知限制」之外单列于下。
+- 文件：`task-plans/<candidateId>.json`，**写一次后不可变**：
 
 ```json
 { "version": 1, "candidateId": "…", "botId": "…", "sessionId": "…",
@@ -247,22 +248,32 @@ PENDING --证据成立--> PLAN_WRITTEN --> APPLYING --> DONE
       "outcome": "verified", "source": "part 2 #1234",
       "meta": { "kind": "howto", "added": "…" } }
   ],
-  "done": [] }
+  "done": [ { "entryId": "…", "file": "ops.md" } ] }
 ```
 
-- **不可变**：`items` 写定后不再改；恢复只读，**绝不重新调用模型生成新计划**。`done` 是唯一可追加的字段。
-- **写盘方式**：计划写入与 `done` 更新都用 **temp + rename**（复用 `memory.js:115-142` `writeTextTo` 的手法），不原地改写。**`done` 只能在对应条目的完整写入成功之后追加**，不能提前——否则崩溃后会把没写的条目当成写完。
-- **逐项恢复，核对三件事**：
+- **不可变**：`items` 写定后不再改；恢复只读，**绝不重新调用模型生成新计划**。`done` 是唯一可追加字段，每项记 `entryId` 与**它实际落到的文件**（由 `addNow` 返回值给出，见下）。
+- **身份是整行文本，不是字段**：`entryId` 只存在于计划与 `done` 里，**不写进条目行**。所以「该条目是否已落盘」的判定是**按计划里的 `line` 整行文本相等**，不是找 `entryId` 字段。两个内容完全相同的计划项会指向同一行（第二个 `addNow` 返回 `changed:false`，可接受）。
+- **写盘方式**：计划写入与 `done` 更新都用 **temp + rename**（`memory.js:115-142` 的手法）。**`done` 只能在对应条目完整写入成功之后追加**。
+- **去重优先于「补齐目标文件」——这是防死循环的关键**：`addNow` 的去重是**整 scope** 的（`matchEntries(allEntries(files), text)`，`memory.js:645-646`），不是只查目标文件。若该条目已在**别的主题文件**里，`addNow` 返回 `changed:false`，目标文件永远不会出现那一行。因此规则写死优先级：
+  1. `addNow` 返回 `changed:false` → **这一项即 `done`**，并把返回的 `file` 记进 `done`；**不再追写目标 topic**。
+  2. `changed:true` → 按返回的 `file` 核对整行，再补 `[[topic]]` 链接，然后 `done`。
+  3. 只有「`changed:true` 但目标文件里没有整行」才算异常，按 `replaceEntry` 语义修。
+- **逐项恢复，核对两件事**（identity 是整行文本）：
   1. `done` 是否已含该 `entryId`；
-  2. 目标文件的 committed view 里是否已有**该 `entryId` 对应的最终格式整行**（计划里的 `line`，含元数据）。**仅正文相同不够**：同文不同元数据是另一条条目（`memory.js:764-766` 的注释就是这个意思），也不能证明链接已写齐；
-  3. `MEMORY.md` 的 `## Index` 里是否有该 topic 的 `[[topic]]` 链接行。**缺则补**（`memory.js:195` `addLink`）。
-- **任何一项不满足就修复该项**：缺行 → 写行；缺链接 → 补链接；行在但元数据不符 → 视为未完成，重做该项（先按现有 `replaceEntry` 语义处理，不静默叠加第二条）。
-- **无变更的重复项也标 `done`**（`addNow` 返回 `changed:false` 时照样完成该计划项，`memory.js:646-647`），否则永远重试。
-- **计划损坏**：`task-plans/*.json` 解析失败 → **原文件改名隔离**（`task-plans/corrupt/<candidateId>.<ts>.json`），journal 记 `op:'task-plan-corrupt'` 并在记忆面板/诊断里报告「需要人工处理」，**不删除、不自动永久 skip、不重做**。
-- **人为冲突**：恢复时发现目标条目被手改成与计划不符（文本或元数据对不上），**停止该项**并记 `op:'task-plan-conflict'`，报告等待人工决定；**不自动覆盖用户的修改**。
-- **强杀恢复边界**：允许在「文件写成功、`done` 未落盘」之间被杀（恢复靠上面第 2、3 项核对 → 判已完成或补齐 → 补记 `done`）。**不承诺断电场景下 `task-plans/*.json` 自身不损坏**——损坏按上一段处理。
-- 提交粒度与恢复判定解耦：即使一次 `commit` 提交多条，恢复仍逐条按 `entryId` 判。
+  2. 该 `line` 是否已在**任一**该 scope 的已提交文件里（整行相等）。在 → 补 `done`（记实际文件）；不在 → 走上面的 `addNow` 流程。
+  `MEMORY.md` 的 `## Index` 里缺该 topic 的 `[[topic]]` 链接时补链接（`memory.js:195` `addLink`）。
+- **计划损坏**：`task-plans/*.json` 解析失败 → 原文件改名隔离到 `task-plans/corrupt/<candidateId>.<ts>.json`，journal 记 `op:'task-plan-corrupt'` 并在诊断里报告「需要人工处理」，**不删除、不自动永久 skip、不重做**。
+- **人为冲突**：条目被手改成与计划不符（整行对不上且不是 `changed:false` 那条路径）→ 停止该项，记 `op:'task-plan-conflict'`，**不覆盖用户的修改**。
+- **project 校验两次，都在计划之外**：计划不可变，`scope` 一旦落盘就固定。因此必须在 **①写计划之前** 与 **②apply 之前** 各校验一次；任一次不一致 → **整份计划作废**（`op:'task-plan-dropped'`，原因 `project-changed`），**不改写计划**。用例 56/57/58 覆盖候选层，计划层另加用例 71。
+- **强杀恢复边界**：允许在「文件写成功、`done` 未落盘」之间被杀（靠整行比对判已完成 → 补 `done`）。**不承诺断电场景下 `task-plans/*.json` 自身不损坏**——损坏按上面处理。
+- 提交粒度与恢复判定解耦：即使一次 `commit` 提交多条，恢复仍逐项按整行文本判。
 
+**候选队列单独落盘，journal 只作审计**
+
+`journal` 目前**只写不读**（产品代码只有 `memory-files.js:9/31-71` 的写入），而且是无限增长的 append-only；`memory-files.js:31-71` 的截断只发生在同进程 catch 到错误时，**被强杀会留下半行**。因此：
+
+- 恢复队列单独存 `task-candidates.json`（temp+rename，结构化、可整体重写），**不依赖读 journal**。
+- journal 仍是审计记录（谁、什么时候、改了什么），**不承担恢复职责**；将来若要读，必须容忍坏行并跳过计数。
 ### 4. 存储与数据模型
 
 **根目录**：`ds-bot/index.js:52` 是 `const home = config.home ?? join(dshHome, 'bot')`，`memory.js:504` 是 `const root = join(home, 'memory')`。记忆根是 **`<botHome>/memory`**，默认 **`<DSH_HOME>/bot/memory`**。
@@ -278,6 +289,7 @@ PENDING --证据成立--> PLAN_WRITTEN --> APPLYING --> DONE
   projects.json                              新增：project:<hash> → 明文路径
   index.sqlite                               新增：可重建的派生索引
   task-plans/<candidateId>.json              新增：不可变的提取计划
+  task-candidates.json                       新增：待处理候选队列（temp+rename，恢复不读 journal）
 ```
 
 **只有这一份派生状态。** 不设 `index-dirty.json`、不设 `index-hashes.json`——理由见 §5。
@@ -310,7 +322,8 @@ CREATE TABLE files (
    - 磁盘上有、索引里没有 → 全量插入；
    - 两边都有但 hash 不同 → 删旧行、插新行。
 3. 第 1–2 步的所有写入在**同一个 SQLite 事务**内完成：要么整批生效，要么整批回滚，下一次重来。
-4. **一致性边界**：快照采集与查询都在**既有写队列**的边界上取一致视图——`memory.js` 的写入全部经 `queued()` 串行（`memory.js:551-556`，`addNow` 在 `:638`、`replaceEntry:693`、`removeEntry:711`、`moveEntry:741`、`archiveBotMemory:792` 都在队列里）。刷新前先 `await` 队列尾部（即 `writing`）落定，再采集。这样**不会采到 `moveEntry` 的两步中间态**（先写 topic、再写 `MEMORY.md`，`memory.js:767` 与 `:771`）。
+4. **一致性边界：必须是一段同步块**。`memory.js` 的写入全部经 `queued()` 串行（`memory.js:551-556`，`addNow:638`、`replaceEntry:693`、`removeEntry:711`、`moveEntry:741`、`archiveBotMemory:792` 都在队列里），队列游标是 `writing`（`:551`），两者都是 `install()` 闭包内变量——**`memory-index.js` 拿不到**，必须由 `memory.js` 显式交出「committed 读取器 + 队列空闲信号」两样东西（见 §8 接线清单）。
+   刷新流程固定为：`await` 队列空闲 → **一口气同步读完所有可见文件并算 hash**（`readText` 用 `readFileSync`（`memory.js:514-517`）、`list` 用 `readdirSync`，本来就是同步的）→ 期间**不出现任何 `await`**。若索引侧改用 `fs/promises`，`moveEntry` 的第二笔（`:771`）会插进两次读之间，正好采到本设计要避免的中间态（`:767` 写 topic、`:771` 写 `MEMORY.md`）。**这条是硬约束，不是建议。**
 5. **索引更新失败**（打不开、写不进、事务失败）→ 直接用第 1 步已经读到内存的那份内容做子串扫描并返回（即现有 `memory.js:1092-1105` 的逻辑），**不再读第二次盘**。下次再试。
 6. 启动时同理：索引缺失或版本不符 → 全量建一次；失败则全程走扫描。
 
@@ -335,9 +348,20 @@ CREATE TABLE files (
 
 **这不构成断电原子性保证**：普通 `fs` 写入（`writeText` 的 temp+rename，`memory.js:115-142`）只保证「不会留下半个目标文件」，不保证跨文件、跨 `journal` 的断电一致性。索引侧靠「下次比对内容」自我纠正；记忆侧靠既有 journal 与 `task-plans` 的恢复规则。
 
-**代价，明确写出来**
+**代价：与现状同量级，新增的是哈希**
 
-每次 `recall` 都要读一遍该会话可见的全部 Markdown（每 scope 上限 40 个主题，`memory.js:37/652`）。这是 O(可见 Markdown) 的读放大，**本设计不声称 I/O 加速，也不把索引当性能优化**：索引在这里的作用是**提供 BM25 排序与跨 scope 检索**，不是省磁盘读。隔离与正确性优先于 I/O。
+现有 ecall 已经把每个可见 scope 的全部文件读进内存（memory.js:1071 的 loadScope × N），内容比对**不新增读放大**，新增的只是每个文件一次 sha256。实测（插件工程师提供，本轮未复验）：最坏 3 个 scope 合计约 948 KB，sha256 合计 3.04 ms；单个 67 KB scope 0.08 ms。**这是探针数据，不是产品性能承诺。**
+
+索引在这里的作用是**提供 BM25 排序与跨 scope 检索**，不是省磁盘读；本设计**不声称 I/O 加速**。隔离与正确性优先。
+
+**归档必须显式清索引行**
+
+rchiveBotMemory 是 ename（memory.js:800），scope ot:<id> 从此不在任何检索白名单里。若不做处理，用例 14 会「通过」——但那是**白名单挡住的**，不是行被删了。两种处理，二选一，实现时选定并写注释：
+
+- 在 rchiveBotMemory 里直接 DELETE FROM entries WHERE scope = ?，参数是 ot:<id>（第一方显式清理，不违反「不靠写入钩子」的原则，因为那不是新鲜度判定）；
+- 或启动时扫一遍 state.bots，清理已不存在的 ot: scope 行。
+
+**「不靠写入钩子」只管新鲜度判定，不管显式的生命周期清理**——这句要写进代码注释，否则后来者会以为索引行会自动消失。
 
 **排序与过滤**
 
@@ -392,7 +416,17 @@ CREATE TABLE files (
 | `src/host/memory-index.js` | 索引生命周期、内容比对刷新、FTS 查询、重建 | 生命周期与 journal/回滚完全不同；`chat-index.js` 已证明这个模式适合独立成文件 |
 | `src/host/task-review.js` | 候选队列、证据核验、计划持久化与恢复 | 异步、模型驱动、可失败可重试，与同步记忆工具解耦 |
 
-`memory.js` 只做接线：`readScopes`、`recall` 的索引优先与回退、`complete_task` 注册、`writeScopeOf`。**不为了少几个文件把独立职责塞进已经 1714 行的 memory.js。**
+`memory.js` 只做接线。**接线清单必须完整，否则索引模块拿不到它需要的东西**：
+
+1. `readScopes` 加上 project；
+2. `recall` 的索引优先与扫描回退；
+3. 注册 `complete_task`；
+4. `writeScopeOf(sessionId, requested)`；
+5. **把 committed 读取器交出去**：`memory.js:550` 解构出的 `read`/`list`，`memory-index.js` 自己拿不到；
+6. **把写队列空闲信号交出去**：`writing`（`memory.js:551`）也是 `install()` 闭包内变量，要暴露成 `whenWritesSettled()`（返回 `writing`）；
+7. 显式清理归档 bot 的索引行（见 §5）。
+
+第 5、6 项是插件工程师复核时指出的漏项：两样东西都是闭包内变量，`memory-files.js:132` 只导出 `memoryFiles()` 的返回值，不会自动出现在 `rt` 上。**不为了少几个文件把独立职责塞进已经 1714 行的 memory.js。**
 
 ## 默认行为与故障降级
 
@@ -419,7 +453,7 @@ CREATE TABLE files (
 
 1. **P1 项目隔离**：`project-scope.js` + project 存储 + `recall`/`remember` 的 scope + 提示词 + `writeScopeOf` 收敛。此时仍用现有子串检索，可独立验收。
 2. **P2 全文索引**：`memory-index.js` + 内容比对刷新 + 重建端点 + 运行时探测。
-3. **P3 任务复盘**：`complete_task` + `task-review.js` + 证据核验 + 计划持久化与恢复（含**新写 journal 读端**）。
+3. **P3 任务复盘**：`complete_task` + `task-review.js` + 证据核验 + 计划持久化与恢复（候选队列独立落盘，不读 journal）。
 4. **P4 验收与文档**：补齐用例、`docs/plans` 定稿、README（英文与中文同步）。
 
 每阶段单独 PR，指向 `dev`，不改 `CHANGELOG.md`。
@@ -501,34 +535,40 @@ CREATE TABLE files (
 | 64 | cwd 在 `ds-bot/`（`.git` 在父目录） | 向上找到 `deepseek-bot` 仓库根 |
 | 65 | 同一目录三种大小写写法 | `realpathSync.native` 收敛为同一 hash；非 native 的写法作为反例被单测拒绝 |
 | 66 | 主仓库 `.git` 为目录、无 `commondir` | 直接用该目录，不报错 |
-| 67 | journal 某行损坏 | 跳过坏行并计数，其余记录仍可读；不整批放弃 |
+| 67 | `task-candidates.json` 或计划文件损坏 | 计划 → 隔离到 `corrupt/` 并报告；候选队列 → 保留原文件、报告，不静默清空 |
 | 68 | 后端无 `node:sqlite`（模拟导入失败） | `warn` + 返回 null + 扫 Markdown；**不崩**（不写「Electron 可用」） |
 | 69 | 非 Git 项目，文件在根下第 5 层子目录 | 仍归到同一个根（**不设层数上限**） |
 | 70 | 非 Git 项目，cwd 在 `teamFolder` 的祖先侧 | 搜索在 `teamFolder` 边界停止，不越界认出外部项目 |
+| 71 | 计划已落盘、apply 前 project 变 hash | **整份计划作废**（`task-plan-dropped`），不改写计划 |
+| 72 | 条目已在**别的主题文件**里，恢复时目标 topic 无该行 | `addNow` 返回 `changed:false` → 该项 `done`，记实际文件，**不追写目标 topic**（防死循环） |
+| 73 | 恢复时判断「是否已落盘」 | 按计划里的整行文本比对，**不是找 `entryId` 字段** |
+| 74 | 强杀留下 journal 半行 | 不影响恢复（恢复不读 journal）；`task-candidates.json` 用 temp+rename |
+| 75 | 归档 Bot 后检索 | 该 `bot:` scope 的索引行**被显式删除**，不是只靠白名单挡住 |
+| 76 | 刷新期间 `moveEntry` 正处在第 767 行与第 771 行之间 | 同步块内不出现 `await`，不会采到中间态；若改成 `fs/promises` 则该用例失败 |
 
 无法在本阶段验证的：桌面 Electron 端 sqlite（只影响「已验证平台」表述）、崩溃注入点（需实现留钩子）、大小写敏感目录（`fsutil` 需管理员权限）。子模块已由用户实测，不再是未验证项。
 
 ## 成本与风险
 
-- 运行成本：索引为本地文件，查询无网络；每次 `recall` 读一遍可见 Markdown（接受）；复盘每条候选一次模型调用；无 embedding 成本。
+- 运行成本：索引为本地文件，查询无网络；内容比对与现有 `recall` 同一次读盘、只多一次哈希；复盘每条候选一次模型调用。
 - 风险：
   - 项目 id 随路径变化（搬动即新项目）——已定规则，靠提示不自动合并。
   - 词面检索不覆盖同义改写——已知限制。
-  - 读放大随 scope 数与主题数增长——接受，换取一致性。
+  - 哈希开销随可见 Markdown 总量线性增长——与现有读盘同量级，换取一致性。
   - 历史 own/team 污染无法自动清理——人工整理。
 
 ## 已知限制
 
 - 纯词面检索无法保证「换说法也能找到」。
 - `verified` 只表示「有可复核引用且引用支持该主张」，不是客观真理。
-- 每次 `recall` 读可见 Markdown：这是设计选择，不是待优化项。
+- 每次 `recall` 读可见 Markdown 并算哈希：这是设计选择，不是待优化项。
 - 项目搬动会产生新 hash，旧记忆需用户确认复用。
 - 历史 own/team 中的项目内容不会被自动隔离。
 - 记忆范围隔离是插件 API 层的，不是文件系统沙箱。
 
 ## 评审状态（R1–R7）
 
-**设计结论：R1–R7 全部通过复审；R1-a/R1-b 两条注记已被实测推翻并改写（修订 9），不影响 R1 其余结论。设计阶段结束，文档冻结，等用户做最终一致性检查。**
+**设计结论：R1–R7 全部通过复审；R1-a/R1-b 已被实测推翻并改写（修订 9）；R3/R4 的复核意见已并入（修订 10）。设计阶段结束，文档冻结，等用户做最终一致性检查。**
 **代码：尚未实现；运行测试：待实施。**
 
 | # | 评审问题 | 本稿处置 | 复审方 | 状态 |
@@ -541,10 +581,19 @@ CREATE TABLE files (
 | R2-a | scope 标识不能替代原有 `teamRule`/角色校验 | §7 明写：两者任一不符都重建；旧无 v2 头快照视为过期 | 架构师 | 已收（本轮） |
 | R3 | `moveEntry:771` 与 `rename` 旁路；两套派生状态 | §5：每次 `recall` 做已提交内容 hash 比对，hash 存 `files` 表，同事务刷新；删除 `index-dirty.json`/`index-hashes.json` | 插件工程师 | **通过** |
 | R3-c | 「把失效钩子挂在 journal 上」这个备选是否更好 | §5 明确否掉：journal 只写不读、`move` 写 journal 失败仅 warn（`:777-779`）、依赖「每条路径记得记一笔」的约定、手工改写不产生 journal | 插件工程师 | 已收（本轮） |
+| R3-d | `read`/`list` 与 `writing` 都是闭包内变量，索引模块拿不到 | §8 接线清单补第 5、6 项：交出 committed 读取器与 `whenWritesSettled()` | 插件工程师 | 已收（本轮） |
+| R3-e | 刷新必须是同步块，否则采到 move 中间态 | §5 第 4 步写成硬约束：同步读完、期间零 `await`，不得改用 `fs/promises` | 插件工程师 | 已收（本轮） |
+| R3-f | 归档 Bot 的索引行没人清 | §5：显式删除该 `bot:` scope 行（或启动时清理），并区分「新鲜度不靠钩子」与「生命周期显式清理」 | 插件工程师 | 已收（本轮） |
+| R3-g | 「接受读放大」的成本表述不利且不准 | §5：改为「与现状同量级，新增的是哈希」，附探针数据并标注非产品承诺 | 插件工程师 | 已收（本轮） |
 | R3-a | 需比较完整文件集合；删除/归档文件要同事务删旧行 | §5 第 2 步写明三种情形（多、缺、变），同一事务 | 插件工程师 | 已收（本轮） |
 | R3-b | 刷新可能采到 `moveEntry` 两步中间态 | §5 第 4 步：刷新前 `await` 既有写队列（`memory.js:551-556`）尾部 | 插件工程师 | 已收（本轮） |
 | R4 | `entryId` 稳定性依赖计划持久化；journal 不够 | §3：不可变 `task-plans/<candidateId>.json`；恢复只读计划、不再调模型 | 插件工程师 | **通过** |
-| R4-f | journal 只写不读，无解析器 | §3：明确要新写读端，坏行跳过并计数，不整批放弃；恢复主依据是 `task-plans/` | 插件工程师 | 已收（本轮） |
+| R4-g | `addNow` 整 scope 去重会导致「缺行→写行→changed:false」死循环 | §3 写死优先级：`changed:false` 即 done 并记实际文件，不追写目标 topic | 插件工程师 | 已收（本轮） |
+| R4-h | journal 只写不读、强杀留半行 | §3：候选队列单独存 `task-candidates.json`（temp+rename），journal 只作审计 | 插件工程师 | 已收（本轮） |
+| R4-i | `callId` 每次调用新生成，retry 是模型重发 | §3：明确 `candidateId` 只去重「日志重放」；模型重发是新候选，靠整句全等兜底 | 插件工程师 | 已收（本轮） |
+| R4-j | `entryId` 不在条目行里 | §3：身份改述为「计划里的整行文本」，`entryId` 只存在于计划与 done | 插件工程师 | 已收（本轮） |
+| R4-k | project 校验时机 | §3：写计划前与 apply 前各校验一次，不一致整份计划作废 | 插件工程师 | 已收（本轮） |
+| R4-f | journal 只写不读，无解析器 | ~~新写读端~~ → 修订 10 改为：候选队列单独存 `task-candidates.json`，**不读 journal**（见 R4-h） | 插件工程师 | **已改写**（本轮） |
 | R4-a | `candidateId` 生成规则被删 | §3 补回：`sha256(sessionId + '\n' + callId)` 前 32 位 hex，纯安全文件名 | 插件工程师 | 已收（本轮） |
 | R4-b | 计划写入/done 更新要 temp+rename，done 不得早于条目提交 | §3 写明；`done` 只在完整条目写成功后追加 | 插件工程师 | 已收（本轮） |
 | R4-c | 仅正文存在不足以确认链接与元数据 | §3 恢复核对三项：`entryId`/最终格式整行/`[[topic]]` 链接；缺则补，元数据不符按 `replaceEntry` 修 | 插件工程师 | 已收（本轮） |
@@ -578,4 +627,5 @@ CREATE TABLE files (
 - 2026-10-22（修订 6）：收架构师 R1/R2 三条注记（标记物搜索加界、子模块归属、同步 cwd 缓存；其中前两条在修订 9 被实测推翻并改写）；收本轮补充检查点：R3 比较完整文件集合 + 队列边界一致视图 + 不断电原子承诺、R4 补回 candidateId 规则与 temp+rename/done 顺序/三项恢复核对/损坏隔离/冲突停止、R5 file 真实路径校验 + 换段后待答卡片 + unverified 不入库 + 失败根因不连带、R2 保留 teamRule 校验。新增 13 条验收用例（40–52）。**评审状态：R1/R2 已通过，R3–R7 待插件工程师与测试工程师交回。**
 - 2026-10-22（修订 7）：收测试工程师 R5/R6/R7 复审。把「原文支持该主张」落成两道闸（evidence 逐字子串为机械闸、模型 yes/no 为可复核闸）；project 校验改为四种转移，`unresolved→ok` 重绑定不丢候选；补用例 53–60（evidence 伪造、闸二 no/yes、project 四种转移、`projectMemory:false`、扫描失败显式报错）；用例 17 明确「非空或显式报错，二者其一」。R1/R2/R5/R6/R7 通过，R3/R4 待交回。
 - 2026-10-22（修订 8）：收插件工程师 R3/R4 与运行时核实。①桌面端明确记为「未知」，不按可用设计（`lib/bin.js:36` 无 electron 依赖、本机无桌面安装），验收只写「探测失败不崩且回退」；②`realpathSync.native` 与非 native 行为不同的实测表；③`.git` 文件绝对/相对两种写法都要支持（git 2.55 实测为绝对路径）；④否掉「journal 钩子」备选并说明四个理由；⑤journal 只写不读，恢复要新写读端且跳过坏行；⑥五处硬编码 own+team 必须一起改；⑦`waitsWork` 命名与 `waitingView` 不适合当闸门，需新增 `pendingWorkOf`。新增用例 61–68。
-- 2026-10-22（修订 9，本稿）：按用户原生 Git 实测撤回并改写两处 R1 注记。①**子模块判定错误**：普通子模块 `.git` 为 `gitdir: ../.git/modules/sub`，该 gitdir **没有 `commondir`**，其 common dir 就是 `parent/.git/modules/sub`，与父仓库 `parent/.git` 不同 → 子模块**独立**；改为「一律按实际 common dir 判定，不从 `modules/` 猜父仓库」。worktree 共享 common dir 的结论不变。②**删除「向上最多 3 层」这一无依据限制**，边界只保留 teamFolder 祖先与盘根，避免同一非 Git 项目的深层目录被切成不同项目。用例 61、69、70 相应改写，子模块不再是「未验证项」。
+- 2026-10-22（修订 9）：按用户原生 Git 实测撤回并改写两处 R1 注记。①**子模块判定错误**：普通子模块 `.git` 为 `gitdir: ../.git/modules/sub`，该 gitdir **没有 `commondir`**，其 common dir 就是 `parent/.git/modules/sub`，与父仓库 `parent/.git` 不同 → 子模块**独立**；改为「一律按实际 common dir 判定，不从 `modules/` 猜父仓库」。worktree 共享 common dir 的结论不变。②**删除「向上最多 3 层」这一无依据限制**，边界只保留 teamFolder 祖先与盘根，避免同一非 Git 项目的深层目录被切成不同项目。用例 61、69、70 相应改写，子模块不再是「未验证项」。
+- 2026-10-22（修订 10，本稿）：收插件工程师 R3/R4 复核。**R3**：§8 接线清单补第 5、6 项（committed 读取器、`whenWritesSettled()`，二者都是 `install()` 闭包内变量）；§5 第 4 步写成硬约束「同步块、零 `await`、不得改用 `fs/promises`」；§5 增「归档必须显式清索引行」并区分「新鲜度不靠钩子」与「生命周期显式清理」；成本表述改为「与现状同量级，新增的是哈希」。**R4**：修掉 `addNow` 整 scope 去重导致的死循环（`changed:false` 即 done，不追写目标 topic）；候选队列改存 `task-candidates.json`、**恢复不读 journal**（推翻 R4-f 的旧结论）；明确 `candidateId` 只去重「日志重放」，模型重发是新候选；身份判定改为「计划里的整行文本」；project 在写计划前与 apply 前各校验一次。新增用例 71–76。
