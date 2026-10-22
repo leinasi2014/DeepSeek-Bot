@@ -3,7 +3,7 @@
 - 日期：2026-10-22
 - 相关：本设计稿（设计阶段，未实现）；参照 `docs/plans/2026-10-09-context-and-memory.md`、`2026-10-16-bot-handoffs.md`
 - 代码基线：`dev` @ `ba9757b`（含 PR #48/#49/#50 的记忆一致性修复）
-- 状态：**设计评审中，未通过。** 本文是修订稿（R1–R7），待架构师、插件工程师、测试工程师本轮复审；代码未实现、运行测试未实施、未合并、未部署。
+- 状态：**设计评审中。** R1/R2/R5/R6/R7 已通过本轮复审，R3/R4 待插件工程师交回；代码未实现、运行测试未实施、未合并、未部署。
 
 ## 为什么
 
@@ -114,22 +114,40 @@ resolve(cwd) -> { status: 'ok', hash, root, kind: 'git'|'marker'|'self' }
 - `kind`：`answer` / `file` / `command` / `test` / `user`。
 - 调用即写 journal `op:'task-candidate'`，**当轮不写任何记忆**。
 - **入队时绑定**：`botId`、`sessionId`、`roomId`（群聊时）、解析出的 `project`（或 `unresolved`）。
-- **执行前重新校验**：Bot 仍存在、仍是该群成员、会话仍属于该 Bot、project 解析结果未变。任一变化 → 作废该候选（journal 记 `op:'task-candidate-dropped'` 带原因），不写入。
+- **执行前重新校验**：Bot 仍存在、仍是该群成员、会话仍属于该 Bot。**project 的校验分两种，不用「变了就作废」**：
+  - 入队 `ok` → 执行时 `ok`：**必须同 hash**，不同则作废（`op:'task-candidate-dropped'`，原因 `project-changed`）。
+  - 入队 `unresolved` → 执行时 `ok`：**重绑定到新 hash，不丢候选**（这正是 R1 的 10 秒缓存恢复语义：先跑起来、后补 `.git` 是合法场景）。
+  - 入队 `ok` → 执行时 `unresolved`：暂不执行，回到 `WAITING`（不计数、不丢弃）。
+  - 入队 `unresolved` → 仍 `unresolved`：`WAITING`。
 
 **证据只看日志，不看模型自报**
 
 - `tool/result` 的结构化字段只有 `message.isError` 与可选 `error{name,code,reason}`（`dsh-session/lib/types/types.d.ts:374-390`、`dsh-tools/lib/types/index.d.ts:197`）。**`exitCode` 不在结构里**，只在模型可见文本中 → 模型自报退出码一律不采信。
 - **`isError === false` 不等于任务成功**：读文件成功、跑测试拿到失败报告但工具包装未报错，都是 `isError === false`。
-- 判定按**具体主张**逐条进行，不做整体 AND：
+
+**证据可判定规则（把「原文支持该主张」落成可执行断言）**
+
+「输出原文含支持该主张的结果」「用户原话确有此意」若不给机制，就是语义判断，测试写不出断言。定为**两道闸：第一道纯机械且决定性，第二道模型判定但输出落盘可复核**。
+
+**闸一（机械）**：每条要判 `verified` 的主张必须带 `evidence`，且
+
+- `evidence` 必须是**引用事件正文的逐字子串**。比较前只做两件事：`\r\n` → `\n`、两端 `trim`。正文用 `textOf(event.data.content)` 取（`text.js:11-16`，与 `turns.js:428/452` 同一取法）。
+- 长度 8–500 字符。
+- **子串不成立 → 直接 `unverified`，不进闸二、不写长期记忆。** 这条完全可单测：构造一个 `tool/result`，断言「evidence 不在输出正文里 ⇒ outcome 不是 verified」。
+- `user` 类主张同理：`evidence` 必须是那条 `user/message` 正文的子串。
+
+**闸二（模型判定，结论落盘）**：仅当闸一通过，才发一次小请求（复用 `memory.js:1126` 的 `oneShot` 手法），输入只有「主张原文 + evidence 原文」，只回 `{"support":"yes"|"no"}`。结果连同 evidence 存进条目 `meta`。mock 模型固定回 yes/no 即可覆盖两条路径。
+
+这样「支持与否」仍是一次判断，但它是**被记录、可复核、可 mock 的**判断；而「evidence 不是子串」是机械的，不会漏。
 
 | 主张来源 | 成立条件 | 结论 |
 |---|---|---|
-| `user` | 用户消息锚点存在且原文确有此意 | `verified`（记录「用户说过」，不是对世界的断言） |
-| `command` / `test` | 对应 `callId` 的 `tool/result` 存在、`isError` 为假、**输出原文含支持该主张的结果** | `verified` |
-| `command` / `test`（失败教训） | `isError` 为真，或输出原文明确显示失败 | `failed`（写成失败教训，标注依据） |
-| `file` | 路径在该会话工作目录内、存在且类型相符；涉及内容须引原文片段 | 有片段 `verified`，仅存在 `unverified` |
+| `user` | 锚点存在；`evidence` 是该 `user/message` 正文的子串；闸二 yes | `verified`（记录「用户说过」，不是对世界的断言） |
+| `command` / `test` | `callId` 的 `tool/result` 存在；`isError` 为假；`evidence` 是输出正文的子串；闸二 yes | `verified` |
+| `command` / `test`（失败教训） | `isError` 为真，或输出正文里有明确的失败行（同样要 `evidence` 子串） | `failed`（写失败教训，标注依据） |
+| `file` | 路径在会话工作目录内、存在、类型相符；涉及内容须 `<path>:<片段>` 且片段是文件正文子串 | 有片段 `verified`，仅存在 `unverified` |
 | `answer` | 只证明「Bot 这样回答过」 | `unverified` |
-| 缺证据 | — | **保持候选，不写长期记忆** |
+| 缺证据 / evidence 不是子串 / 闸二 no | — | **保持候选，不写长期记忆** |
 
 **锚点与文件引用的权限边界**
 
@@ -385,7 +403,7 @@ CREATE TABLE files (
 | 14 | 删 Bot 归档（`rename` 旁路）后 `recall` | 该 Bot 条目不再出现 |
 | 15 | 手工改写文件，**同大小且同 mtime** | 下一次 `recall` 能发现（比的是内容 hash） |
 | 16 | 删 `index.sqlite` 后 `recall` | 自动重建，结果一致 |
-| 17 | 索引不可用（模拟导入失败） | 回退扫 Markdown，结果非空；**不返回「没有记忆」** |
+| 17 | 索引不可用（模拟导入失败） | 回退扫 Markdown，**结果非空或显式报错，二者其一；绝不静默返回空列表** |
 | 18 | 管家异常换段（失败 / 溢出两条路径） | 复盘候选为 0，无写入 |
 | 19 | 模型谎报完成，日志 `isError === true` | 记为 `failed`；自报 exitCode 不参与判定 |
 | 20 | 工具成功但输出显示测试失败 | 不判 verified；无其他证据则保持候选 |
@@ -421,6 +439,14 @@ CREATE TABLE files (
 | 50 | 待答卡片随换段搬到新 Session，候选仍记旧 sessionId | 仍判 `WAITING`，不因换段误放行 |
 | 51 | `unverified` 的经验 | 只留候选，不进 `MEMORY.md` / 主题文件 |
 | 52 | 有失败证据但根因无独立证据 | 只写「发生了什么」为 `failed`，根因不标 `verified` |
+| 53 | `evidence` 不是 `tool/result` 正文的子串（模型编的摘录） | 闸一直接判 `unverified`，不调闸二、不写长期记忆 |
+| 54 | `evidence` 是子串，闸二回 `no` | `unverified`，不写长期记忆；`meta` 里留下 evidence 与 no |
+| 55 | `evidence` 是子串，闸二回 `yes` | `verified`；条目 `meta` 存 evidence 原文与判定结果 |
+| 56 | 入队 `unresolved`、执行前补了 `.git` 变 `ok` | 重绑定到新 hash 并继续，**不丢候选** |
+| 57 | 入队 `ok`、执行时另一个项目 hash | 作废，`task-candidate-dropped` 原因 `project-changed` |
+| 58 | 入队 `ok`、执行时变 `unresolved` | 回 `WAITING`，不计数、不丢弃 |
+| 59 | `projectMemory:false` 时面板选项目 | 拒绝（三查里的「未被配置关闭」） |
+| 60 | 索引不可用且扫描也失败 | **显式报错**；绝不返回静默空列表 |
 
 无法在本阶段验证的：桌面 Electron 端 sqlite（只影响平台声明）、崩溃注入点（需实现留钩子）。均为实现期验收项。
 
@@ -444,7 +470,7 @@ CREATE TABLE files (
 
 ## 评审状态（R1–R7）
 
-**设计结论：未通过，待本轮三方复审。**
+**设计结论：R1/R2/R5/R6/R7 已通过复审；R3/R4 待插件工程师交回。**
 **代码：尚未实现；运行测试：待实施。**
 
 | # | 评审问题 | 本稿处置 | 复审方 | 状态 |
@@ -464,13 +490,17 @@ CREATE TABLE files (
 | R4-c | 仅正文存在不足以确认链接与元数据 | §3 恢复核对三项：`entryId`/最终格式整行/`[[topic]]` 链接；缺则补，元数据不符按 `replaceEntry` 修 | 插件工程师 | 已收（本轮） |
 | R4-d | 计划损坏不得删除或自动永久 skip | §3：改名隔离到 `corrupt/`，报告等待人工处理 | 插件工程师 | 已收（本轮） |
 | R4-e | 人为冲突 | §3：停止该项，记 `task-plan-conflict`，不覆盖用户修改 | 插件工程师 | 已收（本轮） |
-| R5 | 候选绑定与重校验；锚点/文件权限；全链路脱敏；WAITING 范围与唤醒；`memoryReview` 联动；经验结构；原 review 抢写 | §3 各段 | 测试工程师 | **复审中** |
-| R5-a | `file` 边界要防 `../`、同前缀、junction/symlink | §3：两侧 `realpath` + `folders.js:12` 的 `within()` 目录分隔符比较 | 测试工程师 | 已收（本轮） |
-| R5-b | 待答卡片换段迁移后不能只查旧 sessionId | §3：查当前在用会话的同一 `questionId`，仍不扫无关群聊 | 测试工程师 | 已收（本轮） |
-| R5-c | `unverified` 不得进长期库 | §3：只留候选，补证后再写 | 测试工程师 | 已收（本轮） |
-| R5-d | 失败证据不能顺带把未证根因变 verified | §3：发生了什么/为什么分开标注，根因需独立证据 | 测试工程师 | 已收（本轮） |
-| R6 | 模型/接口不得传任意 hash；异步防串；边界声明 | §7：模型工具无 `project` 参数；面板只能从服务端列表选；服务器三查；异步带 scopeSet；明确「API 范围隔离 ≠ 沙箱」 | 测试工程师 | **复审中** |
-| R7 | 查询语义不得退化 | §6：七条逐一列明，含 filter 先于 LIMIT、异常不伪装成空结果 | 测试工程师 | **复审中** |
+| R5 | 候选绑定与重校验；锚点/文件权限；全链路脱敏；WAITING 范围与唤醒；`memoryReview` 联动；经验结构；原 review 抢写 | §3 各段 | 测试工程师 | **通过**（两处已定死） |
+| R5-a | 「原文支持该主张」是语义判断，无法断言 | §3 加两道闸：evidence 必须是事件正文逐字子串（机械、决定性），通过后再由模型判 yes/no 且结果落盘 | 测试工程师 | 已收（本轮） |
+| R5-b | 「project 变了就作废」与 10 秒缓存恢复冲突 | §3 改为四种转移：`ok→ok` 须同 hash；`unresolved→ok` 重绑定不丢；`ok→unresolved` 回 WAITING；`unresolved→unresolved` WAITING | 测试工程师 | 已收（本轮） |
+| R5-c | `file` 边界要防 `../`、同前缀、junction/symlink | §3：两侧 `realpath` + `folders.js:12` 的 `within()` 目录分隔符比较 | 测试工程师 | 已收（本轮） |
+| R5-d | 待答卡片换段迁移后不能只查旧 sessionId | §3：查当前在用会话的同一 `questionId`，仍不扫无关群聊 | 测试工程师 | 已收（本轮） |
+| R5-e | `unverified` 不得进长期库 | §3：只留候选，补证后再写 | 测试工程师 | 已收（本轮） |
+| R5-f | 失败证据不能顺带把未证根因变 verified | §3：发生了什么/为什么分开标注，根因需独立证据 | 测试工程师 | 已收（本轮） |
+| R6 | 模型/接口不得传任意 hash；异步防串；边界声明 | §7：模型工具无 `project` 参数；面板只能从服务端列表选；服务器三查；异步带 scopeSet；明确「API 范围隔离 ≠ 沙箱」 | 测试工程师 | **通过** |
+| R6-a | 三查里的「未被配置关闭」没有对应用例 | 用例 59：`projectMemory:false` 时面板选项目 → 拒绝 | 测试工程师 | 已收（本轮） |
+| R7 | 查询语义不得退化 | §6：七条逐一列明，含 filter 先于 LIMIT、异常不伪装成空结果 | 测试工程师 | **通过** |
+| R7-a | 「索引不可用」的断言要更明确 | 用例 17 改为「结果非空或显式报错，二者其一；绝不静默空列表」；另加用例 60 | 测试工程师 | 已收（本轮） |
 
 **外部参考已更正**：固定 commit `6037f8e3b91d657f5eac80ef764b41ce511499dc` 的 `jiuwenswarm/common/coding_memory_paths.py:43–79` 有项目路径隔离；`jiuwenswarm/agents/harness/common/tools/task_tools.py:309–401` 的 `experience_learn` 实际写 `task-data.json`。此前「对方没有实现」的断言删除。**这不等于其任务结果已做证据验收**——本设计的证据核验规则仍是原创补齐。
 
@@ -486,3 +516,4 @@ CREATE TABLE files (
 - 2026-10-22（修订 4）：收回桌面探针授权阻塞，改运行时探测；面板显式项目上下文；幂等定死逐项恢复；补逐项关闭表。
 - 2026-10-22（修订 5）：按 R1–R7 全面修订——项目身份重写（Git 优先、teamFolder 不短路、大小写不折叠、缓存过期）；快照与面板摘要加 scope 版本；索引改为内容比对并删除两套派生状态；提取计划持久化与强杀恢复边界；候选绑定/重校验/全链路脱敏/WAITING 收窄/review 抢写约束；面板与 API 权限边界；查询语义七条。删除「对方没有实现」的断言，改为固定 commit 引用。**该轮评审未通过。**
 - 2026-10-22（修订 6，本稿）：收架构师 R1/R2 三条注记（标记物搜索加界、子模块归父仓库、同步 cwd 缓存）；收本轮补充检查点：R3 比较完整文件集合 + 队列边界一致视图 + 不断电原子承诺、R4 补回 candidateId 规则与 temp+rename/done 顺序/三项恢复核对/损坏隔离/冲突停止、R5 file 真实路径校验 + 换段后待答卡片 + unverified 不入库 + 失败根因不连带、R2 保留 teamRule 校验。新增 13 条验收用例（40–52）。**评审状态：R1/R2 已通过，R3–R7 待插件工程师与测试工程师交回。**
+- 2026-10-22（修订 7，本稿）：收测试工程师 R5/R6/R7 复审。把「原文支持该主张」落成两道闸（evidence 逐字子串为机械闸、模型 yes/no 为可复核闸）；project 校验改为四种转移，`unresolved→ok` 重绑定不丢候选；补用例 53–60（evidence 伪造、闸二 no/yes、project 四种转移、`projectMemory:false`、扫描失败显式报错）；用例 17 明确「非空或显式报错，二者其一」。R1/R2/R5/R6/R7 通过，R3/R4 待交回。
