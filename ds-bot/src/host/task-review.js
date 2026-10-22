@@ -46,7 +46,7 @@ export const candidateIdOf = (sessionId, callId) => createHash('sha256').update(
 // The id that lands in the Markdown metadata. Lower-case and stable per plan item.
 export const reviewIdOf = (candidateId, index) => createHash('sha256').update(`${candidateId}:${index}`).digest('hex').slice(0, 16)
 
-// taskReview({ root, check, extract, applyItem, linkTopic, readScope, parse, format, now, warn })
+// taskReview({ root, check, extract, applyItem, linkTopic, readScope, parse, format, entryProblem, secretEntry, now, warn })
 //
 // - `check(candidate)` re-validates the Bot, the session and the project; resolves
 //   `{ ok: true, project }`, `{ ok: false, waiting: true }` or `{ ok: false, dropped }`.
@@ -57,7 +57,10 @@ export const reviewIdOf = (candidateId, index) => createHash('sha256').update(`$
 // - `linkTopic(scope, topic)` adds the missing `[[topic]]` link to MEMORY.md.
 // - `readScope(scope)` and `parse(content)`/`format(text, meta)` are the memory module's
 //   own committed reader and entry format, so recovery compares exactly what it wrote.
-export function taskReview({ root, check, extract, applyItem, linkTopic, readScope, parse, format, now = () => new Date().toISOString(), warn = () => {} }) {
+// - `entryProblem(text)` / `secretEntry(text)` are the memory module's own limits. They
+//   run again before the plan is frozen: the extract step may be hours old by then, and
+//   the plan file is a plain JSON a person can edit.
+export function taskReview({ root, check, extract, applyItem, linkTopic, readScope, parse, format, entryProblem = () => undefined, secretEntry = () => false, now = () => new Date().toISOString(), warn = () => {} }) {
   const dir = join(root, 'task-plans')
   const corruptDir = join(dir, 'corrupt')
   const pathOf = id => join(dir, `${id}.json`)
@@ -150,23 +153,35 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
   // The plan is frozen here: every item carries its own scope, topic, text, the exact
   // metadata (including `review_id`) and the exact line those produce. Nothing below ever
   // recomputes metadata or a date, which is what keeps `by` and `added` from drifting.
+  // The limits run once more over what will actually be written — the text and every
+  // metadata value, since that is what lands in the Markdown. An item that fails is left
+  // out of the plan instead of being frozen and then refused on every apply.
   function freeze(record, items) {
-    const plan = items.slice(0, CLAIMS_MAX).map((item, index) => {
+    const accepted = []
+    const refused = []
+    items.slice(0, CLAIMS_MAX).forEach((item, index) => {
       const reviewId = reviewIdOf(record.candidateId, index)
       const meta = { ...(item.meta ?? {}), review_id: reviewId }
-      return {
-        index,
+      const text = String(item.text ?? '')
+      const metaText = Object.entries(meta).map(([key, value]) => `${key}: ${value}`).join(' ')
+      const problem = entryProblem(text) ?? (secretEntry(text) || secretEntry(metaText) ? 'the entry looks like a secret' : undefined)
+      if (problem !== undefined) {
+        refused.push({ claim: item.meta?.claim, text, topic: item.topic ?? '', outcome: item.outcome ?? 'unverified', reason: 'invalid-at-freeze', problem })
+        return
+      }
+      accepted.push({
+        index: accepted.length,
         reviewId,
         scope: item.scope,
         topic: item.topic ?? '',
-        text: String(item.text ?? ''),
+        text,
         outcome: item.outcome ?? 'unverified',
         source: item.source ?? '',
         meta,
-        line: format(item.text, meta),
-      }
+        line: format(text, meta),
+      })
     })
-    return { version: CANDIDATE_VERSION, frozenAt: now(), items: plan }
+    return { version: CANDIDATE_VERSION, frozenAt: now(), items: accepted, refused }
   }
 
   const isDone = (record, reviewId) => record.progress.done.some(item => item.reviewId === reviewId)
@@ -299,7 +314,21 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
         await write(record)
         return record
       }
-      record.plan = freeze(record, extracted.items)
+      const frozen = freeze(record, extracted.items)
+      if (frozen.refused.length > 0) {
+        // What the limits refused at freeze time stays with the candidate, beside the
+        // gate refusals, so a person sees why it never became an entry.
+        record.unverified = [...record.unverified, ...frozen.refused].slice(0, CLAIMS_MAX * 2)
+      }
+      if (frozen.items.length === 0) {
+        // Nothing survived the freeze-time re-check: no empty plan is stored, and only an
+        // explicit retry looks at this task again.
+        record.status = STATUS.held
+        record.heldAt = now()
+        await write(record)
+        return record
+      }
+      record.plan = { version: frozen.version, frozenAt: frozen.frozenAt, items: frozen.items }
       record.status = STATUS.planned
       await write(record)
     }

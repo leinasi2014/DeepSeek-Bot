@@ -13,6 +13,8 @@ function harness(t, {
   check = async () => ({ ok: true, project: 'project:a' }),
   extract,
   fail = undefined,
+  entryProblem = () => undefined,
+  secretEntry = () => false,
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'ds-bot-task-review-'))
   t.after(() => rmSync(root, { recursive: true, force: true }))
@@ -54,6 +56,8 @@ function harness(t, {
     readScope,
     parse: parseMemory,
     format: formatEntry,
+    entryProblem,
+    secretEntry,
     now: () => '2026-10-22T00:00:00.000Z',
   })
   return { root, review, calls, files: state.files, scopeFiles }
@@ -248,4 +252,33 @@ test('a candidate with a frozen plan ignores the explicit retry', async t => {
   const retried = await h.review.retry(candidateId)
   assert.equal(retried.status, STATUS.done)
   assert.equal(h.calls.extract, 1, 'a frozen plan is never extracted again')
+})
+
+test('an item past the limits is refused at freeze, so no plan is written and nothing applies', async t => {
+  // The memory module's own limit says "too long"; the freeze step must run it again
+  // because the plan file is plain JSON a person can edit between extract and apply.
+  const h = harness(t, {
+    entryProblem: text => (text.length > 20 ? 'An entry holds at most 20 characters' : undefined),
+    extract: () => ({ items: [{ scope: 'project:a', text: '这一条教训明显超过了二十个字符的长度上限而且还要更长一些', outcome: 'verified', source: 'part 1 #2' }] }),
+  })
+  const { candidateId } = await h.review.enqueue(candidate)
+  const record = await h.review.process(candidateId)
+  assert.equal(record.status, STATUS.held, 'nothing survived the freeze-time check')
+  assert.equal(record.plan, null, 'no empty plan is stored')
+  assert.equal(h.calls.apply.length, 0, 'nothing was applied')
+  assert.equal(record.unverified.at(-1).reason, 'invalid-at-freeze')
+  assert.match(record.unverified.at(-1).problem, /at most 20 characters/)
+})
+
+test('a lesson that looks like a secret is refused at freeze', async t => {
+  const h = harness(t, {
+    secretEntry: text => /sk-[A-Za-z0-9]{8}/.test(text),
+    extract: () => ({ items: [{ scope: 'project:a', text: 'token sk-abcdefgh', outcome: 'verified', source: 'part 1 #2' }] }),
+  })
+  const { candidateId } = await h.review.enqueue(candidate)
+  const record = await h.review.process(candidateId)
+  assert.equal(record.status, STATUS.held)
+  assert.equal(record.plan, null)
+  assert.equal(h.calls.apply.length, 0)
+  assert.equal(record.unverified.at(-1).reason, 'invalid-at-freeze')
 })

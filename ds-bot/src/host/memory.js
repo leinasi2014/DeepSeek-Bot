@@ -749,13 +749,25 @@ export function install(rt) {
     const items = []
     candidates.forEach((entry, index) => {
       if (support[index] !== 'yes') { drop('model-unsupported', { claim: entry.claim, text: entry.text, topic: entry.topic, outcome: entry.outcome, evidence: entry.evidence, statement: claims[entry.claim].statement, kind: claims[entry.claim].kind, context: entry.context }); return }
+      // The date is taken once, here, and frozen into the plan below: a candidate that
+      // waits past midnight keeps the day it was reviewed, not the day it applied.
+      // `source` and `outcome` belong in the entry itself, not only in the plan file: a
+      // lesson that failed and one that held must be told apart in the Markdown.
+      const source = String(claims[entry.claim].ref ?? 'the conversation')
       items.push({
         scope: scopeKey(scope),
         topic: entry.topic,
         text: entry.text,
         outcome: entry.outcome,
-        source: String(claims[entry.claim].ref ?? 'the conversation'),
-        meta: { kind: 'howto', claim: entry.claim, evidence: entry.evidence.slice(0, 200) },
+        source,
+        meta: {
+          kind: 'howto',
+          claim: entry.claim,
+          evidence: entry.evidence.slice(0, 200),
+          source: source.slice(0, 200),
+          outcome: entry.outcome,
+          added: today(),
+        },
       })
     })
     return { items, dropped }
@@ -820,6 +832,11 @@ export function install(rt) {
     },
     parse: parseMemory,
     format: formatEntry,
+    // The limits the tools use, so the plan is checked against the same rules before it
+    // is frozen — the plan file can be edited by hand, and the extraction may be old.
+    // Wrapped, not passed directly: those two are defined further down in this module.
+    entryProblem: text => entryProblem(text),
+    secretEntry: text => secretEntry(text),
     warn: rt.warn,
   })
   // Candidates are resumed after the team loads, and again whenever the files change on
@@ -1161,10 +1178,30 @@ export function install(rt) {
   // re-frozen instead of going on with the last project's memory in its prompt.
   const snapshotHeader = (botId, projectScope) => `<!-- ds-bot:memory v2 scopes=${[projectScope === undefined ? undefined : scopeKey(projectScope), `bot:${botId}`, 'team'].filter(Boolean).sort().join(',')} -->`
   // A Git identity is the .git folder; what a person reads is the repository's name.
-  const projectName = (root) => {
+  // Two repositories can share a folder name, so the tail of the path is kept until the
+  // names differ: `alpha`, or `work/alpha` and `personal/alpha`. The one place that names
+  // a project is here — the panel only shows what this returns, so the two cannot drift
+  // apart again (issue #61).
+  const projectTail = (root) => {
     const parts = String(root ?? '').split(/[\\/]/).filter(Boolean)
-    const git = parts.at(-1) === '.git' ? parts.at(-2) : parts.at(-1)
-    return git ?? 'this project'
+    if (parts.at(-1) === '.git') parts.pop()
+    return parts
+  }
+  const projectName = (root) => projectTail(root).at(-1) ?? 'this project'
+  const projectNames = (roots) => {
+    const tails = roots.map(projectTail)
+    const names = new Map()
+    tails.forEach((tail, index) => {
+      let depth = 1
+      while (depth < tail.length) {
+        const name = tail.slice(-depth).join('/')
+        const clashes = tails.some((other, otherIndex) => otherIndex !== index && other.slice(-depth).join('/') === name)
+        if (!clashes) break
+        depth += 1
+      }
+      names.set(index, tail.slice(-depth).join('/'))
+    })
+    return names
   }
   function memorySection(bot, projectScope) {
     const own = ownScope(bot.id)
@@ -1667,14 +1704,17 @@ export function install(rt) {
     return undefined
   }
   // Each project the Bot works in, with one conversation that reaches it: the
-  // panel names that conversation, and the server names the project.
+  // panel names that conversation, and the server names the project. `name` is decided
+  // here, once, for every project of this Bot — the panel never derives one again.
   const projectsOfBot = (bot) => {
     const found = new Map()
     for (const id of rt.sessionsOfBot?.(bot.id) ?? []) {
       const project = projectOf(id)
       if (project.status === 'ok' && !found.has(project.hash)) found.set(project.hash, { hash: project.hash, root: project.root, session: id })
     }
-    return [...found.values()]
+    const listed = [...found.values()]
+    const names = projectNames(listed.map(project => project.root))
+    return listed.map((project, index) => ({ ...project, name: names.get(index) }))
   }
 
   // The summary is written again when the entries or the interface language change;

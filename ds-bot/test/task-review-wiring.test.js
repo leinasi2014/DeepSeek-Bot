@@ -140,7 +140,9 @@ test('a verified claim writes one entry with its review id, and the plan is kept
   // legitimate state a crash could leave behind.
   await until(() => existsSync(s.memoryFile()) && s.plans()[0]?.status === 'DONE')
   const text = readFileSync(s.memoryFile(), 'utf8')
-  assert.match(text, /- 发布用 scripts\/ship\.sh，测试通过后再发布 \[kind: howto; claim: 0; evidence: tests 12\/12; review_id: [0-9a-f]{16}\]/)
+  // The entry carries the metadata §5/§6 require: where it came from, when it was added
+  // (frozen with the plan, never recomputed), and whether it held.
+  assert.match(text, /- 发布用 scripts\/ship\.sh，测试通过后再发布 \[kind: howto; claim: 0; evidence: tests 12\/12; source: part 1 #11; outcome: verified; added: \d{4}-\d{2}-\d{2}; review_id: [0-9a-f]{16}\]/)
   assert.equal(parseMemory(text).entries.length, 1)
   const [record] = s.plans()
   assert.equal(record.status, 'DONE')
@@ -264,6 +266,19 @@ test('a relative file claim that leaves the folder is refused', async t => {
   await until(() => s.plans()[0].status === 'HELD')
   assert.equal(s.plans()[0].unverified[0].reason, 'evidence-unsupported')
   assert.equal(existsSync(s.memoryPathOf(s.plans()[0])), false)
+})
+
+test('a failed lesson is written with its outcome, so it is told apart from one that held', async t => {
+  const s = start({ items: [{ claim: 0, topic: '', text: '发布脚本在测试未过时不能发布', outcome: 'failed' }], support: ['yes'] })
+  t.after(() => s.stop())
+  assert.match(await s.tool('complete_task', report, 'b2', 'call-failed'), /Recorded as a candidate/)
+  idle(s.ctx)
+  await until(() => existsSync(s.memoryFile()) && s.plans()[0]?.status === 'DONE')
+  const text = readFileSync(s.memoryFile(), 'utf8')
+  assert.match(text, /outcome: failed/)
+  assert.match(text, /source: part 1 #11/)
+  assert.match(text, /added: \d{4}-\d{2}-\d{2}/)
+  assert.equal(parseMemory(text).entries.length, 1)
 })
 
 test('an explicit re-verify reuses the stored lesson without extracting again', async t => {
