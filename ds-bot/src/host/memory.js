@@ -22,13 +22,14 @@
 // anyway), freezes it anew.
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
-import { appendFile, mkdir, rename, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, rename, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { BlockAssembler } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { splitRef, unquote } from './text.js'
 import { speakerOf } from '../shared/mentions.js'
 import { output } from './tools.js'
+import { memoryFiles } from './memory-files.js'
 
 // Fixed sizes, in characters. Both MEMORY.md files ride in every request of every
 // part, so together they stay near 8,000 characters, a few thousand tokens. A topic is
@@ -501,7 +502,6 @@ export function install(rt) {
 
   const reviewOn = config.memoryReview !== false
   const root = join(home, 'memory')
-  const journalPath = join(root, 'journal.jsonl')
   const dayFormat = new Intl.DateTimeFormat('en-CA', { ...(config.timeZone ? { timeZone: config.timeZone } : {}), year: 'numeric', month: '2-digit', day: '2-digit' })
   const today = () => dayFormat.format(Date.now())
 
@@ -544,10 +544,7 @@ export function install(rt) {
   async function writeText(path, text) {
     await writeTextTo(path, text, rt.warn)
   }
-  async function journal(record) {
-    await mkdir(root, { recursive: true })
-    await appendFile(journalPath, `${JSON.stringify({ time: new Date().toISOString(), ...record })}\n`, 'utf8')
-  }
+  const { journal, commit } = memoryFiles(root, writeText, rt.warn)
   let writing = Promise.resolve()
   const queued = (job) => {
     const run = writing.then(job)
@@ -666,9 +663,10 @@ export function install(rt) {
       index = joinLines(addLink(main.lines.length > 0 ? main.lines : parseMemory(EMPTY_MAIN).lines, topic))
       checkSize(main, index, label)
     }
-    await writeText(target.path, next)
-    if (index !== undefined) await writeText(main.path, index)
-    await journal({ op: 'add', scope: scopeKey(scope), file: target.file, ...actorOf(actor), after: line })
+    await commit([
+      { path: target.path, text: next },
+      ...(index === undefined ? [] : [{ path: main.path, text: index }]),
+    ], { op: 'add', scope: scopeKey(scope), file: target.file, ...actorOf(actor), after: line })
     noteNews(scope, actor, 'add', line)
     const where = topic === undefined ? MAIN : fresh ? `the new topic [[${topic}]], linked from MEMORY.md` : `topic [[${topic}]]`
     return { changed: true, file: target, message: `Saved to ${label}, in ${where} (${sizeNote(target, next.length)}).` }
@@ -699,8 +697,7 @@ export function install(rt) {
       lines[old.line] = line
       const next = joinLines(lines)
       checkSize(old.file, next, label)
-      await writeText(old.file.path, next)
-      await journal({ op: 'replace', scope: scopeKey(scope), file: old.file.file, ...actorOf(actor), before, after: line })
+      await commit([{ path: old.file.path, text: next }], { op: 'replace', scope: scopeKey(scope), file: old.file.file, ...actorOf(actor), before, after: line })
       noteNews(scope, actor, 'replace', line)
       return { changed: true, file: old.file, message: `Updated in ${label} (${fileName(old.file)}): "${old.text}" is now "${text}".` }
     })
@@ -715,14 +712,11 @@ export function install(rt) {
       const lines = old.file.lines.filter((_line, index) => index !== old.line)
       // A topic left with nothing but its title goes, and so does its link.
       const empty = old.file.topic !== undefined && lines.every(line => line.trim() === '' || HEADING.test(line))
-      if (empty) {
-        await unlink(old.file.path).catch(error => { if (error?.code !== 'ENOENT') throw error })
-        const main = files[0]
-        if (main.links.includes(old.file.topic)) await writeText(main.path, joinLines(removeLink(main.lines, old.file.topic)))
-      } else {
-        await writeText(old.file.path, joinLines(lines))
-      }
-      await journal({ op: 'remove', scope: scopeKey(scope), file: old.file.file, ...actorOf(actor), before, ...(empty ? { removedTopic: true } : {}) })
+      const main = files[0]
+      await commit([
+        { path: old.file.path, text: empty ? null : joinLines(lines) },
+        ...(empty && main.links.includes(old.file.topic) ? [{ path: main.path, text: joinLines(removeLink(main.lines, old.file.topic)) }] : []),
+      ], { op: 'remove', scope: scopeKey(scope), file: old.file.file, ...actorOf(actor), before, ...(empty ? { removedTopic: true } : {}) })
       noteNews(scope, actor, 'remove', before)
       return { changed: true, file: old.file, message: `Removed from ${label} (${fileName(old.file)}): "${old.text}", all of it, so save again with remember any part that is still true. The change log keeps a copy.${empty ? ` The topic [[${old.file.topic}]] was empty, so it is gone too.` : ''}` }
     })

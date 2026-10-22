@@ -235,6 +235,36 @@ test('topics hold details, linked from MEMORY.md, and go when their last entry d
   assert.equal(read('bots', 'b2', 'MEMORY.md'), '# Memory\n\n## Index\n')
 })
 
+test('failed journal writes roll back remember, replace and forget, so the same operation can be retried', async t => {
+  for (const operation of ['add', 'replace', 'remove', 'add-topic', 'remove-topic']) {
+    await t.test(operation, async t => {
+      const { tool, home, read, journal, stop } = start({ config: { memoryReview: false } })
+      t.after(() => stop())
+      const dir = join(home, 'memory', 'bots', 'b2')
+      mkdirSync(dir, { recursive: true })
+      const topic = operation === 'remove-topic'
+      const before = `# Memory\n\n${topic ? '' : '- Original fact [source: part 1 #2; added: 2026-01-02]\n\n'}## Index\n${topic ? '- [[ops]]\n' : ''}`
+      const detail = '# ops\n\n- Original fact [source: part 1 #2; added: 2026-01-02]\n'
+      writeFileSync(join(dir, 'MEMORY.md'), before)
+      if (topic) writeFileSync(join(dir, 'ops.md'), detail)
+      const blocked = join(home, 'memory', 'journal.jsonl')
+      mkdirSync(blocked)
+      const call = () => operation.startsWith('remove')
+        ? tool('forget', { entry: 'Original fact' }, 'b2')
+        : tool('remember', { text: 'The replacement fact', ...(operation === 'replace' ? { replace: 'Original fact' } : {}), ...(operation === 'add-topic' ? { topic: 'ops' } : {}) }, 'b2')
+      assert.doesNotMatch(await call(), /^(Saved|Updated|Removed)/)
+      assert.equal(read('bots', 'b2', 'MEMORY.md'), before)
+      assert.equal(existsSync(join(dir, 'ops.md')), topic)
+      if (topic) assert.equal(read('bots', 'b2', 'ops.md'), detail)
+      assert.equal(readdirSync(dir).filter(name => /\.(bak|tmp)$/.test(name)).length, 0)
+      rmSync(blocked, { recursive: true })
+      assert.match(await call(), /^(Saved|Updated|Removed)/)
+      assert.equal(journal().length, 1)
+      assert.equal(journal()[0].op, operation === 'replace' ? 'replace' : operation.startsWith('remove') ? 'remove' : 'add')
+    })
+  }
+})
+
 test('move takes an entry out of MEMORY.md into a topic, whole, with one record', async (t) => {
   const { tool, read, journal, stop } = start()
   t.after(() => stop())
