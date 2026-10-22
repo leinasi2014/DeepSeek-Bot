@@ -1,48 +1,38 @@
-# Fresh-home race: the first model call of a new session has no memory tools
+# Fresh-home first write: a mock routing defect, not a product one
 
-Found on the cloud bench (2026-10-22, `runs\20261022-1950-qa-m55-smoke2`), reproducible
-2 out of 2 on a brand-new DSH_HOME, never on a warm one. This file is the recipe; the
-archived mock.jsonl of the failed run holds the raw evidence (call 1: plain-text answer,
-no tool_use; call 3, same system-prompt hash: `tool:recall`).
+Found on the cloud bench (2026-10-22, `runs\20261022-1930/1950`), reproduced 3/3 on a
+brand-new DSH_HOME, never on a warm one. This file is the closed-out record; the raw
+evidence lives in the run archives (mock.jsonl, web.log, finding.txt).
 
-## Symptom
+## Final verdict (C: the mock's own routing)
 
-- A fresh DSH_HOME with the plugin linked, a Main Bot bootstrapped by the mock greeting.
-- The first user message `记住 Alpha uses pnpm` is answered with plain text by the
-  scripted mock, because the request's tool list has no `remember` (the mock answers
-  anything it has no tool for with `收到：…`). The save is silently skipped.
-- The next message in the same session (`回忆 Alpha`) already carries `recall` — the
-  tools arrived between the first and third model call, with the same system prompt.
+The first request of a fresh session is fine: `toolNames=56` with `remember`/`recall`
+present (logged with `MOCK_LOG_TOOLS=1`; the failed run's first call carries the exact
+same tools digest `3f480ea3178c` as a passing one). The product never lacked the tools.
 
-## Recipe (the cloud bench, ~5 minutes)
+What swallowed the first `记住` was `dev/mock-llm.mjs` itself:
 
-1. Remove the bench home, recreate it, link the plugin:
+1. A fresh home appends its runtime context and a `<system-reminder>` block to the user
+   message. The memory-command regexes matched the whole text with `^…$` (no `m` flag),
+   so `记住 X` followed by the reminder never matched.
+2. The miss fell through to the free-text rule that answers `list_bots` when the text
+   mentions "team" — and the reminder block does. The mock answered `list_bots({})` and
+   the save was silently skipped.
+3. Warm homes do not re-inject the whole reminder, which is why only fresh homes failed.
 
-   ```bat
-   rmdir /s /q C:\lab\bench-m55\.dsh-test-m55
-   mkdir C:\lab\bench-m55\.dsh-test-m55
-   set DSH_HOME=C:\lab\bench-m55\.dsh-test-m55
-   dsh plugin --profile web add link:C:/lab/src/DeepSeek-Bot-m55/ds-bot
-   ```
+Both fixed in `5c8a6d9`: command matching reads the first line, and the reminder block
+is stripped before the free-text rules. With the fix, a brand-new home answers the very
+first `记住` with a real `remember` tool_use and the entry lands (SMOKE-PASS twice on
+the cloud bench: `runs\20261022-2135`, `runs\20261022-2145`).
 
-2. Start the mock (port 3211) and `dsh --profile web --no-open --port 3210` with
-   `DEEPSEEK_BASE_URL=http://127.0.0.1:3211/v1`, wait for the 3210 listener only
-   (the login URL needs a token; a plain HTTP probe fails).
-3. As soon as `state` shows the Main Bot, send `记住 Alpha uses pnpm`, settle, then
-   `回忆 Alpha`, settle. Stop both processes.
-4. Read the mock log: the first call for the send must show
-   `"out":[{"type":"tool_use","name":"remember",...}]`. On the failing builds it shows
-   a text block instead — that is the race.
+## Guards against a comeback
 
-## Where to look
-
-The tools reach the model through the per-session request assembled by DSH; the plugin
-registers its tools once at load. The gap is between the first request of a brand-new
-session and the plugin's (or the capability layer's) registration becoming visible to
-it. Not reproduced in unit tests because fixtures register tools synchronously.
+- `dev/bench-memory.mjs` probe: when the tap records tool names, the first chat call
+  must include `remember`, or the bench fails loudly.
+- The repro case added with `5c8a6d9` pins the first-line matching itself.
 
 ## Acceptance line for #55
 
-A fresh-home bench run must save the first `记住` message; the current smoke
-(`ds-bot/dev/../dev` bench scripts, cloud copy `m55-smoke.mjs` in the run archive)
-asserts exactly this and fails on the race.
+A fresh-home bench run must save the first `记住` message: first-round `remember`
+tool_use and the entry in `MEMORY.md`. That line stands; the earlier "tool
+registration window" hypothesis behind it was wrong and is withdrawn.
