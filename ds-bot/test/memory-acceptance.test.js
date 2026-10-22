@@ -162,10 +162,8 @@ test('scope: the automatic review defaults to project and rejects unresolved', a
     assert.match(log, /"reason":"project-unresolved"/)
     assert.match(log, /The deploy window is 8pm/)
   }
-  // Out of scope, by the maintainer's ruling (2026-10-22): a review add with
-  // team:true that the Bot may not write is not refused; with the project work it
-  // falls to the session's project (own, before this work, when there is none).
-  // This pins today's behavior so any later change is a visible decision, not drift.
+  // An explicit team add by a Bot that may not write the team is refused — skipped
+  // and journaled, never redirected to own or project (fix 5542df2, accepted ruling).
   {
     const teamReply = JSON.stringify({ changes: [{ op: 'add', text: 'Ship on Friday', team: true }] })
     const s = startReview(scopeSessions.sA, [teamReply])
@@ -173,10 +171,13 @@ test('scope: the automatic review defaults to project and rejects unresolved', a
     t.after(async () => { await s.ctx.dispose(); rmSync(s.home, { recursive: true, force: true }) })
     s.ctx.emit('agent/status', { agent: { id: 'sA', session: scopeSessions.sA }, status: 'idle' })
     await new Promise(resolve => setTimeout(resolve, 50))
-    assert.equal(existsSync(join(s.home, 'memory', 'team')), false, 'team not written without permission')
+    assert.equal(existsSync(join(s.home, 'memory', 'team')), false, 'team not written')
+    assert.equal(existsSync(join(s.home, 'memory', 'bots', 'b2')), false, 'own not written')
     const alpha = s.rt.projectScope.resolve(scopeSessions.sA)
-    assert.match(readFileSync(join(s.home, 'memory', 'projects', alpha.hash, 'MEMORY.md'), 'utf8'), /Ship on Friday/, 'the add lands in the session project, the ruled-in fallback')
-    assert.equal(existsSync(join(s.home, 'memory', 'bots', 'b2')), false)
+    assert.equal(existsSync(join(s.home, 'memory', 'projects', alpha.hash)), false, 'project not the fallback either')
+    const log = readFileSync(join(s.home, 'memory', 'journal.jsonl'), 'utf8')
+    assert.match(log, /"reason":"team-write-denied"/)
+    assert.match(log, /Ship on Friday/)
   }
 })
 
