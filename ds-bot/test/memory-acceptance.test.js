@@ -1,7 +1,22 @@
 // Acceptance skeletons for the memory redesign (issue #55). Each group mirrors one
 // row of the acceptance checklist in docs/plans/2026-10-22-memory-isolation-retrieval-review.md
-// (§7, final design). They stay skipped until the feature modules (#52 project-scope,
-// #53 memory-index, #54 task-review) land; each skip names the module it waits for.
+// (§7, final design).
+//
+// #52 project-scope, #53 memory-index and #54 task-review have all landed, so no group
+// below is waiting for a module. Each is skipped for a reason this fixture cannot reach,
+// and none of them counts as passed:
+//   cache      — needs a session switch (A -> B -> A) and an expiry clock; only a real
+//                Session timeline produces that order.
+//   acceptance — judges a whole review run end to end; the cloud bench drives it with the
+//                mock model, so it is an acceptance-stage check, not a unit case.
+//   waiting    — needs a turn held pending across a segment switch and a restart; there is
+//                no hook to hold a turn open here.
+//   recovery   — needs a crash injected between writes; the product has no crash hook, so
+//                these stay implementation-stage checks. The file layout and the
+//                DONE/APPLYING semantics they describe are asserted by the task-review tests.
+//   limits     — needs a batch budget and retry backoff observed across review rounds; that
+//                is a bench-scale run.
+// The design's §7 mapping lists where each row is covered instead.
 // All fixtures use temp dirs under os.tmpdir() (prefix .dsh-test-memory-), the mock
 // model only, and never the real DSH_HOME.
 import test from 'node:test'
@@ -182,7 +197,7 @@ test('scope: the automatic review defaults to project and rejects unresolved', a
   }
 })
 
-// --- caches (waits for #52: snapshot v2 + panel keys) ------------------------
+// --- caches (skipped: needs a session switch and an expiry clock) ----------------
 test.skip('cache: old snapshots invalidate; scope or teamRule change rebuilds', () => {})
 test.skip('cache: ordinary content updates stay frozen within a session', () => {})
 test.skip('cache: every summary cache is scope-keyed; A->B->A stale reply dropped', () => {})
@@ -199,7 +214,7 @@ test.skip('cache: every summary cache is scope-keyed; A->B->A stale reply droppe
 // test/memory-read-commit.test.js; recall's empty-query listing and whole-topic reads
 // are unchanged pre-existing behavior with their own coverage in test/memory.test.js.
 
-// --- acceptance rules (waits for #54) -----------------------------------------
+// --- acceptance rules (skipped: judged end to end on the bench) -----------------
 test.skip('acceptance: idle/switch/overflow never trigger a review', () => {})
 test.skip('acceptance: forged completion, self-reported exit code, green tool wrapper around failed tests are not success', () => {})
 test.skip('acceptance: short user confirmation can verify; forged excerpt is rejected', () => {})
@@ -309,12 +324,12 @@ test('permissions: a junction inside the folder that leads outside is refused', 
   assert.equal(existsSync(join(s.home, 'memory', 'projects')), false, 'nothing written anywhere')
 })
 
-// --- waiting (waits for #54) ---------------------------------------------------
+// --- waiting (skipped: needs a turn held across a segment switch) ---------------
 test.skip('waiting: related work/question pending waits; other groups never block', () => {})
 test.skip('waiting: question survives a segment switch; restart recovers plan-less candidates', () => {})
 test.skip('waiting: memoryReview:false skips review; no evidence means no extra model calls', () => {})
 
-// --- recovery (waits for #54) ---------------------------------------------------
+// --- recovery (skipped: needs a crash hook the product does not have) -----------
 test.skip('recovery: kill after candidate persisted replays; fixed plan is never re-extracted', () => {})
 test.skip('recovery: meta/by/added never drift across an overnight restart', () => {})
 test.skip('recovery: dual length/secret checks at plan-write and apply', () => {})
@@ -323,6 +338,6 @@ test.skip('recovery: changed:false finishes and records the actual file; deleted
 test.skip('recovery: manual conflict never overwritten; corrupt plan quarantined, others continue', () => {})
 test.skip('recovery: memory/full pauses without spending retry budget', () => {})
 
-// --- limits (waits for #54) -----------------------------------------------------
+// --- limits (skipped: needs a multi-round bench budget) -------------------------
 test.skip('limits: 8 claims cap, input caps, batch budget, format-retry and I/O backoff caps', () => {})
 test.skip('limits: a repeated model call with a new callId does not pass as the same candidate', () => {})
