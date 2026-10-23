@@ -172,6 +172,126 @@ test('the boundary is exact: a request of exactly the limit is kept whole, one m
   assert.equal(extractShape(over).notes, 1_200, 'the first step is the one that ran')
 })
 
+// --- boundary cases found on the first pure-helper review (#72) ----------------
+
+const NUL = '\u0000'
+
+// What the old helper did with these inputs: the fields were measured in raw characters and
+// the verification entry was a spread of the caller's object, so JSON escaping and metadata
+// were never counted. Both builders are the counterexamples, not the implementation.
+const oldExtract = (report) => [
+  `The Bot reported: ${report.result.slice(0, 2000)}`,
+  `Notes: ${report.notes.slice(0, 4000)}`,
+  `Claims: ${JSON.stringify(report.claims.map(claim => ({ index: claim.index, kind: claim.kind, statement: claim.statement.slice(0, 1000), evidence: claim.evidence.slice(0, 500), ref: claim.ref.slice(0, 200) })))}`,
+  'Conversation lines (oldest first):',
+  ...report.lines.slice(-40).map(line => `${line.who}: ${line.text}`.replace(/\s+/g, ' ').slice(0, 400)),
+].join('\n')
+const oldVerify = (entries) => entries.map(entry => JSON.stringify({ ...entry, claim: String(entry.claim).slice(0, 1000), evidence: String(entry.evidence).slice(0, 500), context: String(entry.context).slice(0, 300) })).join('\n')
+
+const controlClaims = () => Array.from({ length: CLAIMS_MAX }, (_, at) => ({
+  index: at,
+  kind: at % 2 ? 'command' : 'user',
+  statement: NUL.repeat(1000),
+  evidence: NUL.repeat(500),
+  ref: NUL.repeat(200),
+}))
+
+test('control characters are measured as they serialize, not as they are stored', () => {
+  const report = { result: '', notes: '', claims: controlClaims(), lines: [] }
+  assert.ok(oldExtract(report).length > 22_000, `the counterexample is ${oldExtract(report).length} characters`)
+  const request = extractInput(report)
+  assert.ok(request.length <= INPUT_MAX, `the request is ${request.length} characters`)
+  // Both claims and structure survive: eight claims, each with its index and kind.
+  const parsed = claimsOf(request)
+  assert.equal(parsed.length, CLAIMS_MAX)
+  assert.deepEqual(parsed.map(claim => claim.kind), ['user', 'command', 'user', 'command', 'user', 'command', 'user', 'command'])
+  // The control characters are gone from what the model reads.
+  assert.equal([...request].some(character => character.codePointAt(0) < 32 && character !== '\n'), false)
+})
+
+test('the same control characters in a verification request cannot grow it sixfold', () => {
+  const entries = controlClaims().map(claim => ({
+    claim: claim.statement,
+    kind: claim.kind,
+    evidence: claim.evidence,
+    context: claim.ref,
+    sourceType: 'tool',
+    tool: 'bash',
+    toolCallFailed: false,
+  }))
+  assert.ok(oldVerify(entries).length > 20_000, `the counterexample is ${oldVerify(entries).length} characters`)
+  const request = verifyInput(entries)
+  assert.ok(request.length <= INPUT_MAX, `the request is ${request.length} characters`)
+  const parsed = request.split('\n').map(line => JSON.parse(line))
+  assert.equal(parsed.length, CLAIMS_MAX, 'every candidate keeps its line, in order')
+  assert.ok(parsed.every(entry => entry.sourceType === 'tool' && entry.tool === 'bash' && entry.toolCallFailed === false))
+  assert.equal([...request].some(character => character.codePointAt(0) < 32 && character !== '\n'), false)
+})
+
+test('unbounded metadata in one entry is bounded, and the entry is not dropped', () => {
+  const entry = {
+    claim: '发布脚本跑通了',
+    kind: 'command',
+    evidence: 'tests 12/12',
+    context: 'tests 12/12 passing',
+    sourceType: 'tool',
+    tool: 'bash',
+    toolCallFailed: false,
+    toolError: 'E'.repeat(20_000),
+  }
+  assert.ok(oldVerify([entry]).length > 20_000, `the counterexample is ${oldVerify([entry]).length} characters`)
+  const request = verifyInput([entry])
+  assert.ok(request.length <= INPUT_MAX, `the request is ${request.length} characters`)
+  assert.ok(request.length <= SOURCE_MAX, `one entry is one source: ${request.length}`)
+  const parsed = JSON.parse(request)
+  assert.equal(parsed.claim, '发布脚本跑通了', 'the claim itself is kept')
+  assert.equal(parsed.kind, 'command')
+  assert.equal(parsed.tool, 'bash')
+  assert.equal(parsed.toolCallFailed, false)
+  assert.ok(parsed.toolError.length <= 120, `the error code is ${parsed.toolError.length}`)
+})
+
+test('normal content is preserved whole: only the budget cuts, never the shape', () => {
+  const report = {
+    result: '发布脚本 scripts/ship.sh 跑完了',
+    notes: '先跑 npm test，再发布',
+    claims: [
+      { index: 0, kind: 'command', statement: '发布前必须先跑测试', evidence: 'tests 12/12 passing', ref: 'bash k1' },
+      { index: 1, kind: 'user', statement: '用户希望发布在周五', evidence: 'Deploys go out on Friday', ref: 'part 1 #10' },
+    ],
+    lines: [{ who: 'tool', text: 'tests 12/12 passing\n[exit code: 0]' }, { who: 'user', text: 'Deploys go out on Friday' }],
+  }
+  assert.equal(extractInput(report), oldExtract(report), 'a request inside the budget is byte-for-byte what it was')
+  assert.equal(verifyInput([{ claim: '发布前必须先跑测试', kind: 'command', evidence: 'tests 12/12 passing', context: 'tests 12/12 passing', sourceType: 'tool', tool: 'bash', toolCallFailed: false }]),
+    JSON.stringify({ claim: '发布前必须先跑测试', kind: 'command', evidence: 'tests 12/12 passing', context: 'tests 12/12 passing', sourceType: 'tool', tool: 'bash', toolCallFailed: false }))
+})
+
+test('characters that grow under JSON escaping are counted as they serialize', () => {
+  // A backslash becomes two characters and a quote two, so a field of 4,000 of them is 8,000
+  // in the JSON. The budget is measured on the serialized text, so the request still fits.
+  const report = {
+    result: '\\'.repeat(4000),
+    notes: '"'.repeat(8000),
+    claims: Array.from({ length: CLAIMS_MAX }, (_, at) => ({ index: at, kind: 'command', statement: '\\'.repeat(1000), evidence: '"'.repeat(500), ref: '\\"'.repeat(100) })),
+    lines: Array.from({ length: EXCERPT_LINES }, () => ({ who: 'user', text: '\\'.repeat(4000) })),
+  }
+  const request = extractInput(report)
+  assert.ok(request.length <= INPUT_MAX, `the request is ${request.length}`)
+  assert.equal(claimsOf(request).length, CLAIMS_MAX)
+  const entries = Array.from({ length: CLAIMS_MAX }, () => ({
+    claim: '\\'.repeat(1000), kind: 'command', evidence: '"'.repeat(500), context: '\\'.repeat(300),
+    sourceType: 'tool', tool: 'bash', toolCallFailed: false, toolError: '\\'.repeat(20_000),
+  }))
+  const verify = verifyInput(entries)
+  assert.ok(verify.length <= INPUT_MAX, `the verification request is ${verify.length}`)
+  for (const line of verify.split('\n')) assert.ok(line.length <= SOURCE_MAX, `an entry is ${line.length}`)
+})
+
+test('a resolved entry keeps its own shape: provenance and booleans are typed, not shorten', () => {
+  const parsed = JSON.parse(verifyInput([{ claim: 'c', kind: 'command', evidence: 'e', context: 'x', sourceType: 'tool', tool: 'bash', toolCallFailed: true, toolReportedFailure: false, toolError: 'E_FAIL' }]))
+  assert.deepEqual(parsed, { claim: 'c', kind: 'command', evidence: 'e', context: 'x', sourceType: 'tool', tool: 'bash', toolError: 'E_FAIL', toolCallFailed: true, toolReportedFailure: false })
+})
+
 test('a report of nothing still produces a well-formed request', () => {
   assert.equal(extractInput(), ['The Bot reported: ', 'Notes: ', 'Claims: []', 'Conversation lines (oldest first):'].join('\n'))
   assert.match(extractInput({ claims: [{ kind: 'user', statement: 's', evidence: 'e', ref: 'r' }] }), /"index":0/, 'a claim without an index gets its position')
