@@ -292,6 +292,23 @@ test('a resolved entry keeps its own shape: provenance and booleans are typed, n
   assert.deepEqual(parsed, { claim: 'c', kind: 'command', evidence: 'e', context: 'x', sourceType: 'tool', tool: 'bash', toolError: 'E_FAIL', toolCallFailed: true, toolReportedFailure: false })
 })
 
+test('a candidate as taskReview.enqueue stores it is what the helpers are given', () => {
+  // The record's own limits, from task-review.js/enqueue and the complete_task tool: a 2,000
+  // character result, 4,000 characters of notes and eight claims of kind/statement/evidence/
+  // ref at 1,000/500/200. This is the shape the wiring passes in, not a hand-made one.
+  const record = {
+    result: filler('The report', 2000),
+    notes: filler('The notes', 4000),
+    claims: claims(8).map((claim, at) => ({ kind: at % 2 ? 'command' : 'user', statement: claim.statement, evidence: claim.evidence, ref: claim.ref })),
+  }
+  const request = extractInput({ ...record, lines: lines(EXCERPT_LINES, 400) })
+  assert.ok(request.length <= INPUT_MAX, `the request is ${request.length}`)
+  assert.deepEqual(claimsOf(request).map(claim => claim.kind), ['user', 'command', 'user', 'command', 'user', 'command', 'user', 'command'])
+  // Fields the record does not carry, or a caller's extra ones, never reach the model.
+  const extra = extractInput({ result: 'done', notes: '', claims: [{ kind: 'user', statement: 's', evidence: 'e', ref: 'r', internal: 'x'.repeat(5000) }], lines: [], secret: 'y'.repeat(5000) })
+  assert.equal(extra, ['The Bot reported: done', 'Notes: ', 'Claims: [{"index":0,"kind":"user","statement":"s","evidence":"e","ref":"r"}]', 'Conversation lines (oldest first):'].join('\n'))
+})
+
 test('a report of nothing still produces a well-formed request', () => {
   assert.equal(extractInput(), ['The Bot reported: ', 'Notes: ', 'Claims: []', 'Conversation lines (oldest first):'].join('\n'))
   assert.match(extractInput({ claims: [{ kind: 'user', statement: 's', evidence: 'e', ref: 'r' }] }), /"index":0/, 'a claim without an index gets its position')
