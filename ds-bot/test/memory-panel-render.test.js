@@ -39,7 +39,7 @@ runInNewContext(bundle.outputFiles[0].text, {
     return platform[name]
   },
 })
-const { ProjectPicker } = module.exports
+const { ProjectPicker, Entries } = module.exports
 
 const walk = (node, found = []) => {
   if (typeof node === 'string' || typeof node === 'number') { found.push(String(node)); return found }
@@ -93,4 +93,65 @@ test('a project the host could not name falls back to the root rather than to a 
 
 test('no projects draws no picker at all', () => {
   assert.equal(ProjectPicker({ view: { projects: [] }, session: '', onSession: () => {} }), null)
+})
+
+// #96: the ask prompt numbers the entries own, then team, then project, and the model
+// answers "edit 3" with that number. A person could not see any number, so "3" meant the
+// third row on screen — a different entry whenever own or team held any. The panel now
+// shows the same number the model was given, whichever section the row is drawn in.
+const numbered = (entries, sizes) => ({
+  entries,
+  sizes,
+  limits: { main: 4000, entry: 300, topic: 16000 },
+  project: sizes.project === undefined ? null : { hash: 'h1', root: 'C:\\work\\alpha' },
+})
+const rowNumbers = tree => walk(tree)
+  .filter(node => node.props?.className === 'bt-mem-entry-number')
+  .map(node => text(node))
+
+test('every entry row shows the number the ask prompt gave it', () => {
+  const entries = [
+    { scope: 'own', topic: null, text: 'Own first' },
+    { scope: 'own', topic: null, text: 'Own second' },
+    { scope: 'team', topic: null, text: 'Team one' },
+    { scope: 'project', topic: null, text: 'Project one' },
+  ]
+  const tree = Entries({
+    bot: { name: 'Writer' },
+    view: numbered(entries, { own: 100, team: 50, project: 20 }),
+    remove: async () => true,
+  })
+  assert.deepEqual(rowNumbers(tree), ['[1]', '[2]', '[3]', '[4]'])
+})
+
+test('the numbers follow the list the model reads, not the order of the sections', () => {
+  // No own entries, one team entry, one project entry: the model reads [1] team, [2]
+  // project. The panel draws the team section above the project one, so a person
+  // counting rows would still have said "1" for the project entry.
+  const entries = [
+    { scope: 'team', topic: null, text: 'Team one' },
+    { scope: 'project', topic: null, text: 'Project one' },
+  ]
+  const tree = Entries({
+    bot: { name: 'Writer' },
+    view: numbered(entries, { own: 0, team: 50, project: 20 }),
+    remove: async () => true,
+  })
+  const rows = walk(tree).filter(node => node.props?.className === 'bt-mem-entry')
+  const textOf = row => walk(row).filter(item => typeof item === 'string').join(' ')
+  const projectRow = rows.find(row => textOf(row).includes('Project one'))
+  assert.deepEqual(rowNumbers(projectRow), ['[2]'])
+})
+
+test('a topic entry keeps its place in the numbered list', () => {
+  const entries = [
+    { scope: 'own', topic: null, text: 'In MEMORY.md' },
+    { scope: 'own', topic: 'travel', text: 'In a topic' },
+  ]
+  const tree = Entries({
+    bot: { name: 'Writer' },
+    view: numbered(entries, { own: 100, team: 0 }),
+    remove: async () => true,
+  })
+  assert.deepEqual(rowNumbers(tree), ['[1]', '[2]'])
 })
