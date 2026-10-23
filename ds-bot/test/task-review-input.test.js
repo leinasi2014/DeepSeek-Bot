@@ -1,0 +1,209 @@
+// #72: the task review's model inputs have one total budget and one per-source budget.
+// These cover the request the old code could build (about 31K characters), the boundary,
+// and what must survive a cut: every claim with its index and kind, the tool identity and
+// failure state of a quote, and the fixed order in which fields are shortened.
+import assert from 'node:assert/strict'
+import test from 'node:test'
+import {
+  CLAIMS_MAX, EXCERPT_FLOOR_LINES, EXCERPT_LINES, FULL_SHAPE, INPUT_MAX, SOURCE_MAX,
+  extractInput, extractShape, verifyInput,
+} from '../src/host/task-review-input.js'
+
+const filler = (start, length) => `${start} ${'x'.repeat(Math.max(0, length - start.length - 1))}`
+const lines = (count, width = 400) => Array.from({ length: count }, (_, at) => ({ who: at % 2 ? 'tool' : 'user', text: filler(`line ${at + 1}`, width) }))
+const claims = (count = CLAIMS_MAX) => Array.from({ length: count }, (_, at) => ({
+  index: at,
+  kind: at % 2 ? 'command' : 'user',
+  statement: filler(`claim ${at + 1}`, 1000),
+  evidence: filler(`evidence ${at + 1}`, 500),
+  ref: filler(`ref ${at + 1}`, 200),
+}))
+
+// What the code before the budget built: every field at its own limit, every line at 400
+// characters and no total check. Kept as the counterexample the issue describes.
+const unbudgeted = ({ result, notes, claims: list, lines: conversation }) => [
+  `The Bot reported: ${result.slice(0, 2000)}`,
+  `Notes: ${notes.slice(0, 4000)}`,
+  `Claims: ${JSON.stringify(list.map(claim => ({ index: claim.index, kind: claim.kind, statement: claim.statement.slice(0, 1000), evidence: claim.evidence.slice(0, 500), ref: claim.ref.slice(0, 200) })))}`,
+  'Conversation lines (oldest first):',
+  ...conversation.slice(-40).map(line => `${line.who}: ${line.text}`.replace(/\s+/g, ' ').slice(0, 400)),
+].join('\n')
+
+const huge = {
+  result: filler('The report', 2000),
+  notes: filler('The notes', 4000),
+  claims: claims(),
+  lines: lines(EXCERPT_LINES),
+}
+
+const claimsOf = request => JSON.parse(request.slice(request.indexOf('Claims: ') + 'Claims: '.length, request.indexOf('\nConversation lines')))
+const blockOf = request => request.slice(request.indexOf('Conversation lines (oldest first):\n') + 'Conversation lines (oldest first):\n'.length)
+const notesOf = request => request.slice(request.indexOf('Notes: ') + 'Notes: '.length, request.indexOf('\nClaims: '))
+const reportedOf = request => request.slice('The Bot reported: '.length, request.indexOf('\nNotes: '))
+
+test('the old fields add up to about 31K characters in one extraction request', () => {
+  const request = unbudgeted(huge)
+  assert.ok(request.length > 31_000, `the counterexample is ${request.length} characters`)
+})
+
+test('the same report now fits the total budget, labels and JSON included', () => {
+  const request = extractInput(huge)
+  assert.ok(request.length <= INPUT_MAX, `the request is ${request.length} characters`)
+  assert.match(request, /^The Bot reported: /)
+  assert.match(request, /\nNotes: /)
+  assert.match(request, /\nClaims: \[/)
+  assert.match(request, /\nConversation lines \(oldest first\):\n/)
+})
+
+test('every claim is kept, with its index and kind, so every answer still has a question', () => {
+  const parsed = claimsOf(extractInput(huge))
+  assert.equal(parsed.length, CLAIMS_MAX)
+  assert.deepEqual(parsed.map(claim => claim.index), [0, 1, 2, 3, 4, 5, 6, 7])
+  assert.deepEqual(parsed.map(claim => claim.kind), ['user', 'command', 'user', 'command', 'user', 'command', 'user', 'command'])
+  assert.ok(parsed.every(claim => claim.statement.length > 0 && claim.evidence.length > 0 && claim.ref.length > 0), 'no field is emptied to make room')
+})
+
+test('more claims than the limit keep the first eight, never more', () => {
+  const many = Array.from({ length: 10 }, (_, at) => ({ ...claims(1)[0], index: at }))
+  const parsed = claimsOf(extractInput({ ...huge, claims: many }))
+  assert.equal(parsed.length, CLAIMS_MAX)
+  assert.deepEqual(parsed.map(claim => claim.index), [0, 1, 2, 3, 4, 5, 6, 7])
+})
+
+test('each source stays at or below its own limit: the report, the notes, each claim, the line block', () => {
+  for (const report of [huge, { ...huge, claims: [], lines: lines(EXCERPT_LINES, 4000) }]) {
+    const request = extractInput(report)
+    assert.ok(reportedOf(request).length <= SOURCE_MAX, `the report is ${reportedOf(request).length}`)
+    assert.ok(notesOf(request).length <= SOURCE_MAX, `the notes are ${notesOf(request).length}`)
+    assert.ok(blockOf(request).length <= SOURCE_MAX, `the line block is ${blockOf(request).length}`)
+    for (const claim of claimsOf(request)) assert.ok(JSON.stringify(claim).length <= SOURCE_MAX)
+  }
+})
+
+test('a request that already fits is left whole: nothing is cut for room it does not need', () => {
+  const report = { result: 'ran the release', notes: 'one note', claims: [{ index: 0, kind: 'command', statement: 'the suite passes', evidence: 'tests 12/12', ref: 'bash k1' }], lines: [{ who: 'tool', text: 'tests 12/12 passing' }] }
+  assert.equal(extractInput(report), [
+    'The Bot reported: ran the release',
+    'Notes: one note',
+    'Claims: [{"index":0,"kind":"command","statement":"the suite passes","evidence":"tests 12/12","ref":"bash k1"}]',
+    'Conversation lines (oldest first):',
+    'tool: tests 12/12 passing',
+  ].join('\n'))
+})
+
+// The realised shape must always be the full one with the first steps of the order applied,
+// and no others: that is what "fixed priority" means, and it is what keeps a mild overflow
+// from cutting the evidence a claim will be judged on.
+const steps = [
+  next => ({ ...next, notes: 1_200 }),
+  next => ({ ...next, result: 600 }),
+  next => ({ ...next, lines: EXCERPT_FLOOR_LINES }),
+  next => ({ ...next, evidence: 100 }),
+  next => ({ ...next, statement: 200 }),
+  next => ({ ...next, ref: 40 }),
+]
+const prefix = at => {
+  let shape = { ...FULL_SHAPE }
+  for (let step = 0; step < at; step += 1) shape = steps[step](shape)
+  return shape
+}
+const isPrefix = shape => [0, 1, 2, 3, 4, 5, 6].some(at => JSON.stringify(prefix(at)) === JSON.stringify(shape))
+
+test('the cut is a fixed prefix of one order: notes, report, lines, evidence, statement, ref', () => {
+  const reports = [
+    huge,
+    { ...huge, lines: [] },
+    { ...huge, claims: [] },
+    { result: '', notes: '', claims: claims(), lines: lines(EXCERPT_LINES, 4000) },
+  ]
+  for (const report of reports) {
+    const shape = extractShape(report)
+    assert.ok(isPrefix(shape), `the shape is not a prefix of the order: ${JSON.stringify(shape)}`)
+    assert.ok(extractInput(report).length <= INPUT_MAX)
+  }
+})
+
+test('the order stops as soon as the request fits: a mild overflow shortens the notes only', () => {
+  // Four full claims, a full report, the notes and forty ordinary lines: the notes are the
+  // first step and are enough, so the report, the lines and the claim fields keep the shape
+  // the review always had.
+  const report = { result: filler('The report', 2000), notes: filler('The notes', 4000), claims: claims(4), lines: lines(EXCERPT_LINES, 80) }
+  assert.ok(extractInput(report).length <= INPUT_MAX)
+  const shape = extractShape(report)
+  assert.equal(shape.notes, 1_200)
+  assert.equal(shape.result, FULL_SHAPE.result)
+  assert.equal(shape.lines, FULL_SHAPE.lines)
+  assert.equal(shape.evidence, FULL_SHAPE.evidence)
+  assert.equal(shape.statement, FULL_SHAPE.statement)
+})
+
+test('a backlog of long lines drops to ten before any claim field is cut, and the newest stay', () => {
+  const report = { result: filler('The report', 2000), notes: filler('The notes', 4000), claims: claims(), lines: lines(EXCERPT_LINES, 4000) }
+  const shape = extractShape(report)
+  assert.equal(shape.lines, EXCERPT_FLOOR_LINES)
+  const block = blockOf(extractInput(report))
+  assert.equal(block.split('\n').length, EXCERPT_FLOOR_LINES)
+  assert.match(block, /line 40 /)
+  assert.doesNotMatch(block, /line 1 /)
+})
+
+test('with the lines at their floor, the evidence is cut before the statement and the ref', () => {
+  const report = { result: '', notes: '', claims: claims(), lines: lines(EXCERPT_LINES, 4000) }
+  const shape = extractShape(report)
+  assert.equal(shape.evidence, 100)
+  assert.equal(shape.statement, FULL_SHAPE.statement)
+  assert.equal(shape.ref, FULL_SHAPE.ref)
+  const request = extractInput(report)
+  assert.ok(request.length <= INPUT_MAX, `the request is ${request.length}`)
+  assert.equal(claimsOf(request).length, CLAIMS_MAX, 'nothing is dropped to fit')
+})
+
+test('the boundary is exact: a request of exactly the limit is kept whole, one more character cuts', () => {
+  // Seven full claims and a full report leave room in the notes; the notes are sized to land
+  // exactly on the limit. Nothing may be cut at the boundary, and one more character must be.
+  const report = { result: filler('The report', 2000), notes: '', claims: claims(7), lines: [] }
+  const room = INPUT_MAX - extractInput(report).length
+  assert.ok(room > 0 && room <= FULL_SHAPE.notes, `the notes have ${room} characters of room`)
+  const exact = { ...report, notes: 'n'.repeat(room) }
+  assert.equal(extractInput(exact).length, INPUT_MAX, 'the fixture sits on the boundary')
+  assert.equal(extractShape(exact).notes, FULL_SHAPE.notes, 'no step runs while the request fits')
+  const over = { ...report, notes: 'n'.repeat(room + 1) }
+  assert.ok(extractInput(over).length <= INPUT_MAX, `one character over must still fit: ${extractInput(over).length}`)
+  assert.equal(extractShape(over).notes, 1_200, 'the first step is the one that ran')
+})
+
+test('a report of nothing still produces a well-formed request', () => {
+  assert.equal(extractInput(), ['The Bot reported: ', 'Notes: ', 'Claims: []', 'Conversation lines (oldest first):'].join('\n'))
+  assert.match(extractInput({ claims: [{ kind: 'user', statement: 's', evidence: 'e', ref: 'r' }] }), /"index":0/, 'a claim without an index gets its position')
+})
+
+// --- the batch verification request -----------------------------------------
+
+const candidates = (count = CLAIMS_MAX) => Array.from({ length: count }, (_, at) => ({
+  claim: filler(`claim ${at + 1}`, 1000),
+  kind: at % 2 ? 'command' : 'user',
+  evidence: filler(`evidence ${at + 1}`, 500),
+  context: filler(`context ${at + 1}`, 300),
+  sourceType: 'tool',
+  tool: 'bash',
+  toolCallFailed: false,
+}))
+
+test('the verification request fits the same budget and keeps every candidate in order', () => {
+  const request = verifyInput(candidates())
+  assert.ok(request.length <= INPUT_MAX, `the request is ${request.length}`)
+  const parsed = request.split('\n').map(line => JSON.parse(line))
+  assert.equal(parsed.length, CLAIMS_MAX)
+  assert.deepEqual(parsed.map(entry => entry.claim.slice(0, 7)), ['claim 1', 'claim 2', 'claim 3', 'claim 4', 'claim 5', 'claim 6', 'claim 7', 'claim 8'])
+  assert.ok(parsed.every(entry => entry.sourceType === 'tool' && entry.tool === 'bash' && entry.toolCallFailed === false), 'the provenance is never cut')
+})
+
+test('a verification entry that fits is unchanged, field for field', () => {
+  const entry = { claim: '发布脚本跑通了，测试 12/12 通过', kind: 'command', evidence: 'tests 12/12', context: 'tests 12/12 passing', sourceType: 'tool', tool: 'bash', toolCallFailed: false, toolReportedFailure: false }
+  assert.equal(verifyInput([entry]), JSON.stringify(entry))
+})
+
+test('an empty or oversized verification list is one object per kept candidate', () => {
+  assert.equal(verifyInput(), '')
+  assert.equal(verifyInput(candidates(10)).split('\n').length, CLAIMS_MAX)
+})
