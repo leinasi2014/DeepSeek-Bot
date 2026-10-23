@@ -776,7 +776,7 @@ export function install(rt) {
   // One item, written through the queue exactly as planned: the frozen line and its
   // metadata, never recomputed. Both checks are re-run here because the plan file can be
   // edited by hand between the freeze and the write.
-  function taskReviewApply(item) {
+  function taskReviewApply(item, hooks = {}) {
     return queued(async () => {
       const scope = scopeOfKey(item.scope)
       writable(scope, { id: 'user', name: 'user' })
@@ -787,6 +787,19 @@ export function install(rt) {
       const metaText = Object.entries(metaForSecretCheck(item.meta)).map(([key, value]) => `${key}: ${value}`).join(' ')
       if (secretEntry(item.text) || secretEntry(metaText)) throw Object.assign(new Error('This entry looks like a secret'), { code: 'memory/invalid' })
       const files = loadScope(scope)
+      // #64: the committed hashes of every file this item may write, taken inside the
+      // same critical section as the write itself, and handed to the review through
+      // the hook: it decides and persists its pre-write state here, so no other
+      // memory write — a remember, a move, another review — can land between the
+      // pre-write state and the write it guards.
+      if (hooks.preWrite !== undefined) {
+        const names = [...new Set(item.topic === '' ? [MAIN] : [`${item.topic}.md`, MAIN])]
+        const held = new Map(files.map(file => [file.file, file.content]))
+        const hashes = {}
+        for (const name of names) hashes[name] = createHash('sha256').update(held.get(name) ?? '').digest('hex')
+        const verdict = await hooks.preWrite(hashes)
+        if (verdict?.skip === true) return { skipped: true, verdict }
+      }
       const main = files[0]
       const label = taskLabel(scope)
       const same = matchEntries(allEntries(files), item.text).filter(entry => squash(entry.text) === squash(item.text))

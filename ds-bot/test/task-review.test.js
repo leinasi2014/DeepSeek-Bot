@@ -80,11 +80,20 @@ function prehashHarness(t) {
     root,
     check: async () => ({ ok: true, project: 'project:a' }),
     extract: async () => ({ items: [{ scope: 'project:a', text: '用脚本发布', outcome: 'verified', source: 'part 1 #2' }] }),
-    applyItem: async (item) => {
+    applyItem: async (item, hooks) => {
+      const files_ = files[item.scope]
+      // The queue-side contract the real memory module runs: committed hashes of the
+      // files this item may write, the review's pre-write decision, and only then
+      // the write — the stub throws after the hook, the way the real one does (#64).
+      const names = [...new Set(item.topic === '' ? ['MEMORY.md'] : [`${item.topic}.md`, 'MEMORY.md'])]
+      const held = new Map(Object.entries(files_))
+      const hashes = {}
+      for (const name of names) hashes[name] = createHash('sha256').update(held.get(name) ?? '').digest('hex')
+      const verdict = await hooks.preWrite(hashes)
+      if (verdict?.skip === true) return { skipped: true, verdict }
       calls.apply += 1
       if (fail === 'eio') throw Object.assign(new Error('EIO'), { code: 'EIO' })
       if (fail === 'full') throw Object.assign(new Error('memory is full'), { code: 'memory/full' })
-      const files_ = files[item.scope]
       const name = item.topic === '' ? 'MEMORY.md' : `${item.topic}.md`
       const content = files_[name] ?? `# ${item.topic}\n\n## Index\n`
       if (Object.values(files_).some(other => parseMemory(other).entries.some(entry => entry.text === item.text))) {
@@ -164,7 +173,13 @@ test('a topic item watches the link target too', async t => {
     root,
     check: async () => ({ ok: true, project: 'project:a' }),
     extract: async () => ({ items: [{ scope: 'project:a', topic: 'travel', text: '用脚本发布', outcome: 'verified', source: 'part 1 #2' }] }),
-    applyItem: async (item) => {
+    applyItem: async (item, hooks) => {
+      const names = [...new Set(item.topic === '' ? ['MEMORY.md'] : [`${item.topic}.md`, 'MEMORY.md'])]
+      const held = new Map(Object.entries(files['project:a']))
+      const hashes = {}
+      for (const name of names) hashes[name] = createHash('sha256').update(held.get(name) ?? '').digest('hex')
+      const verdict = await hooks.preWrite(hashes)
+      if (verdict?.skip === true) return { skipped: true, verdict }
       if (failing) throw Object.assign(new Error('EIO'), { code: 'EIO' })
       files[item.scope]['travel.md'] = `# travel\n\n${item.line}\n\n## Index\n`
       return { changed: true, file: 'travel.md' }
