@@ -334,6 +334,36 @@ test('an explicit re-verify reuses the stored lesson without extracting again', 
   assert.match(line, /added: \d{4}-\d{2}-\d{2}/)
 })
 
+// The re-verify replays a lesson the gate refused, and the negation that made it wrong has
+// to travel with it: the stored context is what the check reads, so losing it on either end
+// — when the refusal is recorded, or when the request is rebuilt — would let the model see
+// a quote with no negation and answer yes. Both ends are pinned here, in that order, so a
+// red test says which end broke.
+test('a re-verify carries the stored negation into the check request', async t => {
+  const s = start({ items: ONE_ITEM, support: [['no'], ['yes']] })
+  t.after(() => s.stop())
+  // The quote alone ("run the release script") reads as an instruction; only the whole
+  // line around it ("... now.") makes the condition visible, so the context is what the
+  // check has to see, and it is not part of the evidence.
+  const negated = { ...CLAIM, kind: 'user', statement: '发布前不要自动跑脚本，先问我', evidence: 'run the release script', ref: 'part 1 #10' }
+  await s.tool('complete_task', { ...report, claims: [negated] }, 'b2', 'call-negation')
+  idle(s.ctx)
+  await until(() => s.plans()[0]?.status === 'HELD')
+  const refused = s.plans()[0].unverified[0]
+  // Stored end: the line the gate quoted is kept with the refusal.
+  assert.equal(refused.reason, 'model-unsupported')
+  assert.match(String(refused.context ?? ''), /Please run the release script now\./, 'the refusal keeps the whole line around the quote')
+  // Replayed end: the same text is what the re-verify sends the model.
+  const before = s.requests.length
+  const id = s.plans()[0].candidateId
+  const rechecked = await s.json('memory-task-reverify', { candidateId: id })
+  assert.equal(rechecked.value.ok, true)
+  const verifyRequests = s.requests.slice(before).filter(request => String(request.system).startsWith('You check whether'))
+  assert.equal(verifyRequests.length, 1, 'one check request is made')
+  const body = String(verifyRequests[0].messages[0].content[0].text)
+  assert.match(body, /Please run the release script now\./, 'the replayed request carries the whole line, not just the quote')
+})
+
 test('a re-verify whose lesson the freeze refuses is held instead of marked done with nothing written', async t => {
   const s = start({ items: ONE_ITEM, support: [['no'], ['yes']] })
   t.after(() => s.stop())
