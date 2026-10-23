@@ -627,6 +627,13 @@ export function install(rt) {
   const taskLabel = scope => labelOf(scope, scope.kind === 'bot' ? scope.botId : undefined)
   const taskScopeOf = record => (record.project === null ? ownScope(record.botId) : { kind: 'project', hash: record.project.slice('project:'.length) })
 
+  // Who wrote the entry, for the scopes `metaFor` names the writer in: a project's memory
+  // is shared by every Bot that works there, so a lesson kept by the review has to say
+  // which Bot it came from, exactly as `remember` does. A Bot's own memory says nothing:
+  // the scope already is that Bot. Frozen into the plan with the other fields, never
+  // recomputed at apply time.
+  const taskByOf = (record, scope) => (scope.kind === 'team' || scope.kind === 'project' || scope.botId !== record.botId ? { by: rt.botOf(record.botId)?.name } : {})
+
   const taskCwdOf = (sessionId) => {
     const session = sessionRecord(sessionId)
     return session === undefined ? null : rt.sessionFolder(session) ?? null
@@ -652,6 +659,50 @@ export function install(rt) {
     }
   }
 
+  // The work the calling turn does: the request it answers, the requests that joined it
+  // (tools.js:107 `worksOf`), and the requests it opened itself in this turn.
+  //
+  // A turn in a Bot's own chat has no work above it: the user spoke, and `workOf` answers
+  // undefined for that. That is a normal, complete case — there is nothing to wait for —
+  // not a missing record. What such a turn starts with `message_bot` is a real request to
+  // another Bot, and `openWork` pins each one on the turn that opened it, so this reads
+  // only what this turn set going rather than everything the Bot ever sent.
+  //
+  // Group calls live in the same `spawned` list (they are opened from the same place), so
+  // they are filtered out here and read by `groupWaitsOf`: a room call is not a handoff
+  // work and the two must not be mixed in the record.
+  const isRoomCall = id => id.startsWith('room:')
+  const worksOfTurn = (exec) => {
+    const turn = rt.live.get(exec?.agent?.id)
+    const answered = [rt.workOf(turn?.info), ...(turn?.joined ?? []).map(joined => rt.workOf(joined.info))]
+    return [...new Set([...answered, ...(turn?.spawned ?? [])].filter(id => Boolean(id) && !isRoomCall(id)))]
+  }
+
+  // The group calls this turn made. They are opened when the line that names the member is
+  // posted (`postStep`, while this turn is still open), so a report made later in the same
+  // turn sees them; `callMembers` and the member's own answer reuse and close them.
+  const groupWaitsOf = (exec) => (rt.live.get(exec?.agent?.id)?.spawned ?? []).filter(id => id.startsWith('room:'))
+  // A group call already in the work book has not been answered: `closeRoomCall` removes it
+  // when the member really speaks. Waiting on the round's slot status would miss the
+  // window where the round has moved on but the member has not answered, and a round that
+  // is no longer in `roomProgress` (a restart) would wrongly read as finished.
+  const groupStillWaits = (waits) => {
+    if (!Array.isArray(waits) || waits.length === 0) return false
+    return waits.some(id => rt.pendingWork?.(id) === true)
+  }
+
+  // The questions this Session has open, by id. `ask_user` keeps one per Session, and a
+  // part switch moves it to the fresh Session under the same id (parts.js:805-808), so the
+  // id is what a candidate must remember, not the Session it was asked in.
+  const openQuestionsOf = (sessionId) => {
+    const question = state.questions?.[sessionId]
+    return question?.id === undefined ? [] : [question.id]
+  }
+
+  // The ids of every question still open anywhere: a card moved to the next part is no
+  // longer under the Session that asked it, and the candidate must still wait for it.
+  const openQuestionIds = () => new Set(Object.values(state.questions ?? {}).map(question => question?.id).filter(id => typeof id === 'string'))
+
   async function taskReviewCheck(record) {
     // A guard for a caller that got here anyway: both ways a candidate is looked at
     // (`taskRecovery` after load, `runSessionTasks` after a turn) return before this while
@@ -663,6 +714,19 @@ export function install(rt) {
     const project = projectOf(record.sessionId)
     const current = project.status === 'ok' ? `project:${project.hash}` : null
     if (record.project !== null && current !== record.project) return { ok: false, waiting: true }
+    // Only the work and the questions this candidate recorded. Asking about anything the
+    // Bot happens to be doing would let a busy group chat stall a report from another one.
+    // `pendingWork` is "still in the book", which is what an unanswered request means —
+    // `waitsWork` only asks whether work is waiting on its own children, so a leaf request
+    // (what `message_bot` opens) reads false there even while the other Bot has not replied.
+    const work = Array.isArray(record.work) ? record.work : []
+    if (work.some(id => rt.pendingWork?.(id) === true)) return { ok: false, waiting: true }
+    if (groupStillWaits(record.groupWaits)) return { ok: false, waiting: true }
+    const questions = Array.isArray(record.questions) ? record.questions : []
+    if (questions.length > 0) {
+      const open = openQuestionIds()
+      if (questions.some(id => open.has(id))) return { ok: false, waiting: true }
+    }
     return { ok: true, project: current }
   }
 
@@ -779,6 +843,7 @@ export function install(rt) {
           claim: entry.claim,
           evidence: entry.evidence.slice(0, 200),
           source: source.slice(0, 200),
+          ...taskByOf(record, scope),
           outcome: entry.outcome,
           added: today(),
         },
@@ -864,14 +929,19 @@ export function install(rt) {
   // the next pass after it is switched on decides what happens, on the same evidence.
   const taskRecovery = () => (reviewOn && rt.readOnly() === undefined ? taskReview.recover().catch(error => rt.warn('ds-bot: task review recovery failed: %s', error)) : Promise.resolve([]))
   const taskRunning = new Map()
+  // Candidates are woken by whoever is idle now, compared by the Bot that speaks, not by
+  // the Session id: a conversation that changed part has a new Session id, and a candidate
+  // recorded under the old one would otherwise never be looked at again. The candidate's
+  // own `check` still decides whether anything happens — this only picks the moment.
   function runSessionTasks(sessionId) {
     if (!reviewOn) return Promise.resolve([])
     if (taskRunning.has(sessionId)) return taskRunning.get(sessionId)
+    const who = rt.selfOf(sessionId)
     const job = (async () => {
       const ids = await taskReview.list()
       for (const id of ids) {
         const record = await taskReview.read(id)
-        if (record === undefined || record.sessionId !== sessionId) continue
+        if (record === undefined || rt.selfOf(record.sessionId) !== who) continue
         await taskReview.process(id)
       }
     })().catch(error => rt.warn('ds-bot: task review of %s failed: %s', sessionId, error?.message ?? error))
@@ -1598,6 +1668,9 @@ export function install(rt) {
         result,
         claims,
         notes: String(args.notes ?? '').trim().slice(0, 4000),
+        work: worksOfTurn(exec),
+        questions: openQuestionsOf(caller.sessionId),
+        groupWaits: groupWaitsOf(exec),
       })
       return `Recorded as a candidate (${record.candidateId.slice(0, 8)}). After this turn the host checks the evidence and keeps only what it supports; your memory has not changed yet.`
     },
@@ -2376,6 +2449,7 @@ export function install(rt) {
             claim: entry.claim,
             evidence: String(entry.evidence ?? '').slice(0, 200),
             source: source.slice(0, 200),
+            ...taskByOf(record, taskScopeOf(record)),
             outcome,
             added: today(),
           },
