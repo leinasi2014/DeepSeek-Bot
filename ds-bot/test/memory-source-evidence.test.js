@@ -312,3 +312,59 @@ test('a per-turn howto that quotes the Bot itself is refused', async t => {
   await settle(200)
   assert.equal(s.memory(), '', 'the Bot\'s own words prove nothing')
 })
+
+// --- C: a negation the user stated, written as its opposite ----------------
+// The contract's third case. The quote is verbatim and from the user, so the mechanical gate
+// passes; only the shared semantic gate can refuse it. What makes the refusal possible is the
+// surrounding line travelling as `context`: the quote alone reads like a rule, and the "never"
+// sits just outside it. Both tests below fail if `context` is dropped or if the prompt stops
+// telling the model to read it.
+
+test('a per-turn review cannot turn what the user forbade into a rule to do it', async t => {
+  const s = start({
+    history: {
+      b2: [
+        userLine(10, 'Never run the release script without asking me first.'),
+        botLine(11, 'Understood.'),
+      ],
+    },
+    support: ['no'],
+    review: JSON.stringify({ changes: [{ op: 'add', text: 'The user wants the release script run without being asked', evidence: 'run the release script without asking' }] }),
+  })
+  t.after(() => s.stop())
+  await s.json('state')
+  s.idle()
+  await until(() => s.requests.some(request => String(request.system).startsWith('You check whether')), () => `requests=${s.requests.map(request => String(request.system).slice(0, 24)).join(' | ')}`)
+  await settle(200)
+  assert.equal(s.memory(), '', 'the opposite of what the user forbade never lands')
+  const journal = readFileSync(join(s.home, 'memory', 'journal.jsonl'), 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line))
+  assert.equal(journal[0]?.op, 'skip')
+  assert.equal(journal[0]?.reason, 'model-unsupported')
+
+  // The gate saw the whole line, not only the quoted words.
+  const verify = s.requests.find(request => String(request.system).startsWith('You check whether'))
+  const sent = String(verify.messages[0].content[0].text)
+  assert.match(sent, /"claim":"The user wants the release script run without being asked"/)
+  assert.match(sent, /"context":"User: Never run the release script without asking me first\."/)
+  assert.match(String(verify.system), /`context` is the surrounding line, so a negation near the quote is not lost/)
+})
+
+test('a task claim cannot turn what the user forbade into a verified lesson', async t => {
+  const statement = '用户要求直接运行发布脚本'
+  const claim = { kind: 'user', statement, evidence: 'Never run the release script without asking me first.', ref: 'part 1 #10' }
+  const s = start({
+    history: { b2: [userLine(10, claim.evidence), botLine(11, 'Understood.')] },
+    items: [{ claim: 0, topic: '', text: '发布脚本可以直接跑，不用先问', outcome: 'verified' }],
+    support: ['no'],
+  })
+  t.after(() => s.stop())
+  await s.tool('complete_task', { result: '完成发布脚本验证', claims: [claim] }, 'c-negated')
+  s.idle()
+  await until(() => s.plans()[0]?.status === 'HELD', () => `status=${s.plans()[0]?.status}`)
+  assert.equal(s.memory(), '', 'a lesson the user forbade is not written')
+  assert.equal(s.plans()[0].unverified[0]?.reason, 'model-unsupported')
+
+  const verify = s.requests.find(request => String(request.system).startsWith('You check whether'))
+  const sent = String(verify.messages[0].content[0].text)
+  assert.match(sent, /"context":"Never run the release script without asking me first\."/)
+})
