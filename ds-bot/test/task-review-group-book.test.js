@@ -296,3 +296,76 @@ test('a member the round passes over leaves no call behind, and the report does 
 
 // Restart, member gone: the group no longer holds the Bot the call names, so no turn can
 // ever answer it. The call is settled from what is on disk, and the report goes on.
+
+test('a call whose member was removed is settled when the team loads', async t => {
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-group-book-restart-'))
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }))
+  writeFileSync(join(home, 'state.json'), JSON.stringify(TEAM))
+
+  const first = await start(t, { home })
+  const stop = new AbortController()
+  t.after(() => stop.abort())
+  first.emit('desk', 'user/message', { content: [{ type: 'text', text: '@Chief 安排一下发布说明.' }], source: { kind: 'user' } })
+  void first.tool('group_relay', {}, 'desk', 'relay-removed', { signal: stop.signal }).catch(() => {})
+  await called(first, 'desk-chief')
+  first.begin('desk-chief')
+  await first.say('desk-chief', '@Writer 写发布说明，测试 12/12 通过。')
+  await first.tool('complete_task', report, 'desk-chief', 'report-removed')
+  first.finish('desk-chief', '@Writer 写发布说明，测试 12/12 通过。')
+  first.idle('desk-chief')
+  await until(() => first.plans()[0]?.status === 'WAITING')
+  assert.deepEqual(first.roomCalls(), ['room:desk:chief:writer'])
+  await first.ctx.dispose()
+
+  // The member left the group while the host was down.
+  const state = JSON.parse(readFileSync(join(home, 'state.json'), 'utf8'))
+  state.rooms.desk.members = state.rooms.desk.members.filter(id => id !== 'writer')
+  writeFileSync(join(home, 'state.json'), JSON.stringify(state))
+
+  const second = await start(t, { home })
+  await until(() => second.roomCalls().length === 0, () => JSON.stringify(second.roomCalls()))
+  second.idle('chief')
+  await until(() => second.plans()[0]?.status === 'DONE', () => `status=${second.plans()[0]?.status}`)
+  assert.match(second.memoryOf('chief'), /发布说明由 Writer 写/)
+})
+
+// Restart, member still in the group: nothing process-local can tell it apart from a
+// member between turns, so the call must survive. The member answering in the group is
+// what settles it — the existing late path, no restore layer.
+
+test('a call whose member is still in the group survives a restart and settles when it answers', async t => {
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-group-book-alive-'))
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }))
+  writeFileSync(join(home, 'state.json'), JSON.stringify(TEAM))
+
+  const first = await start(t, { home })
+  const stop = new AbortController()
+  t.after(() => stop.abort())
+  first.emit('desk', 'user/message', { content: [{ type: 'text', text: '@Chief 安排一下发布说明.' }], source: { kind: 'user' } })
+  void first.tool('group_relay', {}, 'desk', 'relay-alive', { signal: stop.signal }).catch(() => {})
+  await called(first, 'desk-chief')
+  first.begin('desk-chief')
+  await first.say('desk-chief', '@Writer 写发布说明，测试 12/12 通过。')
+  await first.tool('complete_task', report, 'desk-chief', 'report-alive')
+  first.finish('desk-chief', '@Writer 写发布说明，测试 12/12 通过。')
+  first.idle('desk-chief')
+  await until(() => first.plans()[0]?.status === 'WAITING')
+  await first.ctx.dispose()
+
+  const second = await start(t, { home })
+  assert.deepEqual(second.roomCalls(), ['room:desk:chief:writer'], 'a live call is not dropped at load')
+  second.idle('chief')
+  await new Promise(resolve => setTimeout(resolve, 400))
+  assert.equal(second.plans()[0]?.status, 'WAITING', 'the member has not answered, so the report still waits')
+  assert.equal(second.memoryOf('chief'), '', 'a restart alone writes nothing')
+
+  // Writer answers in the group after the restart: the late path closes the call.
+  second.emit('desk-writer', 'turn/start', { turn: 1 })
+  second.emit('desk-writer', 'user/message', { content: [{ type: 'text', text: '写好了，测试 12/12 通过。' }], source: { kind: 'bot', role: 'room', roomId: 'desk', exchangeId: 'room-call-1' } })
+  second.emit('desk-writer', 'assistant/message', { message: { content: [{ type: 'text', text: '写好了，测试 12/12 通过。' }] } })
+  second.emit('desk-writer', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
+  await until(() => second.roomCalls().length === 0, () => JSON.stringify(second.roomCalls()))
+  second.idle('chief')
+  await until(() => second.plans()[0]?.status === 'DONE', () => `status=${second.plans()[0]?.status}`)
+  assert.match(second.memoryOf('chief'), /发布说明由 Writer 写/)
+})

@@ -118,6 +118,26 @@ export function install(rt) {
     if (works()[id] === undefined) return
     dropWork(id)
   }
+  // A group call that can never be answered any more, judged only by what the disk says.
+  // The process-local turn and waiter maps are empty after a restart, so they cannot tell
+  // a call whose member has gone from one whose member is simply between turns: dropping
+  // on "no turn here" would end every report at the first restart. What is durable is
+  // membership: the group is gone, or the called Bot is no longer in it (removed, or
+  // deleted). Only those calls are dropped; every other one keeps waiting for the member
+  // to speak, which the regular close paths handle after a restart too.
+  function reconcileRoomCalls() {
+    const dropped = []
+    for (const [id, work] of Object.entries(works())) {
+      if (work === undefined || work.room === undefined || work.to === undefined) continue
+      const room = rt.roomOf?.(work.room)
+      const memberGone = room === undefined || !room.members.includes(work.to) || rt.botOf(work.to) === undefined
+      if (!memberGone) continue
+      dropWork(id)
+      dropped.push(id)
+    }
+    return dropped
+  }
+
   function hold(workId, text) {
     const work = works()[workId]
     if (work === undefined || text === '') return
@@ -178,10 +198,14 @@ export function install(rt) {
     return view
   }
 
-  // A deleted Bot answers no more work and waits for none.
+  // A deleted Bot answers no more work and waits for none. A group call that named it is
+  // settled here as well: it will never speak in that group again.
   function forgetBot(botId) {
     const waiting = Object.entries(works()).filter(([, work]) => work.to === botId).map(([id]) => askedBy(id))
-    for (const [id, work] of Object.entries(works())) if (work.from === botId && work.to !== botId) dropWork(id)
+    for (const [id, work] of Object.entries(works())) {
+      if (work.from === botId && work.to !== botId) dropWork(id)
+      else if (work.room !== undefined && work.to === botId) dropWork(id)
+    }
     return waiting
   }
 
@@ -231,6 +255,10 @@ export function install(rt) {
     return lines.join('; ')
   }
 
-  Object.assign(rt, { workOf, openWork, closeWork, dropWork, takenWork: taken, ownsWork: owns, waitsWork: waits, pendingWork: pending, spawnedBy, openRoomCall, closeRoomCall, dropRoomCall, holdWork: hold, workAsker: askedBy, answerText, upstreamOf, sameWork, forgetBotWork: forgetBot, statusOf, waitingView })
+  Object.assign(rt, { workOf, openWork, closeWork, dropWork, takenWork: taken, ownsWork: owns, waitsWork: waits, pendingWork: pending, spawnedBy, openRoomCall, closeRoomCall, dropRoomCall, reconcileRoomCalls, holdWork: hold, workAsker: askedBy, answerText, upstreamOf, sameWork, forgetBotWork: forgetBot, statusOf, waitingView })
 
+  // Once the team is on disk, calls whose member can no longer answer are settled, so a
+  // report does not wait on a group or a Bot that is gone. Same load hook the task review
+  // recovery uses; a read-only team still has its disk facts to read.
+  rt.load?.().then(() => { reconcileRoomCalls() }).catch(() => {})
 }
