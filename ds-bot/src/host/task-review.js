@@ -17,6 +17,11 @@ import { join } from 'node:path'
 
 export const CANDIDATE_VERSION = 1
 export const CLAIMS_MAX = 8
+// What the gates refused is kept beside the candidate for a person to read, and bounded:
+// the file is not a replay log, and an unbounded list grows with whatever a model returns.
+// The bound is counted rather than silent, so a record that saw more refusals than it
+// keeps says how many it dropped (#83).
+export const UNVERIFIED_MAX = CLAIMS_MAX * 2
 export const INVALID_MAX = 3
 export const RETRY_MAX = 3
 export const CAPACITY_CODE = 'memory/full'
@@ -58,6 +63,24 @@ export const candidateIdOf = (sessionId, callId) => createHash('sha256').update(
 // report may make, and a turn can open more requests than it makes claims. Cutting the list
 // would let a report be written while something it started is still unanswered.
 const relatedIds = ids => [...new Set((Array.isArray(ids) ? ids : []).filter(id => typeof id === 'string' && id !== ''))]
+
+// Keep the first `UNVERIFIED_MAX` refusals and say how many were left out. A refusal that
+// vanishes leaves no way to tell a quiet candidate from one the gates kept rejecting, and
+// the count is the only trace an over-long list can leave while the file stays bounded (#83).
+//
+// `model-unsupported` is the one reason a later pass reads back: the explicit re-verify
+// takes exactly those, and nothing else. The extraction records `plan-full` first, so a
+// plain head of the list let sixteen `plan-full` entries push every re-checkable refusal
+// out; the re-verify then answered `rechecked: 0` with no way to tell why. The order here
+// is the list's meaning, not the order the gates happened to run in.
+export const keepUnverified = (entries, dropped = 0) => {
+  const list = Array.isArray(entries) ? entries : []
+  const retryable = list.filter(entry => entry?.reason === 'model-unsupported')
+  const rest = list.filter(entry => entry?.reason !== 'model-unsupported')
+  const kept = [...retryable, ...rest].slice(0, UNVERIFIED_MAX)
+  const lost = dropped + Math.max(0, list.length - kept.length)
+  return lost > 0 ? { kept, dropped: lost } : { kept, dropped: 0 }
+}
 
 // The id that lands in the Markdown metadata. Lower-case and stable per plan item.
 export const reviewIdOf = (candidateId, index) => createHash('sha256').update(`${candidateId}:${index}`).digest('hex').slice(0, 16)
@@ -546,8 +569,11 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
         return record
       }
       // What the gates refused stays in this file for a person to look at; it never
-      // reaches the Markdown.
-      record.unverified = Array.isArray(extracted.dropped) ? extracted.dropped.slice(0, CLAIMS_MAX * 2) : []
+      // reaches the Markdown. The list is bounded, and what the bound left out is counted
+      // on the record so the refusals that did not fit are not simply gone (#83).
+      const first = keepUnverified(extracted.dropped)
+      record.unverified = first.kept
+      record.unverifiedDropped = first.dropped
       if (extracted.items.length === 0 && record.unverified.length > 0) {
         // Nothing the gates accept: no plan is frozen, and nothing looks at this task
         // again by itself. Only an explicit retry reopens it.
@@ -560,7 +586,9 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
       if (frozen.refused.length > 0) {
         // What the limits refused at freeze time stays with the candidate, beside the
         // gate refusals, so a person sees why it never became an entry.
-        record.unverified = [...record.unverified, ...frozen.refused].slice(0, CLAIMS_MAX * 2)
+        const merged = keepUnverified([...record.unverified, ...frozen.refused], record.unverifiedDropped)
+        record.unverified = merged.kept
+        record.unverifiedDropped = merged.dropped
       }
       if (frozen.items.length === 0) {
         // Nothing survived the freeze-time re-check: no empty plan is stored, and only an
@@ -630,5 +658,5 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
     return results.filter(Boolean)
   }
 
-  return { enqueue, process, recover, retry, read, save: write, list, freeze, entriesOf, dispose, dir }
+  return { enqueue, process, recover, retry, read, save: write, list, freeze, entriesOf, dispose, dir, keepUnverified }
 }

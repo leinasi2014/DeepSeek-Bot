@@ -2822,7 +2822,7 @@ export function install(rt) {
       // A reopened plan-less candidate starts from extraction; a reopened frozen plan
       // goes straight back to applying. Both run on the next pass (#67).
       if (record.status === TASK_STATUS.pending || record.status === TASK_STATUS.planned) void runSessionTasks(record.sessionId)
-      return { ok: true, status: record.status, unverified: record.unverified ?? [] }
+      return { ok: true, status: record.status, unverified: record.unverified ?? [], unverifiedDropped: record.unverifiedDropped ?? 0 }
     }
     // Re-checking what the semantic gate refused, on the same quotes, without asking the
     // model for a new extraction. A frozen plan is only re-applied, never regenerated.
@@ -2913,10 +2913,15 @@ export function install(rt) {
     }
     // Frozen from what was already stored: no extraction, no new wording. The limits run
     // once more over what will actually be written, exactly as on the extract path; a
-    // lesson that fails here is kept as an `unverified` record, never written.
+    // lesson that fails here is kept as an `unverified` record, never written. The list is
+    // bounded, and a refusal the bound left out is counted instead of vanishing (#83).
     const frozen = taskReview.freeze(record, accepted)
     if (frozen.refused.length > 0) {
-      record.unverified = [...record.unverified, ...frozen.refused].slice(0, TASK_CLAIMS_MAX * 2)
+      // The same bound and the same order as the extract path: one place decides what the
+      // list means, so the two paths cannot drift apart (#83).
+      const merged = taskReview.keepUnverified([...record.unverified, ...frozen.refused], record.unverifiedDropped ?? 0)
+      record.unverified = merged.kept
+      record.unverifiedDropped = merged.dropped
     }
     if (frozen.items.length === 0) {
       // Nothing survived: an empty plan would be applied zero times and the candidate
