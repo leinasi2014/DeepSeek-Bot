@@ -478,8 +478,12 @@ const reviewRequest = ({ bot, numbered, left = 0, sizes, where, earlier, fresh, 
 ].join('\n')
 
 const askRequest = ({ name, numbered, language, text }) => [
-  `Entries of ${name} (yours: ${name}'s own; team: shared by every Bot):`,
-  ...(numbered.length > 0 ? numbered.map((item, index) => `[${index + 1}] (${item.scope === 'team' ? 'team' : 'own'}${item.file.topic ? ` · ${item.file.topic}` : ''}) ${item.text}`) : ['(none yet)']),
+  // A project entry is not the Bot's own. While a project tab is chosen the panel lists
+  // that project's memory beside the Bot's and the team's, and the model has to see which
+  // scope each line belongs to; naming project only when one is listed keeps the prompt of
+  // a chat with no project unchanged.
+  `Entries of ${name} (yours: ${name}'s own; team: shared by every Bot${numbered.some(item => item.scope === 'project') ? '; project: shared by every Bot working in that project' : ''}):`,
+  ...(numbered.length > 0 ? numbered.map((item, index) => `[${index + 1}] (${item.scope}${item.file.topic ? ` · ${item.file.topic}` : ''}) ${item.text}`) : ['(none yet)']),
   '',
   `Write reply and every new entry in ${language}. The user says:`,
   text,

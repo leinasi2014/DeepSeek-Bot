@@ -120,6 +120,38 @@ test('the panel names a conversation and reads its project; a foreign session is
   assert.doesNotMatch(s.read('projects', alpha.hash, 'MEMORY.md'), /Alpha uses pnpm/)
 })
 
+// The panel asks the model about one numbered list holding the Bot's own entries, the
+// team's and the chosen project's. Each line has to name the scope it really belongs to:
+// a project line labelled "own" is how the model came to answer about the wrong memory,
+// and to pick the wrong entry when the user names a number (#87).
+test('the panel ask names the scope of every entry, the project included', async t => {
+  const s = start(t)
+  const asked = []
+  Object.assign(s.ctx, {
+    llm: {
+      listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }],
+      listModels: async () => [{ id: 'v4' }],
+      resolveModelInfo: async () => ({ reasoning: { efforts: [{ id: 'off' }] } }),
+      async* stream(request) {
+        asked.push(request)
+        yield { type: 'text-delta', index: 0, text: JSON.stringify({ reply: 'Two entries.', changes: [] }) }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    },
+  })
+  s.rt.desiredModel = async () => undefined
+  s.rt.defaultModel = async () => 'deepseek/v4'
+  await s.tool('remember', { text: 'Likes tea', scope: 'own' }, 'sA')
+  await s.tool('remember', { text: 'Alpha uses pnpm' }, 'sA')
+  const answer = await s.rt.memoryEndpoint('memory-ask', { botId: 'b2', session: 'sA', text: 'What do I know?' })
+  assert.equal(answer.reply, 'Two entries.')
+  const prompt = asked[0].messages[0].content[0].text
+  assert.match(prompt, /^Entries of Writer \(yours: Writer's own; team: shared by every Bot; project: shared by every Bot working in that project\):/)
+  assert.match(prompt, /\[1\] \(own\) Likes tea/)
+  assert.match(prompt, /\[2\] \(project\) Alpha uses pnpm/)
+  assert.doesNotMatch(prompt, /\(own\) Alpha uses pnpm/)
+})
+
 async function rt_forget(s, body) {
   await s.rt.memoryEndpoint('memory-forget', body)
 }
