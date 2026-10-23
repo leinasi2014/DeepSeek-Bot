@@ -34,6 +34,7 @@ import { memoryFiles } from './memory-files.js'
 import { memoryIndex } from './memory-index.js'
 import { STATUS as TASK_STATUS, taskReview as createTaskReview, metaForSecretCheck } from './task-review.js'
 import { within } from './folders.js'
+import { extractInput, verifyInput } from './task-review-input.js'
 
 // Fixed sizes, in characters. Both MEMORY.md files ride in every request of every
 // part, so together they stay near 8,000 characters, a few thousand tokens. A topic is
@@ -719,9 +720,12 @@ export function install(rt) {
   // outside the quote is not cut away. Resolves one 'yes'/'no' per entry, or undefined when
   // the answer is not a usable list — which a caller must read as "nothing is proven",
   // never as yes.
+  //
+  // The request itself is built by `task-review-input.js`, so this batch, the extraction and
+  // the explicit re-verify share one 16K budget and one 4K limit per source (#72).
   async function verifySupport(bot, sessionId, entries) {
     if (entries.length === 0) return []
-    const reply = await botShot(bot, TASK_VERIFY_SYSTEM, entries.map(entry => JSON.stringify(entry)).join('\n'), { sessionId, kind: 'memory' })
+    const reply = await botShot(bot, TASK_VERIFY_SYSTEM, verifyInput(entries), { sessionId, kind: 'memory' })
     const support = parseTaskJson(reply)?.support
     return Array.isArray(support) ? support : undefined
   }
@@ -831,16 +835,12 @@ export function install(rt) {
     const sources = await sessionSources(record.sessionId)
     const excerpt = sources.slice(-TASK_EXCERPT_LINES).map((line) => {
       const who = line.who === 'tool' ? `tool ${line.tool?.name || 'result'}${line.tool?.isError ? ' (failed)' : ''}` : line.who
-      return `${who}: ${line.text}`.replace(/\s+/g, ' ').slice(0, 400)
+      return { who, text: line.text }
     })
     const claims = record.claims.map((claim, index) => ({ index, kind: claim.kind, statement: claim.statement, evidence: claim.evidence, ref: claim.ref }))
-    const reply = await botShot(bot, TASK_EXTRACT_SYSTEM, [
-      `The Bot reported: ${record.result}`,
-      `Notes: ${record.notes}`,
-      `Claims: ${JSON.stringify(claims)}`,
-      'Conversation lines (oldest first):',
-      ...excerpt,
-    ].join('\n'), { sessionId: record.sessionId, kind: 'memory' })
+    // The request is bounded by the shared budget (#72): at most 16K characters in all and
+    // 4K per source, with the fields shortened in a fixed order instead of a claim dropped.
+    const reply = await botShot(bot, TASK_EXTRACT_SYSTEM, extractInput({ result: record.result, notes: record.notes, claims, lines: excerpt }), { sessionId: record.sessionId, kind: 'memory' })
     const parsed = parseTaskJson(reply)
     if (parsed === undefined || !Array.isArray(parsed.items)) return { invalid: 'the model did not answer with items' }
     const scope = taskScopeOf(record)
