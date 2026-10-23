@@ -40,19 +40,22 @@ const TEAM = {
 
 // The line the claim quotes, and the answer it is quoted from. `partLines` flushes an
 // answer only when it reaches the message it answers, exactly as a real part does.
+// The claim below quotes the user's own preference (seq 10), not the Bot's answer: a
+// positive source for this fixture must be something the user really said, never an
+// assistant line that reports its own test run.
 const HISTORY = {
   b2: [
-    { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Please run the release script now.' }] } } },
-    { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Ran scripts/ship.sh; the suite passed: tests 12/12.' }] } } } },
+    { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '以后发布前都先跑 scripts/ship.sh，测试通过再发布。' }] } } },
+    { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '收到，我记下了。' }] } } } },
   ],
   'desk-b2': [
-    { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Please run the release script now.' }] } } },
-    { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Ran scripts/ship.sh; the suite passed: tests 12/12.' }] } } } },
+    { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '以后发布前都先跑 scripts/ship.sh，测试通过再发布。' }] } } },
+    { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '收到，我记下了。' }] } } } },
   ],
 }
 
-const CLAIM = { kind: 'command', statement: '发布脚本跑通了，测试 12/12 通过', evidence: 'tests 12/12', ref: 'part 1 #11' }
-const report = { result: '完成发布脚本验证', claims: [CLAIM], notes: '' }
+const CLAIM = { kind: 'user', statement: '用户要求发布前先跑 scripts/ship.sh，测试通过后再发布', evidence: '发布前都先跑 scripts/ship.sh，测试通过再发布', ref: 'part 1 #10' }
+const report = { result: '记下发布前先跑脚本这条要求', claims: [CLAIM], notes: '' }
 const ONE_ITEM = [{ claim: 0, topic: '', text: '发布用 scripts/ship.sh，测试通过后再发布', outcome: 'verified' }]
 
 // One isolated host: a temp home, a team workspace folder, and the folders the Sessions
