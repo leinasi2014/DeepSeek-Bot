@@ -122,7 +122,7 @@ test('scope: the panel project list is server-computed from the Bot\'s own sessi
 // project's memory file can be seeded directly. A project's entries belong in the
 // summary request, and a cache written by an older request must not keep serving a
 // summary that lacks them.
-function startSummaryBench(t, replies = []) {
+function startSummaryBench(t, replies = [], { oneBot = false } = {}) {
   const ctx = fakeContext()
   const requests = []
   Object.assign(ctx, {
@@ -145,9 +145,9 @@ function startSummaryBench(t, replies = []) {
     load: async () => {}, readOnly: () => undefined, warn: () => {},
     desiredModel: async () => undefined, defaultModel: async () => 'deepseek/v4',
     botOf: id => scopeBots[id], findBot: name => Object.values(scopeBots).find(bot => bot.name === name),
-    selfOf: id => (id === 'sB' ? 'b3' : 'b2'), isMain: () => false,
+    selfOf: id => (oneBot || id !== 'sB' ? 'b2' : 'b3'), isMain: () => false,
     chatOf: botId => `chat-${botId}`, groupSessionsOf: () => [],
-    sessionsOfBot: id => (id === 'b3' ? ['sB'] : ['sA', 'sLost']),
+    sessionsOfBot: id => (id === 'b3' && !oneBot ? ['sB'] : ['sA', ...(oneBot ? ['sB'] : []), 'sLost']),
     groupOwners: new Map(), roomOf: () => undefined, partsOf: id => [{ sessionId: id }],
     clock: () => '12:00', teamFolder: () => join(scopeWork, 'team'),
     sessionFolder: session => scopeSessions[session?.id ?? session]?.header?.cwd,
@@ -230,6 +230,56 @@ test('scope: a summary cached by an older fingerprint is rewritten with the proj
   assert.equal(s.requests.length, 1)
   await s.endpoint('memory-view', { botId: 'b2', session: 'sA', summarize: true })
   assert.equal(s.requests.length, 1)
+})
+
+// One Bot with two projects is the shape the panel really uses: its summary cache
+// key carries the project scope, so a summary asked for A, left in flight while the
+// panel reads B, comes back as A's — never B's — and A→B→A answers from the cache.
+test('scope: one Bot reading two projects keeps each summary to its own project across A to B to A', async t => {
+  const replies = []
+  const s = startSummaryBench(t, replies, { oneBot: true })
+  const alpha = s.rt.projectScope.resolve(scopeSessions.sA)
+  const beta = s.rt.projectScope.resolve(scopeSessions.sB)
+  s.writeEntry(alpha, 'Alpha deploys with a script')
+  s.writeEntry(beta, 'Beta deploys on Fridays')
+  // The project-A summary is held until the test releases it, so B is read while A
+  // is still being written.
+  let releaseA
+  const heldA = new Promise(resolve => { releaseA = resolve })
+  replies.push(heldA.then(() => '## A\nAlpha project summary.'), '## B\nBeta project summary.')
+  const aStart = await s.endpoint('memory-view', { botId: 'b2', session: 'sA', summarize: true })
+  assert.equal(aStart.project.hash, alpha.hash)
+  assert.ok(aStart.entries.some(entry => entry.scope === 'project' && entry.text === 'Alpha deploys with a script'))
+  assert.equal(aStart.summarizing, true)
+  await s.endpoint('memory-view', { botId: 'b2', session: 'sB', summarize: true })
+  await summarized(s.endpoint, { botId: 'b2', session: 'sB' })
+  const bDone = await s.endpoint('memory-view', { botId: 'b2', session: 'sB' })
+  assert.equal(bDone.project.hash, beta.hash)
+  assert.ok(bDone.entries.some(entry => entry.scope === 'project' && entry.text === 'Beta deploys on Fridays'))
+  assert.equal(bDone.fresh, true)
+  assert.equal(bDone.summary.text, '## B\nBeta project summary.')
+  // A is still in flight, and its pending answer is not B's summary.
+  const aMid = await s.endpoint('memory-view', { botId: 'b2', session: 'sA' })
+  assert.equal(aMid.project.hash, alpha.hash)
+  assert.equal(aMid.summarizing, true)
+  releaseA()
+  await summarized(s.endpoint, { botId: 'b2', session: 'sA' })
+  const aDone = await s.endpoint('memory-view', { botId: 'b2', session: 'sA' })
+  assert.equal(aDone.project.hash, alpha.hash)
+  assert.equal(aDone.fresh, true)
+  assert.equal(aDone.summary.text, '## A\nAlpha project summary.')
+  // Two model calls in total, each carrying only its own project's entries.
+  assert.equal(s.requests.length, 2)
+  assert.match(String(s.requests[0].messages[0].content[0].text), /## Project memory of alpha\n- Alpha deploys with a script/)
+  assert.ok(!String(s.requests[0].messages[0].content[0].text).includes('Beta deploys'), "B's entries stayed out of A's request")
+  assert.match(String(s.requests[1].messages[0].content[0].text), /## Project memory of beta\n- Beta deploys on Fridays/)
+  assert.ok(!String(s.requests[1].messages[0].content[0].text).includes('Alpha deploys'), "A's entries stayed out of B's request")
+  // Back on A the cached summary answers: no further model call.
+  const again = await s.endpoint('memory-view', { botId: 'b2', session: 'sA', summarize: true })
+  assert.equal(again.project.hash, alpha.hash)
+  assert.equal(again.fresh, true)
+  assert.equal(again.summary.text, '## A\nAlpha project summary.')
+  assert.equal(s.requests.length, 2)
 })
 
 // The review path over the fixed #52 (d4ca7d9): the architect's regression covers
