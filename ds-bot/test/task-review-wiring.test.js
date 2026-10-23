@@ -116,6 +116,24 @@ const CLAIM = { kind: 'command', statement: '发布脚本跑通了，测试 12/1
 const report = { result: '完成发布脚本验证', claims: [CLAIM], notes: '' }
 const ONE_ITEM = [{ claim: 0, topic: '', text: '发布用 scripts/ship.sh，测试通过后再发布', outcome: 'verified' }]
 
+// The answers are matched to the questions by position, so the number of questions has to
+// be the number the caller can use. A plan holds eight entries; a ninth lesson extracted
+// from the same report used to be verified and then dropped by the freeze with no trace.
+// It is now recorded as unverified, and the batch stays at the eight the plan can hold.
+test('a report that yields more lessons than a plan holds keeps the extras on record', async t => {
+  const items = Array.from({ length: 9 }, (_, at) => ({ claim: 0, topic: '', text: `发布教训 ${at + 1}`, outcome: 'verified' }))
+  const s = start({ items, support: Array.from({ length: 8 }, () => 'yes') })
+  t.after(() => s.stop())
+  await s.tool('complete_task', report, 'b2', 'call-over-plan')
+  idle(s.ctx)
+  await until(() => s.plans()[0]?.status === 'DONE', () => `status=${s.plans()[0]?.status}`)
+  const record = s.plans()[0]
+  assert.equal(record.plan.items.length, 8, 'a plan holds eight entries')
+  assert.equal(record.unverified.filter(entry => entry.reason === 'plan-full').length, 1, 'the ninth lesson is kept on record')
+  assert.equal(s.requests.filter(request => String(request.system).startsWith('You check whether')).length, 1, 'one batch, not two')
+  assert.equal(parseMemory(readFileSync(s.memoryPathOf(record), 'utf8')).entries.length, 8)
+})
+
 test('a report without claims is refused and records nothing', async t => {
   const s = start()
   t.after(() => s.stop())
