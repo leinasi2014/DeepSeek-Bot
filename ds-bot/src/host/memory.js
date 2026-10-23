@@ -657,10 +657,15 @@ export function install(rt) {
   // not a missing record. What such a turn starts with `message_bot` is a real request to
   // another Bot, and `openWork` pins each one on the turn that opened it, so this reads
   // only what this turn set going rather than everything the Bot ever sent.
+  //
+  // Group calls live in the same `spawned` list (they are opened from the same place), so
+  // they are filtered out here and read by `groupWaitsOf`: a room call is not a handoff
+  // work and the two must not be mixed in the record.
+  const isRoomCall = id => id.startsWith('room:')
   const worksOfTurn = (exec) => {
     const turn = rt.live.get(exec?.agent?.id)
     const answered = [rt.workOf(turn?.info), ...(turn?.joined ?? []).map(joined => rt.workOf(joined.info))]
-    return [...new Set([...answered, ...(turn?.spawned ?? [])].filter(Boolean))]
+    return [...new Set([...answered, ...(turn?.spawned ?? [])].filter(id => Boolean(id) && !isRoomCall(id)))]
   }
 
   // The group calls this turn made. They are opened when the line that names the member is

@@ -120,7 +120,12 @@ async function start(t) {
   ctx.connection.fetch.register = (options) => register(options)
   const rt = createRuntime(ctx, { home, memoryReviewDelayMs: 0 })
   await rt.load()
-  rt.deliver = async message => { delivered.push(message) }
+  // Record what is sent, then deliver it for real: a group round only starts when its
+  // member Session actually receives the brief, so replacing `deliver` outright would
+  // leave `group_relay` unable to do anything.
+
+  const deliver = rt.deliver
+  rt.deliver = async message => { delivered.push(message); return deliver(message) }
   const emit = (id, type, data) => {
     for (const listener of ctx.listeners.get('session/event') ?? []) listener({ id }, { type, seq: ++seq, data })
   }
@@ -193,40 +198,54 @@ test('an own-chat turn that sent nothing does not wait', async t => {
   assert.deepEqual(s.plans()[0].work, [], 'a turn with no request above or below it waits for nothing')
 })
 
-// Not yet passing: the group entry point does not reach a WAITING candidate in this
-// harness. Left here, visible, rather than deleted or faked.
-//   // The product's own round: group_relay on the group itself, then Chief takes its turn
-//   // and writes the line that names Writer. That line is posted while Chief's turn is still
-//   // open, which is the only moment a report in the same turn can see the call.
-//   const stop = new AbortController()
-//   t.after(() => stop.abort())
-//   s.emit('desk', 'user/message', { content: [{ type: 'text', text: '@Chief 安排一下发布说明.' }], source: { kind: 'user' } })
-//   void s.tool('group_relay', {}, 'desk', 'call-relay', { signal: stop.signal }).catch(() => {})
-//   await until(() => s.agentOf('desk-chief').calls.length === 1)
-//   const brief = s.agentOf('desk-chief').calls.at(-1)
-//   s.emit('desk-chief', 'turn/start', { turn: 1 })
-//   s.emit('desk-chief', 'user/message', { content: brief.content, source: brief.source })
-//   await s.rt.roomStepText('desk-chief', s.rt.live.get('desk-chief')?.info, '@Writer 写发布说明，测试 12/12 通过。', true)
-//   const roomWork = Object.keys(s.rt.state.works).filter(id => id.startsWith('room:'))
-//   assert.equal(roomWork.length, 1, 'the line that named Writer opened exactly one call')
-// 
-//   // The report is made inside the same turn, before 	urn/end: the call is already there.
-//   await until(() => s.plans()[0]?.status === 'WAITING')
-//   s.idle('desk-chief')
-//   await until(() => s.plans()[0]?.status === 'WAITING')
-//   assert.deepEqual(s.plans()[0].groupWaits, roomWork, 'the report waits for the call its own turn made')
-//   assert.equal(s.plans()[0].plan, null)
-//   assert.equal(s.memoryText(), '')
-// 
-//   // Writer answers in the group: the call closes and the candidate goes on.
-//   await until(() => s.agentOf('desk-writer').calls.length === 1)
-//   const writerBrief = s.agentOf('desk-writer').calls.at(-1)
-//   s.emit('desk-writer', 'turn/start', { turn: 1 })
-//   s.emit('desk-writer', 'user/message', { content: writerBrief.content, source: writerBrief.source })
-//   s.emit('desk-writer', 'assistant/message', { message: { content: [{ type: 'text', text: '写好了，测试 12/12 通过。' }] } })
-//   s.emit('desk-writer', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
-//   s.idle('desk-chief')
-//   await until(() => s.plans()[0]?.status === 'DONE')
-// })
-// 
-//   await until(() => s.plans()[0]?.status === 'DONE')
+// A report made in a group waits on the member that group round called, and stops waiting
+// when that member really speaks. The capture happens where the line is written — `say`
+// for a member holding its place in a round, `postStep` for one posting outside it — because
+// anything the round only records after the turn ends is too late for a report made inside
+// that turn.
+test('a member the admin called in a group holds the report until it answers there', async t => {
+  const s = await start(t)
+  // The product's own round: the user writes in the group and `group_relay` starts it.
+  const stop = new AbortController()
+  t.after(() => stop.abort())
+  s.emit('desk', 'user/message', { content: [{ type: 'text', text: '@Chief 安排一下发布说明.' }], source: { kind: 'user' } })
+  void s.tool('group_relay', {}, 'desk', 'call-relay', { signal: stop.signal }).catch(() => {})
+
+  // Chief takes its turn and writes a line naming Writer, while that turn is still open.
+  await until(() => s.agentOf('desk-chief').calls.length === 1)
+  const chiefBrief = s.agentOf('desk-chief').calls.at(-1)
+  s.emit('desk-chief', 'turn/start', { turn: 1 })
+  s.emit('desk-chief', 'user/message', { content: chiefBrief.content, source: chiefBrief.source })
+  await s.rt.roomStepText('desk-chief', s.rt.live.get('desk-chief')?.info, '@Writer 写发布说明，测试 12/12 通过。', true)
+  const roomCalls = Object.keys(s.rt.state.works).filter(id => id.startsWith('room:'))
+  assert.equal(roomCalls.length, 1, 'the line that named Writer opened exactly one call')
+
+  // The report is made inside the same turn, before `turn/end`: the call is already there.
+  // The evidence must be in this group Session's own lines, so the claim quotes what the
+  // user said there.
+  const groupReport = { result: '完成发布说明安排', claims: [{ kind: 'command', statement: '发布说明已安排', evidence: '@Chief 安排一下发布说明', ref: 'part 1 #10' }], notes: '' }
+  const accepted = await s.tool('complete_task', groupReport, 'desk-chief', 'call-group-report')
+  assert.match(String(accepted), /Recorded as a candidate/)
+  assert.equal(s.plans().length, 1, 'the report was accepted as a candidate')
+  assert.deepEqual(s.plans()[0].work, [], 'the group call is not a handoff work')
+  assert.equal(s.plans()[0].groupWaits.length, 1, 'the candidate is bound before the turn ends')
+  // Only the real end of Chief's turn hands the round on to Writer; an idle event is not a
+  // turn end. The candidate is checked at that idle.
+  s.emit('desk-chief', 'assistant/message', { message: { content: [{ type: 'text', text: '@Writer 写发布说明，测试 12/12 通过。' }] } })
+  s.emit('desk-chief', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
+  s.idle('desk-chief')
+  await until(() => s.plans()[0]?.status === 'WAITING')
+  assert.deepEqual(s.plans()[0].groupWaits, roomCalls, 'the report waits for the call its own turn made')
+  assert.equal(s.plans()[0].plan, null, 'no plan is frozen while waiting')
+  assert.equal(s.memoryText(), '', 'nothing is written while waiting')
+
+  // Writer answers in the group: the call closes and the candidate goes on.
+  await until(() => s.agentOf('desk-writer').calls.length === 1)
+  const writerBrief = s.agentOf('desk-writer').calls.at(-1)
+  s.emit('desk-writer', 'turn/start', { turn: 1 })
+  s.emit('desk-writer', 'user/message', { content: writerBrief.content, source: writerBrief.source })
+  s.emit('desk-writer', 'assistant/message', { message: { content: [{ type: 'text', text: '写好了，测试 12/12 通过。' }] } })
+  s.emit('desk-writer', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
+  s.idle('desk-chief')
+  await until(() => s.plans()[0]?.status === 'DONE')
+})

@@ -232,3 +232,31 @@ test('a waiting candidate is picked up again after a restart', async t => {
   await until(() => second.plans()[0]?.status === 'DONE')
   assert.match(second.memoryText(), /发布用 scripts\/ship\.sh/)
 })
+
+
+// A turn can send more requests than a report makes claims. The association list must hold
+// every one of them: dropping the extras would let a report be written while a request it
+// opened is still unanswered. Nine children, eight closed, the ninth still out: it waits.
+test('every request a turn opened is kept, not cut at the claims limit', async t => {
+  const works = {}
+  for (let i = 0; i < 9; i += 1) works[`w-${i}`] = { from: 'b2', to: 'b3', open: [], results: [], at: i }
+  const s = await start({ works })
+  t.after(() => s.stop())
+  s.turnAnswering('b2', 'w-0')
+  for (let i = 1; i < 9; i += 1) s.rt.openWork(`w-${i}`, { from: 'b2', to: 'b3', session: 'b2' })
+  await s.tool('complete_task', report, 'call-nine')
+  const recorded = s.plans()[0].work
+  assert.equal(recorded.length, 9, 'all nine requests are recorded')
+  assert.equal(new Set(recorded).size, 9, 'and none of them twice')
+  assert.equal(recorded.includes('w-8'), true, 'the ninth is not dropped')
+
+  // Eight come back, the ninth does not: the candidate must still wait.
+  for (let i = 0; i < 8; i += 1) delete s.rt.state.works[`w-${i}`]
+  s.idle()
+  await until(() => s.plans()[0]?.status === 'WAITING')
+  assert.equal(s.memoryText(), '', 'nothing is written while the ninth is out')
+
+  delete s.rt.state.works['w-8']
+  s.idle()
+  await until(() => s.plans()[0]?.status === 'DONE')
+})

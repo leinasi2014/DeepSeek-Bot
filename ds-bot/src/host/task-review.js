@@ -43,6 +43,12 @@ export const STATUS = {
 // entry finds the same file, while a model that calls complete_task again gets a new
 // callId and therefore a new candidate (its wording cannot be deduplicated, by design).
 export const candidateIdOf = (sessionId, callId) => createHash('sha256').update(`${sessionId}\n${callId}`).digest('hex').slice(0, 32)
+// The work, question and room-call ids a candidate is bound to, de-duplicated and with the
+// empty ones dropped. Deliberately not capped by CLAIMS_MAX: that bounds how many claims a
+// report may make, and a turn can open more requests than it makes claims. Cutting the list
+// would let a report be written while something it started is still unanswered.
+const relatedIds = ids => [...new Set((Array.isArray(ids) ? ids : []).filter(id => typeof id === 'string' && id !== ''))]
+
 // The id that lands in the Markdown metadata. Lower-case and stable per plan item.
 export const reviewIdOf = (candidateId, index) => createHash('sha256').update(`${candidateId}:${index}`).digest('hex').slice(0, 16)
 
@@ -159,16 +165,20 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
       result: String(result ?? '').slice(0, 2000),
       claims: (Array.isArray(claims) ? claims : []).slice(0, CLAIMS_MAX),
       notes: String(notes ?? '').slice(0, 4000),
-      // Work ids, not bot ids: `waitsWork` answers for one piece of work. A request that
-      // was answered and dropped is gone from the map, so it stops blocking by itself.
-      work: (Array.isArray(work) ? work : []).filter(id => typeof id === 'string' && id !== '').slice(0, CLAIMS_MAX),
+      // Work ids, not bot ids: one entry per request this turn opened. These are all kept:
+      // `CLAIMS_MAX` bounds how many claims a report may make, not how many requests the
+      // turn actually sent. Truncating here would let a candidate pass while a request it
+      // opened is still unanswered — the report would be written as if everything it
+      // started had come back. A request that is answered or dropped leaves the map, so it
+      // stops blocking by itself.
+      work: relatedIds(work),
       // Question ids, not Session ids: a question moves to the next Session when the
       // conversation changes part, and its id stays the same.
-      questions: (Array.isArray(questions) ? questions : []).filter(id => typeof id === 'string' && id !== '').slice(0, CLAIMS_MAX),
+      questions: relatedIds(questions),
       // Room calls this turn made, as work ids in the same book as the rest: a group line
       // that names a member is work the moment it is posted, which is while the turn is
       // still open, so a report made later in that turn can wait for it.
-      groupWaits: (Array.isArray(groupWaits) ? groupWaits : []).filter(id => typeof id === 'string' && id !== '').slice(0, CLAIMS_MAX),
+      groupWaits: relatedIds(groupWaits),
       plan: null,
       progress: { done: [], conflicts: [] },
     }
