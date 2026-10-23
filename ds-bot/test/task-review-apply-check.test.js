@@ -88,8 +88,12 @@ test('a plan edited after the freeze is checked again at apply, and a refusal st
   const memoryFile = join(home, 'memory', 'bots', 'b2', 'MEMORY.md')
   const readPlan = callId => JSON.parse(readFileSync(planFileOf(callId), 'utf8'))
   const settle = () => new Promise(resolve => setTimeout(resolve, 50))
-  const until = async check => {
+  // A wait that only polls says nothing when it runs out: the next assertion then blames
+  // the state it wanted, not the wait that never got there. On a slow CI machine this read
+  // as "the plan is not APPLYING" when the truth was "5 s was not enough" (#98).
+  const until = async (check, describe) => {
     for (let tries = 0; tries < 100 && !check(); tries += 1) await settle()
+    assert.ok(check(), `did not reach the expected state within 5 s; it is ${describe()}`)
   }
 
   // Freeze the plan, stop the first apply, edit the plan, let the backoff walk into the
@@ -98,7 +102,8 @@ test('a plan edited after the freeze is checked again at apply, and a refusal st
     await tool('complete_task', { result: 'done', claims: [{ kind: 'user', statement: '发布前先跑发布脚本', evidence: 'Please run the release script now.', ref: 'part 1 #10' }] }, callId)
     ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
     const read = () => { try { return readPlan(callId) } catch { return {} } }
-    await until(() => read().status === 'APPLYING' && read().retry === 1)
+    const say = () => `status=${read().status} retry=${read().retry}`
+    await until(() => read().status === 'APPLYING' && read().retry === 1, say)
     const waiting = read()
     assert.equal(waiting.status, 'APPLYING', 'the plan is frozen and the first apply failed transiently')
     assert.equal(waiting.plan.items.length, 1, 'the plan holds the lesson')
@@ -106,7 +111,7 @@ test('a plan edited after the freeze is checked again at apply, and a refusal st
     const edited = structuredClone(waiting)
     edit(edited)
     writeFileSync(planFileOf(callId), `${JSON.stringify(edited, null, 2)}\n`, 'utf8')
-    await until(() => read().status === 'CONFLICT')
+    await until(() => read().status === 'CONFLICT', say)
     return read()
   }
 
