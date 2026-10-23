@@ -156,7 +156,7 @@ test('an interrupted item whose target file is unchanged goes on to write', asyn
   assert.ok(pending !== undefined, 'the pre-write state is on the record')
   assert.deepEqual(Object.keys(pending.files), ['MEMORY.md'])
   assert.equal(s.recordOf(candidateId).progress.pending.files['MEMORY.md'], pending.files['MEMORY.md'], 'the pre-write state was persisted before the write')
-  s.advance(61_000) // past the failed apply's backoff (#67)
+  s.advance(2_000) // past the failed apply's first backoff (#67)
   const done = await s.build({}).process(candidateId)
   assert.equal(done.status, STATUS.done)
   assert.equal(done.progress.pending, undefined, 'settling the item clears the pre-write state')
@@ -169,7 +169,7 @@ test('a person\'s edit of the target file stops the item as a conflict and is pr
   const { candidateId } = await s.build({ fail: 'eio' }).enqueue(candidate)
   await s.build({ fail: 'eio' }).process(candidateId)
   s.files['project:a']['MEMORY.md'] = '# Memory\n\n- 用户手改了这里\n\n## Index\n'
-  s.advance(61_000) // past the failed apply's backoff (#67)
+  s.advance(2_000) // past the failed apply's first backoff (#67)
   const stopped = await s.build({}).process(candidateId)
   assert.equal(stopped.status, STATUS.conflict)
   const conflict = stopped.progress.conflicts.at(-1)
@@ -187,7 +187,7 @@ test('the same text elsewhere in the scope explains the change instead of confli
   // The person moved the fact into a topic file and left a note behind.
   s.files['project:a']['MEMORY.md'] = '# Memory\n\n- 顺带改了一句\n\n## Index\n'
   s.files['project:a']['travel.md'] = '# travel\n\n- 用脚本发布\n\n## Index\n'
-  s.advance(61_000) // past the failed apply's backoff (#67)
+  s.advance(2_000) // past the failed apply's first backoff (#67)
   const settled = await s.build({}).process(candidateId)
   assert.equal(settled.status, STATUS.done)
   const doneEntry = settled.progress.done.at(-1)
@@ -230,7 +230,7 @@ test('a topic item watches the link target too', async t => {
   assert.deepEqual(Object.keys(interrupted.progress.pending.files).sort(), ['MEMORY.md', 'travel.md'], 'both files the item may write are watched')
   files['project:a']['MEMORY.md'] = '# Memory\n\n- 用户只改了 MEMORY.md\n\n## Index\n'
   failing = false
-  clock += 61_000 // past the failed apply's backoff (#67)
+  clock += 2_000 // past the failed apply's first backoff (#67)
   const stopped = await build().process(candidateId)
   assert.equal(stopped.status, STATUS.conflict)
   assert.equal(stopped.progress.conflicts.at(-1).file, 'MEMORY.md')
@@ -247,7 +247,7 @@ test('a capacity failure keeps the pre-write state without spending a retry, and
   assert.ok(full.progress.pending !== undefined, 'the pre-write state waits with the item')
   // Capacity stays until a person reopens it, the way the panel endpoint does.
   await s.build({}).save({ ...full, status: STATUS.planned })
-  s.advance(61_000) // past the failed apply's backoff (#67)
+  s.advance(2_000) // past the failed apply's first backoff (#67)
   const done = await s.build({}).process(candidateId)
   assert.equal(done.status, STATUS.done)
   assert.equal(done.progress.pending, undefined)
@@ -262,7 +262,7 @@ test('a duplicate committed ahead of the queued apply explains the pending hash'
   const s = prehashHarness(t)
   const { candidateId } = await s.build({ fail: 'eio' }).enqueue(candidate)
   await s.build({ fail: 'eio' }).process(candidateId)
-  s.advance(61_000) // past the failed apply's backoff (#67)
+  s.advance(2_000) // past the failed apply's first backoff (#67)
   const recovered = await s.build({
     beforeDecide: (item, files_) => { files_['MEMORY.md'] = `# Memory\n\n- ${item.text}\n\n## Index\n` },
   }).process(candidateId)
@@ -455,7 +455,7 @@ function backoffHarness(t) {
 test('a failed apply waits its backoff, pauses after three, and recovers explicitly', async t => {
   const s = backoffHarness(t)
   const { candidateId } = await s.build().enqueue(candidate)
-  // First failure: wait one minute before the next try.
+  // First failure: wait one second before the next try.
   const first = await s.build().process(candidateId)
   assert.equal(first.status, STATUS.applying)
   assert.equal(first.retry, 1)
@@ -465,16 +465,16 @@ test('a failed apply waits its backoff, pauses after three, and recovers explici
   assert.equal(tooSoon.retry, 1)
   assert.equal(s.calls.apply, 1, 'before the wait is up, nothing is tried')
   // A fresh instance (a restart) reads the same point and also stays put.
-  s.advance(59_000)
+  s.advance(999)
   const stillEarly = await s.build().process(candidateId)
   assert.equal(stillEarly.retry, 1)
   assert.equal(s.calls.apply, 1, 'a restart before the wait is up does not try either')
-  // Past the wait, the second failure waits ten minutes.
-  s.advance(2_000)
+  // Past the wait, the second failure waits five seconds.
+  s.advance(2)
   const second = await s.build().process(candidateId)
   assert.equal(second.retry, 2)
   assert.equal(s.calls.apply, 2)
-  s.advance(600_000)
+  s.advance(5_000)
   const third = await s.build().process(candidateId)
   assert.equal(third.status, STATUS.retry, 'the third failure pauses the candidate')
   assert.equal(third.retry, 3)
@@ -532,6 +532,104 @@ test('a capacity stop reopens onto its frozen plan through the explicit retry', 
   const done = await build().process(candidateId)
   assert.equal(done.status, STATUS.done)
   assert.equal(calls.apply, 2)
+})
+
+// #67, Codex's negative on 9a683e2: after a capacity stop the person makes room — by
+// removing entries, which changes exactly the bytes the old pre-write state hashed —
+// and the explicit retry must resume the frozen plan, not stop as a manual conflict.
+test('freeing space lets an explicit capacity retry resume the frozen plan', async t => {
+  const s = prehashHarness(t)
+  s.files['project:a']['MEMORY.md'] = '# Memory\n\n- Old entry removed to free space\n\n## Index\n'
+  const first = s.build({ fail: 'full' })
+  const { candidateId } = await first.enqueue(candidate)
+  const full = await first.process(candidateId)
+  assert.equal(full.status, STATUS.capacity)
+  assert.ok(full.progress.pending !== undefined, 'the pre-write state was taken before the file was full')
+  s.files['project:a']['MEMORY.md'] = '# Memory\n\n## Index\n'
+  const resume = s.build({})
+  await resume.retry(candidateId)
+  const done = await resume.process(candidateId)
+  assert.equal(done.status, STATUS.done, 'explicit capacity retry after removing old entries must write the retained plan')
+  assert.match(s.files['project:a']['MEMORY.md'], /用脚本发布/)
+})
+
+// #67: a validation the memory module refused is permanent — the plan file was edited
+// into something the limits reject — so it is a person's conflict, not a transient
+// fault: no retry is spent and no backoff waits.
+test('a permanent validation failure at apply is a conflict, never a retry', async t => {
+  const h = harness(t, {
+    extract: () => ({ items: [{ scope: 'project:a', text: '用脚本发布', outcome: 'verified', source: 'part 1 #2' }] }),
+  })
+  // The apply-side check refuses the text, the way a hand-edited plan can be refused.
+  const realApply = h.review
+  const root = h.root
+  const refusing = taskReview({
+    root,
+    check: async () => ({ ok: true, project: 'project:a' }),
+    extract: async () => ({ items: [{ scope: 'project:a', text: '用脚本发布', outcome: 'verified', source: 'part 1 #2' }] }),
+    applyItem: async (item, hooks) => {
+      const hashes = { 'MEMORY.md': createHash('sha256').update('').digest('hex') }
+      const verdict = await hooks.decide({ hashes, entries: [], hasLink: true })
+      if (verdict.kind !== 'proceed') return { skipped: verdict.kind, file: verdict.file, conflict: verdict.conflict }
+      throw Object.assign(new Error('This entry is too long'), { code: 'memory/invalid' })
+    },
+    linkTopic: async () => {},
+    readScope: () => [],
+    parse: parseMemory,
+    format: formatEntry,
+    entryProblem: () => undefined,
+    secretEntry: () => false,
+    now: () => '2026-10-23T00:00:00.000Z',
+  })
+  const { candidateId } = await refusing.enqueue(candidate)
+  const stopped = await refusing.process(candidateId)
+  assert.equal(stopped.status, STATUS.conflict, 'a permanent validation failure stops for a person')
+  assert.equal(stopped.retry, 0, 'no retry is spent on a permanent refusal')
+  assert.equal(stopped.progress.conflicts.at(-1).reason, 'invalid-at-apply')
+  assert.ok(stopped.retryAt === undefined, 'no backoff waits for a permanent refusal')
+  void realApply
+})
+
+// #67: the bounded wake. A timer per candidate fires at the recorded wait and calls
+// the host's wake; whatever pass finds the wait still ahead re-arms it (a restart
+// rebuilds the wait), and dispose clears it with the factory.
+test('the wake timer fires at the recorded wait and is cleared with the factory', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'ds-bot-task-wake-'))
+  t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 5 }))
+  let clock = Date.parse('2026-10-23T00:00:00.000Z')
+  const fired = []
+  const build = () => taskReview({
+    root,
+    check: async () => ({ ok: true, project: 'project:a' }),
+    extract: async () => ({ items: [{ scope: 'project:a', text: '用脚本发布', outcome: 'verified', source: 'part 1 #2' }] }),
+    applyItem: async (item, hooks) => {
+      const hashes = { 'MEMORY.md': createHash('sha256').update('').digest('hex') }
+      const verdict = await hooks.decide({ hashes, entries: [], hasLink: true })
+      if (verdict.kind !== 'proceed') return { skipped: verdict.kind, file: verdict.file, conflict: verdict.conflict }
+      throw Object.assign(new Error('EIO'), { code: 'EIO' })
+    },
+    linkTopic: async () => {},
+    readScope: () => [],
+    parse: parseMemory,
+    format: formatEntry,
+    entryProblem: () => undefined,
+    secretEntry: () => false,
+    now: () => new Date(clock).toISOString(),
+    wake: record => fired.push(record.candidateId),
+  })
+  const review = build()
+  const { candidateId } = await review.enqueue(candidate)
+  await review.process(candidateId) // fails once, arms the one-second timer
+  await new Promise(resolve => setTimeout(resolve, 100))
+  assert.deepEqual(fired, [], 'the timer has not fired yet')
+  await new Promise(resolve => setTimeout(resolve, 1_200))
+  assert.deepEqual(fired, [candidateId], 'the timer fired once at the recorded wait and called the host wake')
+  review.dispose()
+  await review.process(candidateId) // fails again, would arm a five-second timer
+  review.dispose()
+  const armed = fired.length
+  await new Promise(resolve => setTimeout(resolve, 300))
+  assert.equal(fired.length, armed, 'dispose clears the timer: nothing fires after it')
 })
 
 test('an unreadable candidate file is quarantined and the others still run', async t => {

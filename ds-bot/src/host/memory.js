@@ -929,6 +929,13 @@ export function install(rt) {
     extract: taskReviewExtract,
     applyItem: taskReviewApply,
     linkTopic: taskReviewLinkItem,
+    // The bounded wake for a backed-off apply (#67): a real timer, unref'd, cleaned
+    // up with this module. It goes through the same gate as every other pass — the
+    // review switched off means no candidate change and no model call — and holds
+    // nothing: the pass it wakes does the work.
+    wake: record => {
+      if (reviewOn) void runSessionTasks(record.sessionId)
+    },
     readScope: (key) => {
       const scope = scopeOfKey(key)
       return loadScope(scope).map(file => ({ file: file.file, topic: file.topic ?? '', content: file.content }))
@@ -2397,6 +2404,10 @@ export function install(rt) {
       turnOwners.clear()
     }, 'ds-bot: memory review')
   }
+
+  // The backoff timers of task candidates belong to this module's life, whatever the
+  // review switch says (#67): they exist only while the plugin does.
+  ctx.effect(() => () => taskReview.dispose?.(), 'ds-bot: task review timers')
 
   async function memoryEndpoint(endpoint, body) {
     if (endpoint === 'memory-view') return memoryView(body)

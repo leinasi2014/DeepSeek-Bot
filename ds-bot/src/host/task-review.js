@@ -21,8 +21,8 @@ export const INVALID_MAX = 3
 export const RETRY_MAX = 3
 export const CAPACITY_CODE = 'memory/full'
 // A failed apply waits before it is tried again, and the wait grows with each failure.
-// The third failure pauses the candidate for an explicit retry (#67).
-export const RETRY_WAIT_MS = [60_000, 600_000, 3_600_000]
+// The waits are short: the wake is a timer in this module's life (#67), not a person.
+export const RETRY_WAIT_MS = [1_000, 5_000, 25_000]
 
 export const STATUS = {
   pending: 'PENDING',
@@ -71,14 +71,17 @@ export const metaForSecretCheck = meta => Object.fromEntries(Object.entries(meta
 // - `extract(candidate)` asks the model for the claims once; resolves
 //   `{ items: [...] }` or `{ invalid: reason }`.
 // - `applyItem(item)` writes one entry through the memory queue and resolves
-//   `{ changed, file }`; it throws `memory/full` when the file is full.
+//   `{ changed, file }`; it throws `memory/full` when the file is full and
+//   `memory/invalid` for a check that cannot pass by trying again.
 // - `linkTopic(scope, topic)` adds the missing `[[topic]]` link to MEMORY.md.
+// - `wake(record)` is called when a backed-off apply's wait is over (#67). The host
+//   decides what a wake does; a review switched off does nothing at all.
 // - `readScope(scope)` and `parse(content)`/`format(text, meta)` are the memory module's
 //   own committed reader and entry format, so recovery compares exactly what it wrote.
 // - `entryProblem(text)` / `secretEntry(text)` are the memory module's own limits. They
 //   run again before the plan is frozen: the extract step may be hours old by then, and
 //   the plan file is a plain JSON a person can edit.
-export function taskReview({ root, check, extract, applyItem, linkTopic, readScope, parse, format, entryProblem = () => undefined, secretEntry = () => false, now = () => new Date().toISOString(), warn = () => {} }) {
+export function taskReview({ root, check, extract, applyItem, linkTopic, readScope, parse, format, entryProblem = () => undefined, secretEntry = () => false, now = () => new Date().toISOString(), warn = () => {}, wake = () => {} }) {
   const dir = join(root, 'task-plans')
   const corruptDir = join(dir, 'corrupt')
   const pathOf = id => join(dir, `${id}.json`)
@@ -337,6 +340,14 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
       })
     } catch (error) {
       if (error?.code === CAPACITY_CODE) return { kind: 'capacity' }
+      // A validation the memory module itself refused cannot pass by trying again —
+      // the plan file was edited by hand into something the limits reject. It is a
+      // person's conflict, not a transient fault: no retry is spent and no backoff
+      // waits (#67, the contract behind the dual checks).
+      if (error?.code === 'memory/invalid') {
+        record.progress.conflicts.push({ reviewId: item.reviewId, file: item.topic === '' ? 'MEMORY.md' : `${item.topic}.md`, expected: item.line, found: null, reason: 'invalid-at-apply', problem: String(error?.message ?? error) })
+        return { kind: 'conflict', file: item.topic === '' ? 'MEMORY.md' : `${item.topic}.md` }
+      }
       record.retry += 1
       return { kind: 'retrying', error: String(error?.message ?? error) }
     }
@@ -385,11 +396,13 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
       if (outcome.kind === 'retrying') {
         // The backoff lives on the record, never in a sleep: the next pass — an idle,
         // a restart, a load — reads it and leaves the candidate alone until the time
-        // arrives. The wait holds nothing, least of all the memory write queue (#67).
+        // arrives, and the timer wakes one pass at exactly that time (#67). The wait
+        // holds nothing, least of all the memory write queue.
         record.status = record.retry >= RETRY_MAX ? STATUS.retry : STATUS.applying
         record.retryAt = new Date(Date.parse(now()) + RETRY_WAIT_MS[Math.min(record.retry, RETRY_MAX) - 1]).toISOString()
         if (record.status === STATUS.retry) warn('ds-bot: task candidate %s failed %d times and is paused for an explicit retry', record.candidateId, record.retry)
         await write(record)
+        scheduleWake(record)
         return outcome
       }
     }
@@ -397,6 +410,27 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
     record.doneAt = now()
     await write(record)
     return { kind: 'done' }
+  }
+
+  // The bounded wake for a backed-off apply (#67): one timer per candidate, unref'd,
+  // re-armed by whatever pass finds a wait still ahead (a restart rebuilds it), cleared
+  // with this factory. It holds nothing — the pass it wakes does the work.
+  const wakeTimers = new Map()
+  function scheduleWake(record) {
+    if (record.retryAt === undefined) return
+    const running = wakeTimers.get(record.candidateId)
+    if (running !== undefined) clearTimeout(running)
+    const wait = Math.max(0, Date.parse(record.retryAt) - Date.parse(now()))
+    const timer = setTimeout(() => {
+      wakeTimers.delete(record.candidateId)
+      wake(record)
+    }, wait)
+    timer.unref?.()
+    wakeTimers.set(record.candidateId, timer)
+  }
+  function dispose() {
+    for (const timer of wakeTimers.values()) clearTimeout(timer)
+    wakeTimers.clear()
   }
 
   // One pass over one candidate: re-validate, extract once, freeze the plan once, then
@@ -423,9 +457,13 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
     // RETRY is paused for a person; it leaves through an explicit retry, never on its
     // own, however often a wake arrives (#67).
     if (record.status === STATUS.retry) return record
-    // A failed apply waits its backoff before it is tried again. The wake is whatever
-    // pass happens along, so nothing sleeps and nothing is held (#67).
-    if (record.status === STATUS.applying && record.retryAt !== undefined && Date.parse(record.retryAt) > Date.parse(now())) return record
+    // A failed apply waits its backoff before it is tried again. The pass that finds
+    // the wait still ahead re-arms the wake, so a restart rebuilds it and no external
+    // event is needed for the try to happen on time (#67).
+    if (record.status === STATUS.applying && record.retryAt !== undefined && Date.parse(record.retryAt) > Date.parse(now())) {
+      scheduleWake(record)
+      return record
+    }
     const verdict = await check(record)
     if (verdict?.ok !== true) {
       record.status = verdict?.waiting === true ? STATUS.waiting : STATUS.dropped
@@ -494,9 +532,18 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
     const ontoPlan = record.plan !== null && (record.status === STATUS.retry || record.status === STATUS.capacity)
     const fromScratch = record.plan === null && (record.status === STATUS.held || record.status === STATUS.skipped || record.status === STATUS.retry)
     if (!ontoPlan && !fromScratch) return record
+    const was = record.status
     if (ontoPlan) {
       record.status = STATUS.planned
       delete record.retryAt
+      // A capacity stop is the one reopening that re-establishes the pre-write state
+      // (#67): the file was full, a person made room — by moving entries, which
+      // changes exactly the bytes the old state hashed. The next apply pass takes
+      // fresh hashes in the queue, against the files as they now are; the plan, its
+      // done entries and its metadata are kept as they were frozen. An I/O RETRY
+      // keeps its pre-write state: nothing was written, so the files should not have
+      // moved, and a change is still a person's edit to stop for.
+      if (was === STATUS.capacity) delete record.progress.pending
     } else {
       record.status = STATUS.pending
       record.invalid = 0
@@ -524,5 +571,5 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
     return results.filter(Boolean)
   }
 
-  return { enqueue, process, recover, retry, read, save: write, list, freeze, entriesOf, dir }
+  return { enqueue, process, recover, retry, read, save: write, list, freeze, entriesOf, dispose, dir }
 }
