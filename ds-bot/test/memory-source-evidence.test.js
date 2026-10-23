@@ -91,6 +91,40 @@ const ITEM = [{ claim: 0, topic: '', text: '发布用 scripts/ship.sh，测试�
 
 // --- A: the task review's source gate ---------------------------------------
 
+test('two lessons resting on one claim are judged on their own text', async t => {
+  // The same report, the same quote, two different lessons. The gate is asked about the
+  // text that would be written (the item's text), not about the reported claim, so the
+  // lesson the evidence does not show is refused while the one it does show is kept.
+  const s = start({
+    history: {
+      b2: [
+        userLine(10, 'Please run the release script now.'),
+        botLine(11, 'Ran scripts/ship.sh.'),
+        toolCall(12, 'k1', 'bash'),
+        toolResult(13, 'k1', 'tests 12/12 passing\n[exit code: 0]'),
+      ],
+    },
+    items: [
+      { claim: 0, topic: '', text: '发布用 scripts/ship.sh，测试通过后再发布', outcome: 'verified' },
+      { claim: 0, topic: '', text: '发布必须用蓝绿部署，且只在周二晚上进行', outcome: 'verified' },
+    ],
+    support: ['yes', 'no'],
+  })
+  t.after(() => s.stop())
+  await s.tool('complete_task', { result: '完成发布脚本验证', claims: [CLAIM] }, 'c-two-lessons')
+  s.idle()
+  await until(() => s.plans()[0]?.status === 'DONE', () => `status=${s.plans()[0]?.status}`)
+  const kept = s.memory()
+  assert.match(kept, /发布用 scripts\/ship\.sh/)
+  assert.doesNotMatch(kept, /蓝绿/)
+  assert.equal(s.plans()[0].unverified.map(entry => entry.reason).includes('model-unsupported'), true, 'the unrelated lesson is held back as unverified')
+  // One verify call, and it carried both texts as separate claims.
+  const verify = s.requests.find(r => String(r.system).startsWith('You check whether'))
+  const sent = String(verify.messages[0].content[0].text)
+  assert.match(sent, /发布用 scripts\/ship\.sh/)
+  assert.match(sent, /蓝绿/)
+})
+
 test('a command claim that only the Bot itself reports is refused', async t => {
   // The words "tests 12/12" exist, but only in the Bot's own message: before #66 that was
   // enough, and a self-reported success became a verified lesson.
@@ -178,6 +212,8 @@ test('a failed run is still kept as a failure, so the lesson is not lost', async
 // --- B: the per-turn review's source gate ----------------------------------
 
 test('a per-turn review cannot write a sentence that no line carries', async t => {
+  // No quote at all: the host refuses it before any model call, so a model that invents a
+  // sentence cannot get past the gate however plausible its wording looks.
   const s = start({
     history: {
       b2: [
@@ -196,9 +232,32 @@ test('a per-turn review cannot write a sentence that no line carries', async t =
   const journal = existsSync(join(s.home, 'memory', 'journal.jsonl'))
     ? readFileSync(join(s.home, 'memory', 'journal.jsonl'), 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line))
     : []
-  // No quote and words the user never wrote: the host refuses it on the words themselves.
-  assert.equal(journal[0]?.reason, 'evidence-unsupported')
+  // No quote: the host refuses it on the missing evidence, and never asks the model.
+  assert.equal(journal[0]?.reason, 'evidence-missing')
   assert.equal(journal[0]?.op, 'skip')
+})
+
+test('a per-turn review with a real but unrelated quote writes nothing', async t => {
+  // The user did write this line, word for word, so the mechanical gate passes — and the
+  // shared semantic gate is what refuses it, because the quote says nothing about deploys.
+  const s = start({
+    history: {
+      b2: [
+        userLine(10, 'Please run the release script now.'),
+        botLine(11, 'Ran scripts/ship.sh.'),
+      ],
+    },
+    support: ['no'],
+    review: JSON.stringify({ changes: [{ op: 'add', text: 'Production deploys must run only on Tuesday evenings', evidence: 'Please run the release script now' }] }),
+  })
+  t.after(() => s.stop())
+  await s.json('state')
+  s.idle()
+  await until(() => s.requests.length === 2, () => `requests=${s.requests.length}`)
+  await settle(200)
+  assert.equal(s.memory(), '', 'an unrelated quote supports nothing')
+  const journal = readFileSync(join(s.home, 'memory', 'journal.jsonl'), 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line))
+  assert.equal(journal[0]?.reason, 'model-unsupported')
 })
 
 test('a per-turn review keeps a preference the user stated', async t => {

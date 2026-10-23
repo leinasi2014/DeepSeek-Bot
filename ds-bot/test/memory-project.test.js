@@ -190,7 +190,17 @@ test('the memory review skips project writes when the project is unresolved, and
       listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }],
       listModels: async () => [{ id: 'v4' }],
       resolveModelInfo: async () => ({ reasoning: { efforts: [{ id: 'off' }] } }),
-      async* stream() {
+      async* stream(request) {
+        // The shared semantic gate (#66) asks its own question once per review, so it must
+        // not consume the review replies: every change here quotes a real user line, so a
+        // canned 'yes' per entry is the honest answer.
+        if (String(request?.system ?? '').startsWith('You check whether')) {
+          const body = [].concat(request?.messages?.at(-1)?.content ?? []).map(part => String(part?.text ?? '')).join('')
+          const entries = body.split('\n').filter(line => line.trim().startsWith('{')).length
+          yield { type: 'text-delta', index: 0, text: JSON.stringify({ support: Array.from({ length: entries }, () => 'yes') }) }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+          return
+        }
         const reply = replies.shift()
         yield { type: 'text-delta', index: 0, text: reply ?? '' }
         yield { type: 'finish', reason: { kind: 'stop' } }
@@ -241,7 +251,17 @@ test('the memory review refuses a team write the Bot may not make, instead of sa
       listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }],
       listModels: async () => [{ id: 'v4' }],
       resolveModelInfo: async () => ({ reasoning: { efforts: [{ id: 'off' }] } }),
-      async* stream() {
+      async* stream(request) {
+        // The shared semantic gate (#66) asks its own question once per review, so it must
+        // not consume the review replies: every change here quotes a real user line, so a
+        // canned 'yes' per entry is the honest answer.
+        if (String(request?.system ?? '').startsWith('You check whether')) {
+          const body = [].concat(request?.messages?.at(-1)?.content ?? []).map(part => String(part?.text ?? '')).join('')
+          const entries = body.split('\n').filter(line => line.trim().startsWith('{')).length
+          yield { type: 'text-delta', index: 0, text: JSON.stringify({ support: Array.from({ length: entries }, () => 'yes') }) }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+          return
+        }
         const reply = replies.shift()
         yield { type: 'text-delta', index: 0, text: reply ?? '' }
         yield { type: 'finish', reason: { kind: 'stop' } }

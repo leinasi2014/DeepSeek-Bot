@@ -125,19 +125,42 @@ const ownChat = [
 // of a Session, oldest first; each own chat has one user message, at seq 10, unless
 // it says otherwise. `requireSession` turns down a request without a Session, as
 // some routes do.
-function start({ home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-')), replies = [], config = {}, history = {}, reasoning = { efforts: [{ id: 'off' }, { id: 'high' }] }, models = ['v4'], defaultModel, requireSession = false } = {}) {
+//
+// The shared semantic gate (#66) asks its own prompt - 'You check whether quoted
+// evidence supports a claim' - once per review with changes, so it must NOT consume
+// the `replies` queue or every fixture after it would shift. `verify` is a separate
+// queue for explicit answers ('no' for the rejection cases); by default every entry
+// gets a canned 'yes', which is only used by fixtures whose evidence is a real,
+// verbatim source line. These calls emit no usage chunk, so token assertions stay
+// about the review call they measured before.
+function start({ home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-')), replies = [], verify = [], config = {}, history = {}, reasoning = { efforts: [{ id: 'off' }, { id: 'high' }] }, models = ['v4'], defaultModel, requireSession = false } = {}) {
   if (!existsSync(join(home, 'state.json'))) writeFileSync(join(home, 'state.json'), JSON.stringify(TEAM))
   const services = defaultModel === undefined ? {} : { agentDefaultModel: { currentSelection: () => ({ provider: 'deepseek', model: defaultModel }) } }
   const ctx = fakeContext({ services })
   const requests = []
+  // The semantic gate's calls land here, NOT in `requests`: every existing assertion
+  // counts and inspects the review passes it always meant, while the gate stays
+  // observable for the fixtures that assert it. Empty candidate sets make no call.
+  const verifyRequests = []
   Object.assign(ctx, {
     llm: {
       listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }],
       listModels: async () => models.map(id => ({ id })),
       resolveModelInfo: async () => ({ reasoning }),
       async* stream(request) {
-        requests.push(request)
         if (requireSession && request.sessionId === undefined) throw new Error('400: {"type":"MissingSessionID","message":"Request is missing x-opencode-session"}')
+        const system = String(request.system ?? '')
+        if (system.startsWith('You check whether quoted evidence supports')) {
+          verifyRequests.push(request)
+          const raw = request.messages?.at(-1)?.content
+          const body = typeof raw === 'string' ? raw : Array.isArray(raw) ? raw.map(block => block?.text ?? '').join('\n') : String(raw ?? '')
+          const entries = body.split('\n').filter(line => line.trim().startsWith('{')).length
+          const answer = verify.length > 0 ? verify.shift() : JSON.stringify({ support: Array.from({ length: entries }, () => 'yes') })
+          yield { type: 'text-delta', index: 0, text: typeof answer === 'string' ? answer : JSON.stringify(answer) }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+          return
+        }
+        requests.push(request)
         const reply = await replies.shift()
         if (reply instanceof Error) throw reply
         const out = typeof reply === 'object' && reply !== null ? reply : { text: reply ?? '' }
@@ -176,7 +199,7 @@ function start({ home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-')), replies =
     await ctx.dispose()
     if (!keep) rmSync(home, { recursive: true, force: true, maxRetries: 5 })
   }
-  return { ctx, home, call, tool, section, read, journal, requests, stop }
+  return { ctx, home, call, tool, section, read, journal, requests, verifyRequests, stop }
 }
 
 const settle = () => new Promise(resolve => setTimeout(resolve, 20))
