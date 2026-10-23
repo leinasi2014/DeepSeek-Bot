@@ -127,9 +127,21 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
 
   // A file that cannot be parsed keeps its evidence: it is moved aside under a name all
   // its own, marked so the same candidateId is never silently regenerated, and reported
-  // for a person to look at. When the move itself fails the original stays where it is,
-  // still marked: a replay must not overwrite it (#63).
+  // for a person to look at. The marker is written first: it is the durable fact that
+  // blocks a rebuild, so it must exist before the original path can become empty — a
+  // crash between the two leaves the unreadable file in place, never a window where a
+  // replay rebuilds over the evidence (#63). When the marker cannot be saved the move
+  // does not happen: the original stays where it is and the failure is reported, never
+  // swallowed as a successful quarantine.
   async function quarantine(id, error) {
+    const marker = { candidateId: id, at: now(), error: String(error?.message ?? error) }
+    try {
+      await mkdir(dir, { recursive: true })
+      await writeFile(markerOf(id), `${JSON.stringify(marker)}\n`, 'utf8')
+    } catch (failure) {
+      warn('ds-bot: quarantine marker for task candidate %s could not be saved; the unreadable file was left in place: %s', id, failure?.message ?? failure)
+      return { candidateId: id, status: STATUS.corrupt, unreadable: true, markerFailed: true, error: marker.error }
+    }
     let moved = false
     try {
       await mkdir(corruptDir, { recursive: true })
@@ -143,16 +155,10 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
       await rename(pathOf(id), target)
       moved = true
     } catch (failure) {
-      warn('ds-bot: task candidate %s is unreadable and could not be moved aside: %s', id, failure?.message ?? failure)
+      warn('ds-bot: task candidate %s is marked corrupt and could not be moved aside; the unreadable file stays in place: %s', id, failure?.message ?? failure)
     }
-    try {
-      await mkdir(dir, { recursive: true })
-      await writeFile(markerOf(id), `${JSON.stringify({ candidateId: id, at: now(), moved, error: String(error?.message ?? error) })}\n`, 'utf8')
-    } catch (failure) {
-      warn('ds-bot: quarantine marker for task candidate %s could not be saved: %s', id, failure?.message ?? failure)
-    }
-    warn('ds-bot: task candidate %s is unreadable and was quarantined: %s', id, error?.message ?? error)
-    return { candidateId: id, status: STATUS.corrupt, ...(moved ? { quarantined: true } : { unreadable: true }), error: String(error?.message ?? error) }
+    warn('ds-bot: task candidate %s is unreadable and was quarantined: %s', id, marker.error)
+    return { candidateId: id, status: STATUS.corrupt, ...(moved ? { quarantined: true } : { unreadable: true }), error: marker.error }
   }
 
   // Persisted before the tool call returns, so a candidate that was accepted is never

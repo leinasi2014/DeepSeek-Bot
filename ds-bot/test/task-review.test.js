@@ -322,6 +322,70 @@ test('a candidate that goes bad twice keeps both copies in corrupt', async t => 
   assert.deepEqual(moved.map(name => readFileSync(join(dir, 'corrupt', name), 'utf8')).sort(), [first, second].sort())
 })
 
+// The marker is the durable fact that blocks a rebuild, so it is written before the
+// original path can become empty. Each crash point of that order leaves no window:
+// after the marker but before the move the unreadable file is still in place, and a
+// replay quarantines it then; after the move the marker alone refuses the rebuild (#63).
+test('a crash between the marker and the move aside leaves no rebuild window', async t => {
+  const id = candidateIdOf('s1', 'c1')
+  const evidence = '{ the unreadable bytes'
+  // Crash point one: the marker is saved, the file has not moved yet.
+  {
+    const h = harness(t)
+    const dir = join(h.root, 'task-plans')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, `${id}.json`), evidence)
+    writeFileSync(join(dir, `${id}.corrupt`), '{"candidateId":"marked"}\n')
+    const replay = await h.review.enqueue({ ...candidate })
+    assert.equal(replay.status, STATUS.corrupt)
+    assert.equal(replay.quarantined, true)
+    assert.equal(existsSync(join(dir, `${id}.json`)), false, 'no candidate was rebuilt over the evidence')
+    const moved = readdirSync(join(dir, 'corrupt'))
+    assert.equal(moved.length, 1)
+    assert.equal(readFileSync(join(dir, 'corrupt', moved[0]), 'utf8'), evidence)
+    assert.equal(h.calls.extract, 0)
+  }
+  // Crash point two: the file has moved, only the marker is left to answer the replay.
+  {
+    const h = harness(t)
+    const dir = join(h.root, 'task-plans')
+    mkdirSync(join(dir, 'corrupt'), { recursive: true })
+    writeFileSync(join(dir, 'corrupt', `${id}.2026-10-23T00-00-00-000Z.json`), evidence)
+    writeFileSync(join(dir, `${id}.corrupt`), '{"candidateId":"marked"}\n')
+    const replay = await h.review.enqueue({ ...candidate })
+    assert.equal(replay.status, STATUS.corrupt)
+    assert.equal(replay.quarantined, true)
+    assert.equal(existsSync(join(dir, `${id}.json`)), false, 'no candidate was rebuilt')
+    assert.equal(readdirSync(join(dir, 'corrupt')).length, 1, 'the moved evidence was not touched again')
+    assert.equal(h.calls.extract, 0)
+  }
+})
+
+// When the marker itself cannot be persisted the move does not happen: the unreadable
+// file stays in place, untouched, and the failure is reported — never swallowed as a
+// successful quarantine that a later replay could rebuild over (#63).
+test('a quarantine whose marker cannot be saved fails loudly and keeps the file in place', async t => {
+  const h = harness(t)
+  const dir = join(h.root, 'task-plans')
+  const id = candidateIdOf('s1', 'c1')
+  const original = '{ unreadable but present'
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, `${id}.json`), original)
+  mkdirSync(join(dir, `${id}.corrupt`)) // a directory where the marker would go: the write fails
+  const first = await h.review.enqueue({ ...candidate })
+  assert.equal(first.status, STATUS.corrupt)
+  assert.equal(first.markerFailed, true)
+  assert.equal(first.quarantined, undefined)
+  assert.equal(existsSync(join(dir, 'corrupt')), false, 'nothing was moved aside')
+  assert.equal(readFileSync(join(dir, `${id}.json`), 'utf8'), original, 'the unreadable file was left untouched')
+  // The replay answers the same way, and still nothing is rebuilt over the evidence.
+  const replay = await h.review.enqueue({ ...candidate })
+  assert.equal(replay.status, STATUS.corrupt)
+  assert.equal(replay.markerFailed, true)
+  assert.equal(readFileSync(join(dir, `${id}.json`), 'utf8'), original)
+  assert.equal(h.calls.extract, 0)
+})
+
 test('a candidate whose conditions are not met waits without asking the model', async t => {
   const h = harness(t, { check: async () => ({ ok: false, waiting: true }) })
   const { candidateId } = await h.review.enqueue(candidate)
