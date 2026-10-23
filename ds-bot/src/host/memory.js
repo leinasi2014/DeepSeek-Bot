@@ -855,7 +855,7 @@ export function install(rt) {
   // One item, written through the queue exactly as planned: the frozen line and its
   // metadata, never recomputed. Both checks are re-run here because the plan file can be
   // edited by hand between the freeze and the write.
-  function taskReviewApply(item) {
+  function taskReviewApply(item, hooks = {}) {
     return queued(async () => {
       const scope = scopeOfKey(item.scope)
       writable(scope, { id: 'user', name: 'user' })
@@ -866,6 +866,25 @@ export function install(rt) {
       const metaText = Object.entries(metaForSecretCheck(item.meta)).map(([key, value]) => `${key}: ${value}`).join(' ')
       if (secretEntry(item.text) || secretEntry(metaText)) throw Object.assign(new Error('This entry looks like a secret'), { code: 'memory/invalid' })
       const files = loadScope(scope)
+      // #64: everything the review decides on is read inside this critical section —
+      // the committed hashes, the scope's current entries, the link state — through
+      // the hook, together with the write the decision guards. No other memory write
+      // can land between any of them.
+      if (hooks.decide !== undefined) {
+        const names = [...new Set(item.topic === '' ? [MAIN] : [`${item.topic}.md`, MAIN])]
+        const held = new Map(files.map(file => [file.file, file.content]))
+        const hashes = {}
+        for (const name of names) hashes[name] = createHash('sha256').update(held.get(name) ?? '').digest('hex')
+        const entries = allEntries(files).map(entry => ({ file: entry.file.file, topic: entry.file.topic ?? '', text: entry.text, meta: entry.meta ?? {} }))
+        const hasLink = files.some(file => file.file === MAIN && file.links.includes(item.topic))
+        const verdict = await hooks.decide({ hashes, entries, hasLink })
+        if (verdict.kind !== 'proceed') {
+          // The repair link belongs to the same queued job: a second queued call here
+          // would wait behind itself.
+          if (verdict.link !== undefined) await addLinkInner(scope, verdict.link)
+          return { skipped: verdict.kind, file: verdict.file, conflict: verdict.conflict }
+        }
+      }
       const main = files[0]
       const label = taskLabel(scope)
       const same = matchEntries(allEntries(files), item.text).filter(entry => squash(entry.text) === squash(item.text))
@@ -889,16 +908,19 @@ export function install(rt) {
     })
   }
 
+  // The link write itself, plain so a queued job can call it inline (#64): both the
+  // standalone link tool and the review's repair path run inside the queue.
+  async function addLinkInner(scope, topic) {
+    const files = loadScope(scope)
+    const main = files[0]
+    if (main.links.includes(topic)) return
+    const next = joinLines(addLink(main.lines.length > 0 ? main.lines : parseMemory(EMPTY_MAIN).lines, topic))
+    checkSize(main, next, taskLabel(scope))
+    await commit([{ path: main.path, text: next }], { op: 'task-review-link', scope: scopeKey(scope), file: MAIN, link: topic })
+  }
+
   function taskReviewLinkItem(scopeKeyValue, topic) {
-    return queued(async () => {
-      const scope = scopeOfKey(scopeKeyValue)
-      const files = loadScope(scope)
-      const main = files[0]
-      if (main.links.includes(topic)) return
-      const next = joinLines(addLink(main.lines.length > 0 ? main.lines : parseMemory(EMPTY_MAIN).lines, topic))
-      checkSize(main, next, taskLabel(scope))
-      await commit([{ path: main.path, text: next }], { op: 'task-review-link', scope: scopeKey(scope), file: MAIN, link: topic })
-    })
+    return queued(() => addLinkInner(scopeOfKey(scopeKeyValue), topic))
   }
 
   const taskReview = createTaskReview({
