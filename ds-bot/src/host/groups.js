@@ -257,11 +257,34 @@ export function install(rt) {
   const minutesSince = at => Math.max(1, Math.round((Date.now() - at) / 60000))
 
   // A member's message in the round: in the log, for the members after it, and in the
-  // round's replies, for the user.
-  const postInRound = (room, round, member, text) => {
-    appendRoom(room, { who: member.name, botId: member.id, text })
+  // round's replies, for the user. `final` marks the one line that is the turn's answer
+  // rather than something it said on the way. Only such a line is a terminal fact: a
+  // restart may read it as the call being answered, which a step line ("still working")
+  // never is.
+  const postInRound = (room, round, member, text, final = false) => {
+    // The answer and the close of every call to this member go into one snapshot: a host
+    // that died in between would leave an answer on disk with the call it answered still
+    // open, and no later read could tell that apart from a member that never answered.
+    if (final) rt.closeRoomCalls?.(room.id, member.id)
+    appendRoom(room, { who: member.name, botId: member.id, text, ...(final ? { final: true } : {}) })
     round.replies.push({ botId: member.id, name: member.name, color: member.color, text, time: Date.now() })
     void rt.save().catch(() => {})
+  }
+  // The last thing a member wrote in this group is its answer after all: its turn ended
+  // with the steps and nothing more. Marking that line keeps the log's terminal fact true
+  // — a restart reads only marked lines as an answer, never a step spoken mid-turn. The
+  // marked line and the calls it settles are saved in one snapshot, so the two can never
+  // be read apart.
+  const markLastLineFinal = (room, memberId) => {
+    for (let at = room.log.length - 1; at >= 0; at -= 1) {
+      const line = room.log[at]
+      if (line.botId !== memberId || line.kind !== undefined || line.final === true) continue
+      room.log[at] = { ...line, final: true }
+      rt.closeRoomCalls?.(room.id, memberId)
+      void rt.save().catch(() => {})
+      return true
+    }
+    return false
   }
 
   // One member turn inside the room; resolves to its final text, `{ failure }` when its
@@ -494,7 +517,10 @@ export function install(rt) {
         round.replies.push({ kind: 'working', botId: member.id, name: member.name, color: member.color, time: Date.now() })
       } else if (final !== undefined || (typeof reply === 'string' && said.length > 0)) {
         slot.status = 'posted'
-        if (final !== undefined) postInRound(room, round, member, final)
+        if (final !== undefined) postInRound(room, round, member, final, true)
+        // It ended on what it already said: that last step is the answer the group gets,
+        // so it is marked as such and the calls to this member are settled with it.
+        else markLastLineFinal(room, member.id)
       } else {
         slot.status = typeof reply === 'string' ? 'passed' : 'missed'
         round.passed.push(member.name)
@@ -794,16 +820,17 @@ export function install(rt) {
   // and its answer closes the call by the ordinary late path.
   //
   // Two other shapes are read from what is on disk rather than guessed from empty
-  // process-local maps: a member line after the call means the member did answer and only
-  // the close was lost, so the call is settled; a call whose member, group or Bot is gone
-  // is settled by handoffs' load hook. The ask is noted in the work (`recovered`) and its
-  // exchange id is fixed, so a restart loop asks once and a queued ask is not sent twice.
+  // process-local maps: a line the member's turn ended on (marked `final` — a terminal
+  // answer, never a "still working" step) after the call means the member did answer and
+  // only the close was lost, so the call is settled; a call whose member, group or Bot is
+  // gone is settled by handoffs' load hook. The ask is noted in the work (`recovered`) and
+  // its exchange id is fixed, so a restart loop asks once and a queued ask is not sent twice.
   async function recoverRoomCalls() {
     for (const call of rt.roomCallsAwaiting?.() ?? []) {
       const room = rt.roomOf(call.room)
       const member = rt.botOf(call.to)
       if (room === undefined || member === undefined || !room.members.includes(member.id)) continue
-      if (call.since !== undefined && (room.log ?? []).some(line => line.botId === member.id && line.seq > call.since)) {
+      if (call.since !== undefined && (room.log ?? []).some(line => line.final === true && line.botId === member.id && line.seq > call.since)) {
         rt.closeRoomCall?.(room.id, call.from, member.id)
         continue
       }

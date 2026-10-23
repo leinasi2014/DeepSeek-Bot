@@ -43,21 +43,24 @@ const TEAM = {
 
 const HISTORY = {
   'desk-chief': [
-    { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '@Chief 安排一下发布说明.' }] } } },
-    { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '@Writer @Tester 一起看发布说明，测试 12/12 通过。' }] } } } },
+    { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '@Chief 记一下：发布说明一律由 Writer 写，测试必须 12/12 通过才发。' }] } } },
+    { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '@Writer 按这个来，测试 12/12 通过后再发。' }] } } } },
   ],
   'desk-writer': [
     { event: { seq: 10, type: 'user/message', data: { source: { kind: 'bot', role: 'room' }, content: [{ type: 'text', text: '你的回合' }] } } },
     { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '写好了，测试 12/12 通过。' }] } } } },
   ],
   'desk-tester': [
-    { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '请复核发布说明，测试 12/12 通过。' }] } } },
+    { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '记住：发布说明一律由 Writer 写，测试必须 12/12 通过才发。' }] } } },
     { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '复核中。' }] } } } },
   ],
 }
 
 const ITEM = [{ claim: 0, topic: '', text: '发布说明由 Writer 写，测试通过后再发', outcome: 'verified' }]
-const CLAIM = { kind: 'command', statement: '发布脚本跑通了，测试 12/12 通过', evidence: '测试 12/12 通过', ref: 'part 1 #11' }
+// The evidence is a decision the user really stated in the group, quoted verbatim from
+// its own line: `kind: 'user'` is the one kind that is not a Bot's report of its own run,
+// so a waiting case does not lean on the tool-result gate (#66) to be believed.
+const CLAIM = { kind: 'user', statement: '发布说明一律由 Writer 写，测试 12/12 通过才发', evidence: '发布说明一律由 Writer 写，测试必须 12/12 通过才发', ref: 'part 1 #10' }
 const report = { result: '完成发布说明安排', claims: [CLAIM], notes: '' }
 
 async function start(t, { home: existing } = {}) {
@@ -191,7 +194,7 @@ test('the admins @all opens a call for every member the round will ask', async t
   const s = await start(t)
   const stop = new AbortController()
   t.after(() => stop.abort())
-  s.emit('desk', 'user/message', { content: [{ type: 'text', text: '@Chief 安排一下发布说明.' }], source: { kind: 'user' } })
+  s.emit('desk', 'user/message', { content: [{ type: 'text', text: '@Chief 记一下：发布说明一律由 Writer 写，测试必须 12/12 通过才发。' }], source: { kind: 'user' } })
   void s.tool('group_relay', {}, 'desk', 'relay-all', { signal: stop.signal }).catch(() => {})
 
   await called(s, 'desk-chief')
@@ -305,7 +308,7 @@ test('a call whose member was removed is settled when the team loads', async t =
   const first = await start(t, { home })
   const stop = new AbortController()
   t.after(() => stop.abort())
-  first.emit('desk', 'user/message', { content: [{ type: 'text', text: '@Chief 安排一下发布说明.' }], source: { kind: 'user' } })
+  first.emit('desk', 'user/message', { content: [{ type: 'text', text: '@Chief 记一下：发布说明一律由 Writer 写，测试必须 12/12 通过才发。' }], source: { kind: 'user' } })
   void first.tool('group_relay', {}, 'desk', 'relay-removed', { signal: stop.signal }).catch(() => {})
   await called(first, 'desk-chief')
   first.begin('desk-chief')
@@ -342,7 +345,7 @@ test('a call saved but never asked is asked again after a restart, and the repor
   const first = await start(t, { home })
   const stop = new AbortController()
   t.after(() => stop.abort())
-  first.emit('desk', 'user/message', { content: [{ type: 'text', text: '@Chief 安排一下发布说明.' }], source: { kind: 'user' } })
+  first.emit('desk', 'user/message', { content: [{ type: 'text', text: '@Chief 记一下：发布说明一律由 Writer 写，测试必须 12/12 通过才发。' }], source: { kind: 'user' } })
   void first.tool('group_relay', {}, 'desk', 'relay-unasked', { signal: stop.signal }).catch(() => {})
   await called(first, 'desk-chief')
   first.begin('desk-chief')
@@ -389,7 +392,7 @@ test('a call saved but never asked is settled after a restart when its member wa
   const first = await start(t, { home })
   const stop = new AbortController()
   t.after(() => stop.abort())
-  first.emit('desk', 'user/message', { content: [{ type: 'text', text: '@Chief 安排一下发布说明.' }], source: { kind: 'user' } })
+  first.emit('desk', 'user/message', { content: [{ type: 'text', text: '@Chief 记一下：发布说明一律由 Writer 写，测试必须 12/12 通过才发。' }], source: { kind: 'user' } })
   void first.tool('group_relay', {}, 'desk', 'relay-unasked-gone', { signal: stop.signal }).catch(() => {})
   await called(first, 'desk-chief')
   first.begin('desk-chief')
@@ -412,9 +415,14 @@ test('a call saved but never asked is settled after a restart when its member wa
   assert.match(second.memoryOf('chief'), /发布说明由 Writer 写/)
 })
 
-// The other crash window: the member did answer, its line is on disk, and the close that
-// would have deleted the call never landed. After a restart the call is settled from the
-// log — not asked again, and not left waiting.
+// The other crash window: the member did answer and its line is on disk, while the close
+// that would have deleted the call never landed. After a restart the call is settled from
+// the log — not asked again, and not left waiting.
+//
+// The forward path saves the answer and the close in one snapshot, so this state can only
+// come from a save that was cut in two. It is planted here from the real run: the same
+// final line, the same key, exactly the shape the pre-fix product left when it saved the
+// answer first and the close second.
 test('a call whose member already answered is settled after a restart instead of asked again', async t => {
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-group-book-answered-'))
   t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }))
@@ -423,7 +431,7 @@ test('a call whose member already answered is settled after a restart instead of
   const first = await start(t, { home })
   const stop = new AbortController()
   t.after(() => stop.abort())
-  first.emit('desk', 'user/message', { content: [{ type: 'text', text: '@Chief 安排一下发布说明.' }], source: { kind: 'user' } })
+  first.emit('desk', 'user/message', { content: [{ type: 'text', text: '@Chief 记一下：发布说明一律由 Writer 写，测试必须 12/12 通过才发。' }], source: { kind: 'user' } })
   void first.tool('group_relay', {}, 'desk', 'relay-answered', { signal: stop.signal }).catch(() => {})
   await called(first, 'desk-chief')
   first.begin('desk-chief')
@@ -434,24 +442,76 @@ test('a call whose member already answered is settled after a restart instead of
   first.idle('desk-chief')
   await until(() => first.plans()[0]?.status === 'WAITING')
 
-  // Writer answers in the group through the product's own step path, which writes its
-  // line into the log and saves it while the round still waits for the turn to end. The
-  // host goes down before that turn ends, so the round's closing pass never runs.
+  // Writer's turn really ends with its answer: the line is marked final and the call is
+  // closed in the same save, so the two can never be read apart.
   await called(first, 'desk-writer')
   first.begin('desk-writer')
-  await first.say('desk-writer', '写好了，测试 12/12 通过。')
+  first.finish('desk-writer', '写好了，测试 12/12 通过。')
+  await until(() => first.roomCalls().length === 0, () => JSON.stringify(first.roomCalls()))
+  await first.ctx.dispose()
+  const saved = JSON.parse(readFileSync(join(home, 'state.json'), 'utf8'))
+  const answer = saved.rooms.desk.log.find(line => line.botId === 'writer' && line.text.includes('写好了'))
+  assert.equal(answer?.final, true, 'the answer line is marked as the turn\'s end, not a step')
+  assert.equal(saved.works['room:desk:chief:writer'], undefined, 'the close landed with the answer in one snapshot')
+
+  // The interrupted-write shape: the answer is on disk, the close never landed. `since` is
+  // the log position the call was opened at, as every call records it.
+  saved.works['room:desk:chief:writer'] = { from: 'chief', to: 'writer', room: 'desk', since: 0, open: [], results: [], at: Date.now() - 1000 }
+  writeFileSync(join(home, 'state.json'), JSON.stringify(saved))
+
+  const second = await start(t, { home })
+  await until(() => second.roomCalls().length === 0, () => JSON.stringify(second.roomCalls()))
+  assert.equal(second.agentOf('desk-writer').calls.some(call => String(call.source?.exchangeId ?? '').startsWith('room-recover:')), false, 'a member that already answered is not asked again')
+  second.idle('chief')
+  await until(() => second.plans()[0]?.status === 'DONE', () => `status=${second.plans()[0]?.status}`)
+  assert.match(second.memoryOf('chief'), /发布说明由 Writer 写/)
+})
+
+// A step line is not an answer. A member that says "I have started, the task is still
+// running" and then loses its host has not finished: the call stays open across the
+// restart, the report keeps waiting, and only the member's real turn end settles it.
+test('a step line before a restart does not settle the call; its answer still does', async t => {
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-group-book-progress-'))
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }))
+  writeFileSync(join(home, 'state.json'), JSON.stringify(TEAM))
+
+  const first = await start(t, { home })
+  const stop = new AbortController()
+  t.after(() => stop.abort())
+  first.emit('desk', 'user/message', { content: [{ type: 'text', text: '@Chief 记一下：发布说明一律由 Writer 写，测试必须 12/12 通过才发。' }], source: { kind: 'user' } })
+  void first.tool('group_relay', {}, 'desk', 'relay-progress', { signal: stop.signal }).catch(() => {})
+  await called(first, 'desk-chief')
+  first.begin('desk-chief')
+  await first.say('desk-chief', '@Writer 写发布说明，测试 12/12 通过。')
+  await first.tool('complete_task', report, 'desk-chief', 'report-progress')
+  first.finish('desk-chief', '@Writer 写发布说明，测试 12/12 通过。')
+  first.idle('desk-chief')
+  await until(() => first.plans()[0]?.status === 'WAITING')
+
+  await called(first, 'desk-writer')
+  first.begin('desk-writer')
+  await first.say('desk-writer', '已经开始检查，任务仍在执行。')
   await new Promise(resolve => setTimeout(resolve, 150))
   await first.ctx.dispose()
   const state = JSON.parse(readFileSync(join(home, 'state.json'), 'utf8'))
-  assert.equal(state.rooms.desk.log.some(line => line.botId === 'writer' && line.text.includes('写好了')), true, 'the answer line is on disk')
-  assert.equal(state.works['room:desk:chief:writer'] !== undefined, true, 'the close never landed, so the call is still in the book')
+  const step = state.rooms.desk.log.find(line => line.botId === 'writer' && line.text.includes('已经开始检查'))
+  assert.equal(step !== undefined, true, 'the step line is on disk')
+  assert.notEqual(step?.final, true, 'a step line is never the turn\'s end')
+  assert.equal(state.works['room:desk:chief:writer'] !== undefined, true, 'the call is still in the book')
 
   const second = await start(t, { home })
-  // Settled from the log: the call is closed and no recovery brief is sent. (The cut-off
-  // turn itself is a separate note in inflight.json and may still be picked up; that is
-  // the ordinary resume path, not this call.)
+  await new Promise(resolve => setTimeout(resolve, 400))
+  assert.deepEqual(second.roomCalls(), ['room:desk:chief:writer'], 'a progress line is not a terminal answer; the call must remain open')
+  second.idle('chief')
+  await new Promise(resolve => setTimeout(resolve, 200))
+  assert.equal(second.plans()[0]?.status, 'WAITING', 'the report still waits')
+  assert.equal(second.memoryOf('chief'), '', 'nothing is written on a progress line')
+
+  // The real end of the member's turn after the restart settles it.
+  await called(second, 'desk-writer')
+  second.begin('desk-writer')
+  second.finish('desk-writer', '写好了，测试 12/12 通过。')
   await until(() => second.roomCalls().length === 0, () => JSON.stringify(second.roomCalls()))
-  assert.equal(second.agentOf('desk-writer').calls.some(call => String(call.source?.exchangeId ?? '').startsWith('room-recover:')), false, 'a member that already answered is not asked again')
   second.idle('chief')
   await until(() => second.plans()[0]?.status === 'DONE', () => `status=${second.plans()[0]?.status}`)
   assert.match(second.memoryOf('chief'), /发布说明由 Writer 写/)
@@ -469,7 +529,7 @@ test('a call whose member is still in the group survives a restart and settles w
   const first = await start(t, { home })
   const stop = new AbortController()
   t.after(() => stop.abort())
-  first.emit('desk', 'user/message', { content: [{ type: 'text', text: '@Chief 安排一下发布说明.' }], source: { kind: 'user' } })
+  first.emit('desk', 'user/message', { content: [{ type: 'text', text: '@Chief 记一下：发布说明一律由 Writer 写，测试必须 12/12 通过才发。' }], source: { kind: 'user' } })
   void first.tool('group_relay', {}, 'desk', 'relay-alive', { signal: stop.signal }).catch(() => {})
   await called(first, 'desk-chief')
   first.begin('desk-chief')

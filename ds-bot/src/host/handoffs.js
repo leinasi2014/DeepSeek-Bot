@@ -113,6 +113,18 @@ export function install(rt) {
     delete works()[id]
     save()
   }
+  // Every call to `to` in this group, settled without a save of its own: the caller's
+  // next save carries the close and the line that answered it in one snapshot, so a
+  // host that dies in between cannot leave an answer on disk with its call still open.
+  function closeRoomCalls(roomId, to) {
+    let closed = 0
+    for (const [id, work] of Object.entries(works())) {
+      if (work === undefined || work.room !== roomId || work.to !== to) continue
+      delete works()[id]
+      closed += 1
+    }
+    return closed
+  }
   // A call nobody will answer here: the round passed this member over (it had used its
   // turns), or the member, its group or its Bot is gone for good. Same key as the call
   // that was opened, so the pairing cannot drift.
@@ -273,7 +285,7 @@ export function install(rt) {
     return lines.join('; ')
   }
 
-  Object.assign(rt, { workOf, openWork, closeWork, dropWork, takenWork: taken, ownsWork: owns, waitsWork: waits, pendingWork: pending, spawnedBy, openRoomCall, closeRoomCall, dropRoomCall, reconcileRoomCalls, roomCallsAwaiting, markRoomCallRecovered, holdWork: hold, workAsker: askedBy, answerText, upstreamOf, sameWork, forgetBotWork: forgetBot, statusOf, waitingView })
+  Object.assign(rt, { workOf, openWork, closeWork, dropWork, takenWork: taken, ownsWork: owns, waitsWork: waits, pendingWork: pending, spawnedBy, openRoomCall, closeRoomCall, closeRoomCalls, dropRoomCall, reconcileRoomCalls, roomCallsAwaiting, markRoomCallRecovered, holdWork: hold, workAsker: askedBy, answerText, upstreamOf, sameWork, forgetBotWork: forgetBot, statusOf, waitingView })
 
   // Once the team is on disk, calls whose member can no longer answer are settled, so a
   // report does not wait on a group or a Bot that is gone. Same load hook the task review
