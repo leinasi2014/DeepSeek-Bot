@@ -73,8 +73,11 @@ export const metaForSecretCheck = meta => Object.fromEntries(Object.entries(meta
 //   `{ ok: true, project }`, `{ ok: false, waiting: true }` or `{ ok: false, dropped }`.
 // - `extract(candidate)` asks the model for the claims once; resolves
 //   `{ items: [...] }` or `{ invalid: reason }`.
-// - `applyItem(item)` writes one entry through the memory queue and resolves
-//   `{ changed, file }`; it throws `memory/full` when the file is full.
+// - `applyItem(item, hooks)` writes one entry through the memory queue and resolves
+//   `{ changed, file }`; it throws `memory/full` when the file is full. `hooks` carries
+//   `record` (the candidate, for the standing re-check #70 makes in the queued job) and
+//   `decide` (#64's in-queue hook: fresh hashes/entries/hasLink, and the persisted
+//   pre-write state); the second argument is a hooks bag, never the record alone.
 // - `linkTopic(scope, topic)` adds the missing `[[topic]]` link to MEMORY.md.
 // - `readScope(scope)` and `parse(content)`/`format(text, meta)` are the memory module's
 //   own committed reader and entry format, so recovery compares exactly what it wrote.
@@ -321,23 +324,19 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
   // only decides status. Every read the decision needs — the scope's current entries, the
   // pre-write hashes, the link state — happens inside the memory write queue, in the same
   // critical section as the write itself, through the hook below: nothing can move under
-  // the decision, and no queue-outside snapshot goes stale (#64). The candidate's standing
-  // is re-checked in that same section (#70): a candidate can wait hours between its freeze
-  // and its last item, and the Bot, the conversation, the group, the configuration or the
-  // project may have changed in between.
-  async function applyOne(record, item, check) {
+  // the decision, and no queue-outside snapshot goes stale (#64). `applyItem` is given the
+  // candidate as `hooks.record` beside that hook; it re-checks the Bot, the conversation,
+  // the group, the configuration and the project in that same queued job, because a
+  // candidate can wait hours between its freeze and its last item (#70). The hook itself
+  // stays exactly what #64 made it: fresh entries/hashes/hasLink, and the persisted
+  // pre-write state.
+  async function applyOne(record, item) {
     if (isDone(record, item.reviewId)) return { kind: 'done', skipped: true }
     let result
     try {
       result = await applyItem(item, {
         record,
         decide: async ({ hashes, entries, hasLink }) => {
-          const standing = await check(record)
-          if (standing?.ok !== true) {
-            return standing?.waiting === true
-              ? { kind: 'waiting', file: null }
-              : { kind: 'stale', file: null, staleReason: String(standing?.reason ?? 'check-refused') }
-          }
           // The id says an entry is the one this plan made. Only the exact frozen line
           // counts: a user edit keeps the id but changes the line, and that must not
           // be overwritten. A missing topic link is repaired in the same queued job.
@@ -383,8 +382,6 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
         record.progress.conflicts.push(result.conflict)
         return { kind: 'conflict', file: result.file }
       }
-      if (result.skipped === 'waiting') return { kind: 'waiting' }
-      if (result.skipped === 'stale') return { kind: 'stale', reason: String(result.staleReason ?? 'check-refused') }
       markDone(record, item.reviewId, result.file)
       if (result.skipped === 'done') return { kind: 'done', repaired: true, file: result.file }
       return { kind: 'deduplicated', file: result.file, explained: 'same text elsewhere in the scope' }
@@ -405,9 +402,9 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
   // is not undone), then the Markdown is checked by review id, and only then is anything
   // written — all inside the memory write queue, per item. A conflict stops the whole
   // candidate: it needs a person to look.
-  async function applyPlan(record, check) {
+  async function applyPlan(record) {
     for (const item of record.plan.items) {
-      const outcome = await applyOne(record, item, check)
+      const outcome = await applyOne(record, item)
       if (outcome.kind === 'conflict') {
         record.status = STATUS.conflict
         record.conflictAt = now()
@@ -508,7 +505,7 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
     }
     record.status = STATUS.applying
     await write(record)
-    await applyPlan(record, check)
+    await applyPlan(record)
     return record
   }
 

@@ -18,6 +18,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { createRuntime } from '../index.js'
+import { taskReview } from '../src/host/task-review.js'
+import { formatEntry, parseMemory } from '../src/host/memory.js'
 import { fakeContext } from './fake-ctx.js'
 
 const TEAM = {
@@ -333,6 +335,41 @@ test('a frozen plan waits while its project is unreadable and finishes in the sa
   assert.equal(s.plans()[0].plan.items[0].scope, frozen)
   assert.equal(s.extractionCalls(), 1, 'a frozen plan is never extracted again')
   assert.match(s.projectMemory(alpha.hash), /发布用 scripts\/ship\.sh/)
+})
+
+// The second argument of `applyItem` is the shared interface #64 introduced: a hooks bag
+// carrying `decide` (fresh hashes/entries/hasLink, and the persisted pre-write state) —
+// #70 adds `record` beside it for its standing re-check and must never replace the bag
+// with the record alone. This pins that contract at the module boundary (#70, #64).
+test('applyItem is called with a hooks bag: record beside the decide hook, never the record alone', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'ds-bot-binding-hooks-'))
+  t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }))
+  const seen = []
+  const review = taskReview({
+    root,
+    check: async () => ({ ok: true, project: 'project:a' }),
+    extract: async () => ({ items: [{ scope: 'project:a', text: '用脚本发布', outcome: 'verified', source: 'part 1 #2' }] }),
+    applyItem: async (item, hooks) => {
+      seen.push({ item, hooks })
+      const verdict = await hooks.decide({ hashes: { 'MEMORY.md': 'h' }, entries: [], hasLink: true })
+      assert.equal(verdict.kind, 'proceed', 'the #64 hook still decides inside the queued job')
+      return { changed: true, file: 'MEMORY.md' }
+    },
+    linkTopic: async () => {},
+    readScope: () => [{ file: 'MEMORY.md', topic: '', content: '# Memory\n\n## Index\n' }],
+    parse: parseMemory,
+    format: formatEntry,
+    now: () => '2026-10-23T00:00:00.000Z',
+  })
+  const record = await review.enqueue({ botId: 'b1', sessionId: 's1', roomId: null, project: 'project:a', projectKind: 'ok', cwd: null, callId: 'c-hooks', result: 'done', claims: [], notes: '' })
+  const done = await review.process(record.candidateId)
+  assert.equal(done.status, 'DONE')
+  assert.equal(seen.length, 1)
+  const [call] = seen
+  assert.equal(typeof call.hooks, 'object', 'the second argument is a hooks bag')
+  assert.equal(typeof call.hooks.decide, 'function', '#64 decide is still there')
+  assert.equal(call.hooks.record?.candidateId, record.candidateId, '#70 record travels beside it')
+  assert.notEqual(call.hooks, call.hooks.record, 'the bag is not the record itself')
 })
 
 test('a candidate whose Bot left the group is dropped instead of written', async t => {
