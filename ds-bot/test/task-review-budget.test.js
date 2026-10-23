@@ -118,8 +118,11 @@ test('a small report is asked about exactly as it was recorded', async t => {
   t.after(() => s.stop())
   await s.tool('complete_task', { result: 'ran the release', notes: 'one note', claims: [{ kind: 'user', statement: 'the user wants the release script run first', evidence: 'Please run the release script now.', ref: 'part 1 #1' }] }, 'c-small')
   s.idle()
-  await until(() => s.requests.length >= 1)
-  const body = String(s.requests[0].messages[0].content[0].text)
+  // The review and the extraction both run off the same idle, and which reaches the model
+  // first is not promised; pick the extraction by what it asks, not by arrival order.
+  const extraction = () => s.requests.find(r => String(r.system).startsWith('You turn a reported'))
+  await until(() => extraction() !== undefined, () => `requests=${s.requests.map(r => String(r.system).slice(0, 24)).join(' | ')}`)
+  const body = String(extraction().messages[0].content[0].text)
   assert.match(body, /^The Bot reported: ran the release\nNotes: one note\nClaims: \[\{"index":0,"kind":"user","statement":"the user wants the release script run first","evidence":"Please run the release script now\.","ref":"part 1 #1"\}\]/)
   // The conversation lines keep their speaker, and a tool line names its tool.
   assert.match(body, /\nConversation lines \(oldest first\):\n/)
