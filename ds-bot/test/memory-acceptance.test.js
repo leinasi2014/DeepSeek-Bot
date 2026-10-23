@@ -23,7 +23,8 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
+import { createHash } from 'node:crypto'
 
 // --- scope: real assertions over the merged #52 (design §7 rows not covered by
 // test/memory-project.test.js: the panel write path, the project list of a Bot,
@@ -114,6 +115,121 @@ test('scope: the panel project list is server-computed from the Bot\'s own sessi
   // The host names each project; the panel shows that name and never derives one (#61).
   assert.deepEqual(view.projects, [{ hash: alpha.hash, root: alpha.root, session: 'sA', name: 'alpha' }])
   // sLost resolves to nothing, so it never appears as a project choice.
+})
+
+// The summary side of the same fixture (#71): the canned model records every request it
+// answers, `uiLanguage` is fixed so the fingerprint's language term is stable, and a
+// project's memory file can be seeded directly. A project's entries belong in the
+// summary request, and a cache written by an older request must not keep serving a
+// summary that lacks them.
+function startSummaryBench(t, replies = []) {
+  const ctx = fakeContext()
+  const requests = []
+  Object.assign(ctx, {
+    llm: {
+      listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }],
+      resolveModelInfo: async () => ({ reasoning: { efforts: [{ id: 'off' }] } }),
+      async* stream(request) {
+        requests.push(request)
+        const reply = await replies.shift()
+        if (reply instanceof Error) throw reply
+        yield { type: 'text-delta', index: 0, text: reply ?? '' }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    },
+  })
+  const home = mkdtempSync(join(tmpdir(), '.dsh-test-memory-sum-'))
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 5 }))
+  const rt = {
+    ctx, home, config: { memoryReview: false }, state: { rooms: {} },
+    load: async () => {}, readOnly: () => undefined, warn: () => {},
+    desiredModel: async () => undefined, defaultModel: async () => 'deepseek/v4',
+    botOf: id => scopeBots[id], findBot: name => Object.values(scopeBots).find(bot => bot.name === name),
+    selfOf: id => (id === 'sB' ? 'b3' : 'b2'), isMain: () => false,
+    chatOf: botId => `chat-${botId}`, groupSessionsOf: () => [],
+    sessionsOfBot: id => (id === 'b3' ? ['sB'] : ['sA', 'sLost']),
+    groupOwners: new Map(), roomOf: () => undefined, partsOf: id => [{ sessionId: id }],
+    clock: () => '12:00', teamFolder: () => join(scopeWork, 'team'),
+    sessionFolder: session => scopeSessions[session?.id ?? session]?.header?.cwd,
+    uiLanguage: () => 'Chinese',
+    async* eventsBackwards() {},
+  }
+  installProjectScope(rt)
+  installMemory(rt)
+  return {
+    home, rt, requests,
+    endpoint: (endpoint, body) => rt.memoryEndpoint(endpoint, body),
+    text: () => String(requests.at(-1)?.messages?.[0]?.content?.[0]?.text ?? ''),
+    writeEntry: (scope, text) => {
+      const dir = join(home, 'memory', 'projects', scope.hash)
+      mkdirSync(dir, { recursive: true })
+      writeFileSync(join(dir, 'MEMORY.md'), `# Memory\n\n- ${text}\n\n## Index\n`)
+    },
+    memoryFiles: () => {
+      const root = join(home, 'memory', 'projects')
+      const listing = {}
+      for (const name of existsSync(root) ? readdirSync(root) : []) {
+        const file = join(root, name, 'MEMORY.md')
+        listing[name] = existsSync(file) ? readFileSync(file, 'utf8') : ''
+      }
+      return listing
+    },
+  }
+}
+
+const summarySettle = () => new Promise(resolve => setTimeout(resolve, 20))
+async function summarized(endpoint, body) {
+  for (let tries = 0; tries < 200; tries += 1) {
+    if ((await endpoint('memory-view', body)).summarizing === false) return
+    await summarySettle()
+  }
+  throw new Error('the memory summary did not finish')
+}
+
+test('scope: the summary request restates the selected project\'s entries, and only that project\'s', async t => {
+  const s = startSummaryBench(t, ['## A\nAlpha project.', '## B\nBeta project.'])
+  s.writeEntry(s.rt.projectScope.resolve(scopeSessions.sA), 'Alpha deploys with a script')
+  s.writeEntry(s.rt.projectScope.resolve(scopeSessions.sB), 'Beta deploys on Fridays')
+  await s.endpoint('memory-view', { botId: 'b2', session: 'sA', summarize: true })
+  await summarized(s.endpoint, { botId: 'b2', session: 'sA' })
+  assert.match(s.text(), /then the project memory of alpha that every Bot working in that project shares/)
+  assert.match(s.text(), /## Project memory of alpha\n- Alpha deploys with a script/)
+  assert.ok(!s.text().includes('Beta deploys'), "the other project's entries stay out")
+  await s.endpoint('memory-view', { botId: 'b3', session: 'sB', summarize: true })
+  await summarized(s.endpoint, { botId: 'b3', session: 'sB' })
+  assert.match(s.text(), /## Project memory of beta\n- Beta deploys on Fridays/)
+  assert.ok(!s.text().includes('Alpha deploys'), "the other project's entries stay out")
+})
+
+test('scope: a summary cached by an older fingerprint is rewritten with the project entries, in place', async t => {
+  const s = startSummaryBench(t, ['## Overview\nThe alpha project memory is in.'])
+  const alpha = s.rt.projectScope.resolve(scopeSessions.sA)
+  s.writeEntry(alpha, 'Alpha deploys with a script')
+  // The cache an older build left behind: same entries, but the fingerprint of the
+  // request that had no project section (no version term, #71).
+  const key = `b2|bot:b2,project:${alpha.hash},team`
+  const file = join(s.home, 'memory', 'summaries', `b2-${createHash('sha256').update(key).digest('hex').slice(0, 8)}.json`)
+  const oldHash = createHash('sha256').update(JSON.stringify(['Chinese', [], [], ['- Alpha deploys with a script']])).digest('hex')
+  mkdirSync(join(s.home, 'memory', 'summaries'), { recursive: true })
+  writeFileSync(file, JSON.stringify({ hash: oldHash, scopes: key.slice(key.indexOf('|') + 1), text: 'Old summary without the project.', at: 1 }))
+  const before = s.memoryFiles()
+  const stale = await s.endpoint('memory-view', { botId: 'b2', session: 'sA', summarize: true })
+  assert.equal(stale.fresh, false, 'a cache from the older request is not fresh')
+  await summarized(s.endpoint, { botId: 'b2', session: 'sA' })
+  const done = await s.endpoint('memory-view', { botId: 'b2', session: 'sA' })
+  assert.equal(done.fresh, true)
+  assert.equal(done.summary.text, '## Overview\nThe alpha project memory is in.')
+  assert.match(s.text(), /## Project memory of alpha\n- Alpha deploys with a script/)
+  // The old file was replaced in place: still one file under the same name, a new
+  // fingerprint inside it, and the memory itself untouched.
+  const dir = join(s.home, 'memory', 'summaries')
+  assert.deepEqual(readdirSync(dir), [basename(file)])
+  assert.notEqual(JSON.parse(readFileSync(file, 'utf8')).hash, oldHash)
+  assert.deepEqual(s.memoryFiles(), before)
+  // The same input reads the cache now: no further model call.
+  assert.equal(s.requests.length, 1)
+  await s.endpoint('memory-view', { botId: 'b2', session: 'sA', summarize: true })
+  assert.equal(s.requests.length, 1)
 })
 
 // The review path over the fixed #52 (d4ca7d9): the architect's regression covers
