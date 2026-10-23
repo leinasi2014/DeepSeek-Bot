@@ -375,16 +375,26 @@ const teamRule = (main, writer) => (main
 
 const SUMMARY_SYSTEM = 'You write the memory summary that a user reads in the memory panel of DS Bot, an app where a team of AI Bots works for the user. You only restate saved memory entries; you never add to them.'
 
-const summaryRequest = ({ name, own, team, language }) => [
-  `Here is everything ${name} remembers: its own memory, then the team memory that every Bot shares. Each line is one entry; [[name]] is a topic.`,
+// Bumped when the summary request changes shape, so a summary saved by an older
+// request no longer matches the fingerprint and is written again (#71: project
+// entries joined the request; entries alone did not change).
+const SUMMARY_VERSION = 2
+
+const summaryRequest = ({ name, own, team, project, language }) => [
+  `Here is everything ${name} remembers: its own memory, then the team memory that every Bot shares${project === undefined ? '' : `, then the project memory of ${project.name} that every Bot working in that project shares`}. Each line is one entry; [[name]] is a topic.`,
   '',
   `## ${name}'s memory`,
   ...(own.length > 0 ? own : ['(nothing)']),
   '',
   '## Team memory',
   ...(team.length > 0 ? team : ['(nothing)']),
+  ...(project === undefined ? [] : [
+    '',
+    `## Project memory of ${project.name}`,
+    ...(project.lines.length > 0 ? project.lines : ['(nothing)']),
+  ]),
   '',
-  `Write the summary in ${language}, speaking to the user as "you" about what ${name} knows. Use two to five sections. Each section is a line starting with "## " and a short heading, then one short paragraph of plain sentences: no lists, no bold, no tables. Start with an overview of one sentence that says what kinds of things are saved, and leave the facts to the sections after it: never say the same fact twice. Group related entries; facts from the team memory go in their own section that says the whole team shares them. Write only what the entries say: no guesses, no advice, no sources or dates, nothing before the first heading or after the last paragraph.`,
+  `Write the summary in ${language}, speaking to the user as "you" about what ${name} knows. Use two to five sections. Each section is a line starting with "## " and a short heading, then one short paragraph of plain sentences: no lists, no bold, no tables. Start with an overview of one sentence that says what kinds of things are saved, and leave the facts to the sections after it: never say the same fact twice. Group related entries; facts from the team memory go in their own section that says the whole team shares them${project === undefined ? '' : ', and facts from the project memory go in their own section that names the project'}. Write only what the entries say: no guesses, no advice, no sources or dates, nothing before the first heading or after the last paragraph.`,
 ].join('\n')
 
 const ASK_SYSTEM = [
@@ -1688,9 +1698,11 @@ export function install(rt) {
   const linesFor = files => allEntries(files).map(entry => `- ${entry.file.topic ? `[[${entry.file.topic}]] ` : ''}${entry.text}`)
 
   function startSummary(bot, own, team, project, language, hash, key) {
+    // `project` is `{ name, lines }` for the project the panel reads, or undefined:
+    // its entries belong in the summary, not only the Bot's own and the team's (#71).
     const model = bot.model
     const job = (async () => {
-      const text = await botShot(bot, SUMMARY_SYSTEM, summaryRequest({ name: bot.name, own: linesFor(own), team: linesFor(team), language }), { sessionId: rt.chatOf(bot.id), kind: 'memory' })
+      const text = await botShot(bot, SUMMARY_SYSTEM, summaryRequest({ name: bot.name, own: linesFor(own), team: linesFor(team), project, language }), { sessionId: rt.chatOf(bot.id), kind: 'memory' })
       const value = { hash, scopes: key.slice(key.indexOf('|') + 1), text: text.slice(0, SUMMARY_TEXT_MAX), at: Date.now() }
       summaries.set(key, value)
       summaryFailures.delete(key)
@@ -1748,13 +1760,16 @@ export function install(rt) {
     }
     const entries = [...panelEntries(own, 'own'), ...panelEntries(team, 'team'), ...(project === undefined ? [] : panelEntries(project, 'project'))]
     const language = languageNow()
-    const hash = createHash('sha256').update(JSON.stringify([language, linesFor(own), linesFor(team), project === undefined ? [] : linesFor(project)])).digest('hex')
+    const projectLines = project === undefined ? [] : linesFor(project)
+    // The version sits in the fingerprint next to the entries: a request that changed
+    // shape must replace a summary even when every entry stayed the same (#71).
+    const hash = createHash('sha256').update(JSON.stringify([SUMMARY_VERSION, language, linesFor(own), linesFor(team), projectLines])).digest('hex')
     const key = summaryKey(bot.id, ['bot:' + bot.id, 'team', ...(projectScope === undefined ? [] : [scopeKey(projectScope)])])
     const saved = savedSummary(key)
     const prior = summaryFailures.get(key)
     const failed = prior?.hash === hash && prior.model === bot.model ? prior : undefined
     const wanted = body.regenerate === true || (body.summarize === true && saved?.hash !== hash && failed === undefined)
-    if (wanted && entries.length > 0 && !summarizing.has(key)) startSummary(bot, own, team, project, language, hash, key)
+    if (wanted && entries.length > 0 && !summarizing.has(key)) startSummary(bot, own, team, projectScope === undefined ? undefined : { name: projectName(projectScope.root), lines: projectLines }, language, hash, key)
     return {
       botId: bot.id,
       entries,
