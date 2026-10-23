@@ -260,3 +260,19 @@ test('every request a turn opened is kept, not cut at the claims limit', async t
   s.idle()
   await until(() => s.plans()[0]?.status === 'DONE')
 })
+
+// A call opened without naming the Session it came from must not be pinned on some other
+// turn. Guessing from the sender would put a group line on that Bot's own-chat turn, and a
+// report made there would then wait for a conversation it never had.
+test('a call opened without a Session is not pinned on the senders own-chat turn', async t => {
+  const s = await start()
+  t.after(() => s.stop())
+  s.turnAnswering('b2', 'w-own')
+  // No `session`: the record stays in the book but belongs to no turn.
+  s.rt.openWork('w-anonymous', { from: 'b2', to: 'b3' })
+  assert.deepEqual(s.rt.live.get('b2')?.spawned ?? [], [], 'nothing was pinned on the turn')
+  await s.tool('complete_task', report, 'call-anonymous')
+  s.idle()
+  await until(() => s.plans()[0]?.status === 'DONE')
+  assert.equal(s.plans()[0].work.includes('w-anonymous'), false, 'the anonymous call is not this candidates business')
+})

@@ -36,7 +36,12 @@ export function install(rt) {
     // waits for these even when there was no work above it (the user spoke in its own
     // chat, so `workOf` has nothing). Process-local like the rest of `live`, and dropped
     // with the turn, which is what keeps it to this turn rather than the Bot's history.
-    const turn = rt.live?.get(session ?? (from === undefined ? undefined : (rt.chatOf?.(from) ?? from)))
+    //
+    // Only when the caller named the Session it speaks from. Guessing from `from` would pin
+    // a group line on the Bot's own-chat turn, which is a different conversation: no
+    // `session`, no record. The call still exists in the book; it just cannot be tied to a
+    // report, and it is not this candidate's business.
+    const turn = session === undefined ? undefined : rt.live?.get(session)
     if (turn !== undefined) (turn.spawned ??= []).push(id)
     save()
   }
