@@ -302,7 +302,7 @@ export function install(rt) {
       const say = (raw) => {
         const step = stripOwnName(member.name, raw)
         if (isPass(step)) return
-        captureRoomCalls(room, member, step, sessionId)
+        captureRoomCalls(room, member, calleesOf(room, member, step, rt.isAdminOf(room, member.id)), sessionId)
         said.push(step)
         postInRound(room, round, member, step)
       }
@@ -353,6 +353,22 @@ export function install(rt) {
   rt.workRoomTurn = (sessionId, tool) => {
     if (QUICK_TOOLS.has(tool)) return
     for (const waiter of waitersOf(sessionId)) waiter.work()
+  }
+
+  // Who a line actually calls, for both the dispatcher and the call book: the members it
+  // names, and, for the admin's "@all" only, everyone else. One function, so what is
+  // written down as a call is exactly what the round will ask. `leads` says whether the
+  // speaker may call the whole group; a member's "@all" names nobody.
+  const mentionsOf = (room, member, text) => {
+    const everyone = room.members.map(rt.botOf).filter(Boolean)
+    const mentions = mentionsIn(text, everyone)
+    return { all: mentions.all, found: mentions.found.filter(other => other.id !== member.id) }
+  }
+  const calleesOf = (room, member, text, leads) => {
+    const { all, found } = mentionsOf(room, member, text)
+    if (!leads || !all) return found
+    const others = room.members.map(rt.botOf).filter(other => other !== undefined && other.id !== member.id && !found.includes(other))
+    return [...found, ...others]
   }
 
   // A called member moves up if it is still waiting, or gets one more turn if it
@@ -481,12 +497,9 @@ export function install(rt) {
       const spoken = final === undefined ? said : [...said, final]
       if (spoken.length === 0) continue
       // Only the admin's "@all" calls everyone, so a member cannot set off a storm.
-      const leads = rt.isAdminOf(room, member.id)
       const everyone = room.members.map(rt.botOf).filter(Boolean)
-      const others = everyone.filter(other => other.id !== member.id)
-      const { all, found: named } = mentionsIn(spoken.join('\n\n'), everyone)
-      const found = named.filter(other => other.id !== member.id)
-      const callees = leads && all ? [...found, ...others.filter(other => !found.includes(other))] : found
+      const leads = rt.isAdminOf(room, member.id)
+      const callees = calleesOf(room, member, spoken.join('\n\n'), leads)
       callMembers(round, turns, index, callees, `${member.name} mentioned you`, leads ? ROOM_ADMIN_TURNS_EACH : ROOM_TURNS_EACH, member.id)
       // This member has now had its say in the group: whatever was waiting on it from an
       // earlier line of this round is settled, so the report that waited can go on.
@@ -751,18 +764,20 @@ export function install(rt) {
     const member = rt.botOf(owner?.botId)
     return room !== undefined && member !== undefined && room.members.includes(member.id) ? { room, member } : undefined
   }
-  const callsIn = (room, member, text) => mentionsIn(text, room.members.map(rt.botOf).filter(Boolean)).found.some(bot => bot.id !== member.id)
+  const callsIn = (room, member, text) => mentionsOf(room, member, text).found.length > 0
 
   // A line that names members is a call as of the line, and the line is written while the
   // calling turn is still open. Both places a line can arrive go through this: `say` (a
   // member already speaking in a round) and `postStep`'s later branch (a member posting
   // outside a waiting round). Anything a round only records afterwards would be too late
   // for a report made in this same turn.
-  function captureRoomCalls(room, member, text, sessionId) {
+  //
+  // `peers` is the set the round will actually call, not just the names written: the
+  // admin's "@all" calls every other member, so the book must say so too. Both sides read
+  // it from `calleesOf`, so what is written down cannot drift from what is dispatched.
+  function captureRoomCalls(room, member, peers, sessionId) {
     if (member === undefined || room === undefined) return
-    const everyone = room.members.map(rt.botOf).filter(Boolean)
-    const named = mentionsIn(text, everyone).found.filter(other => other.id !== member.id)
-    for (const peer of named) rt.openRoomCall?.(room.id, member.id, peer.id, sessionId)
+    for (const peer of peers) rt.openRoomCall?.(room.id, member.id, peer.id, sessionId)
   }
 
   // What a member says while it works, into the group. While the member holds its place
@@ -777,7 +792,10 @@ export function install(rt) {
     if (room === undefined) return
     ensureRoomLog(room)
     const calls = callsIn(room, member, text)
-    captureRoomCalls(room, member, text, sessionId)
+    // A step posted outside a round calls only the members it names (the post goes out as
+    // a progress/late line, which does not expand "@all"), so the book records exactly
+    // those.
+    captureRoomCalls(room, member, mentionsOf(room, member, text).found, sessionId)
     const running = [...rt.roomProgress.values()].find(round => round.roomId === room.id)
     if (!calls && running !== undefined) return postInRound(room, running, member, text)
     const quiet = !calls || (room.lateRounds ?? 0) >= ROOM_LATE_ROUNDS
