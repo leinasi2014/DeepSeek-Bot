@@ -12,7 +12,7 @@
 // and the progress, so no second queue state can be committed half-way. Every update is a
 // temp+rename of that one file, serialized here.
 import { createHash } from 'node:crypto'
-import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises'
+import { access, mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 export const CANDIDATE_VERSION = 1
@@ -93,15 +93,20 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
   }
 
   async function read(id) {
+    let text
     try {
-      const text = await readFile(pathOf(id), 'utf8')
-      const record = JSON.parse(text)
-      if (record === null || typeof record !== 'object' || record.candidateId !== id) return undefined
-      return record
+      text = await readFile(pathOf(id), 'utf8')
     } catch (error) {
       if (error?.code === 'ENOENT') return undefined
       throw error
     }
+    const record = JSON.parse(text)
+    // A file that exists but is not this candidate's record is corruption, not absence:
+    // only a missing file may be treated as "no candidate yet" (#63).
+    if (record === null || typeof record !== 'object' || record.candidateId !== id) {
+      throw new Error(`task candidate ${id} is not a valid record`)
+    }
+    return record
   }
 
   async function list() {
@@ -113,19 +118,47 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
     }
   }
 
-  // A file that cannot be parsed keeps its evidence: it is moved aside, marked so the
-  // same candidateId is never silently regenerated, and reported for a person to look at.
+  // The quarantine marker outlives the move: a replay of the same session and call must
+  // never quietly build a fresh candidate over the evidence, wherever it ended up (#63).
+  const markerOf = id => join(dir, `${id}.corrupt`)
+  async function quarantined(id) {
+    return await access(markerOf(id)).then(() => true, () => false)
+  }
+
+  // A file that cannot be parsed keeps its evidence: it is moved aside under a name all
+  // its own, marked so the same candidateId is never silently regenerated, and reported
+  // for a person to look at. The marker is written first: it is the durable fact that
+  // blocks a rebuild, so it must exist before the original path can become empty — a
+  // crash between the two leaves the unreadable file in place, never a window where a
+  // replay rebuilds over the evidence (#63). When the marker cannot be saved the move
+  // does not happen: the original stays where it is and the failure is reported, never
+  // swallowed as a successful quarantine.
   async function quarantine(id, error) {
-    await mkdir(corruptDir, { recursive: true })
-    const stamp = now().replace(/[:.]/g, '-')
+    const marker = { candidateId: id, at: now(), error: String(error?.message ?? error) }
     try {
-      await rename(pathOf(id), join(corruptDir, `${id}.${stamp}.json`))
+      await mkdir(dir, { recursive: true })
+      await writeFile(markerOf(id), `${JSON.stringify(marker)}\n`, 'utf8')
     } catch (failure) {
-      warn('ds-bot: task candidate %s is unreadable and could not be moved aside: %s', id, failure?.message ?? failure)
-      return { candidateId: id, status: STATUS.corrupt, unreadable: true, error: String(error?.message ?? error) }
+      warn('ds-bot: quarantine marker for task candidate %s could not be saved; the unreadable file was left in place: %s', id, failure?.message ?? failure)
+      return { candidateId: id, status: STATUS.corrupt, unreadable: true, markerFailed: true, error: marker.error }
     }
-    warn('ds-bot: task candidate %s is unreadable and was moved to task-plans/corrupt: %s', id, error?.message ?? error)
-    return { candidateId: id, status: STATUS.corrupt, quarantined: true, error: String(error?.message ?? error) }
+    let moved = false
+    try {
+      await mkdir(corruptDir, { recursive: true })
+      const stamp = now().replace(/[:.]/g, '-')
+      let target = join(corruptDir, `${id}.${stamp}.json`)
+      // A candidate can go bad twice; both copies are evidence, neither replaces the other.
+      for (let copy = 2; ; copy += 1) {
+        if (await access(target).then(() => true, () => false)) target = join(corruptDir, `${id}.${stamp}-${copy}.json`)
+        else break
+      }
+      await rename(pathOf(id), target)
+      moved = true
+    } catch (failure) {
+      warn('ds-bot: task candidate %s is marked corrupt and could not be moved aside; the unreadable file stays in place: %s', id, failure?.message ?? failure)
+    }
+    warn('ds-bot: task candidate %s is unreadable and was quarantined: %s', id, marker.error)
+    return { candidateId: id, status: STATUS.corrupt, ...(moved ? { quarantined: true } : { unreadable: true }), error: marker.error }
   }
 
   // Persisted before the tool call returns, so a candidate that was accepted is never
@@ -133,8 +166,19 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
   async function enqueue({ botId, sessionId, roomId, project, cwd, callId, result, claims, notes }) {
     if (typeof sessionId !== 'string' || typeof callId !== 'string') throw new Error('A candidate needs the session and the tool call')
     const candidateId = candidateIdOf(sessionId, callId)
-    const existing = await read(candidateId).catch(() => undefined)
+    // A replay finds the accepted candidate. An unreadable file is quarantined here —
+    // never written over — and a candidate that was quarantined before is not rebuilt:
+    // only a missing file counts as absent (#63).
+    let existing
+    try {
+      existing = await read(candidateId)
+    } catch (error) {
+      return quarantine(candidateId, error)
+    }
     if (existing !== undefined) return existing
+    if (await quarantined(candidateId)) {
+      return { candidateId, status: STATUS.corrupt, quarantined: true }
+    }
     const record = {
       version: CANDIDATE_VERSION,
       candidateId,
