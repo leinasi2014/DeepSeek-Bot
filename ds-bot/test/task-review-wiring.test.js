@@ -280,6 +280,30 @@ test('a relative file claim is judged against the cwd frozen at enqueue', async 
   assert.match(text, /发布脚本的测试通过/)
 })
 
+// A file claim is checked against the file, not against a line of the conversation, so the
+// only thing the semantic gate can be told about where the quote came from is the file it
+// came from. That string is the whole of `context` on this path (#84): dropping it leaves
+// the gate reading a bare quote with no source at all, and nothing else in the request says
+// which file the words were found in.
+test('a file claim tells the check which file its quote came from', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'ds-bot-file-context-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  mkdirSync(join(root, '.git'), { recursive: true })
+  writeFileSync(join(root, 'notes.txt'), 'the suite passed: tests 12/12')
+  const s = start({ cwd: root, items: [{ claim: 0, topic: '', text: '发布脚本的测试通过', outcome: 'verified' }], support: ['yes'] })
+  t.after(() => s.stop())
+  const claim = { kind: 'file', statement: '测试通过', evidence: 'tests 12/12', ref: 'notes.txt' }
+  await s.tool('complete_task', { ...report, claims: [claim] }, 'b2', 'call-file-context')
+  idle(s.ctx)
+  await until(() => s.plans()[0]?.status === 'DONE')
+  const check = s.requests.find(request => String(request.system).startsWith('You check whether'))
+  assert.ok(check !== undefined, 'the semantic gate was asked')
+  const sent = check.messages.at(-1).content.map(block => block?.text ?? '').join('\n')
+  assert.match(sent, /"context":"file notes.txt"/, 'the check is told which file the quote was read from')
+  assert.match(sent, /"kind":"file"/)
+  assert.match(sent, /"evidence":"tests 12\/12"/)
+})
+
 test('a relative file claim that leaves the folder is refused', async t => {
   const root = mkdtempSync(join(tmpdir(), 'ds-bot-cwd-out-'))
   const inner = join(root, 'inner')
