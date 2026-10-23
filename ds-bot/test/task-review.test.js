@@ -294,7 +294,13 @@ test('when the file cannot be moved aside it stays in place, marked, and is neve
   assert.equal(first.status, STATUS.corrupt)
   assert.equal(first.unreadable, true)
   assert.equal(readFileSync(file, 'utf8'), original, 'the unreadable file was not overwritten')
-  assert.equal(existsSync(join(dir, `${id}.corrupt`)), true, 'the marker was still saved')
+  // The marker is what blocks a rebuild, so prove it really was written: it parses and
+  // names this candidate (the move-happened field belongs to the move, not the marker:
+  // the marker is saved before the move by construction).
+  const marked = JSON.parse(readFileSync(join(dir, `${id}.corrupt`), 'utf8'))
+  assert.equal(marked.candidateId, id)
+  assert.equal(typeof marked.at, 'string')
+  assert.equal(typeof marked.error, 'string')
   rmSync(join(dir, 'corrupt'))
   const replay = await h.review.enqueue({ ...candidate })
   assert.equal(replay.status, STATUS.corrupt)
