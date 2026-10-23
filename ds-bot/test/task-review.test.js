@@ -30,6 +30,17 @@ test('the unverified bound keeps the refusals a re-verify can read back', () => 
   assert.equal(overflow.kept.length, 16)
   assert.equal(overflow.dropped, 79)
 
+  // A refusal the gates made for another reason is audit only: no later pass reads it
+  // back, so it gives way to the ones that are read. Sixteen of those beside three
+  // re-checkable ones keeps thirteen of the sixteen and all three that a re-verify reads,
+  // and the three that gave way are counted, not gone.
+  const gateRefused = count => Array.from({ length: count }, (_, at) => ({ reason: 'evidence-unsupported', text: `无据 ${at + 1}` }))
+  const mixed = keepUnverified([...gateRefused(16), ...unsupported(3)])
+  assert.equal(mixed.kept.length, 16)
+  assert.equal(mixed.kept.filter(entry => entry.reason === 'model-unsupported').length, 3)
+  assert.equal(mixed.kept.filter(entry => entry.reason === 'evidence-unsupported').length, 13)
+  assert.equal(mixed.dropped, 3)
+
   // A count carried in from an earlier pass adds up, so two cuts in one pass do not lose it.
   assert.equal(keepUnverified(planFull(20), 5).dropped, 9)
   assert.equal(keepUnverified([], 0).dropped, 0)
