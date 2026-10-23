@@ -20,6 +20,12 @@ export const CLAIMS_MAX = 8
 export const INVALID_MAX = 3
 export const RETRY_MAX = 3
 export const CAPACITY_CODE = 'memory/full'
+// Raised by `applyItem` when the conditions the candidate was checked under no longer
+// hold at the moment of the write: the Bot left the group, the conversation changed
+// hands, project memory was switched off, or the project id is no longer the one the
+// frozen plan names. It is not a write failure and not a retry: the candidate stops, and
+// the record says why (#70).
+export const STALE_CODE = 'memory/task-stale'
 
 export const STATUS = {
   pending: 'PENDING',
@@ -176,7 +182,15 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
   // They are the only things WAITING may look at. Checking the Bot's other work instead
   // would let one busy group chat stall a report made in another, which is the point of
   // keeping these lists per candidate.
-  async function enqueue({ botId, sessionId, roomId, project, cwd, callId, result, claims, notes, work, questions, groupWaits }) {
+  //
+  // `projectKind` is what the resolver answered at the moment of the report — ok, none,
+  // unresolved or off — and is kept beside `project`, so the four cases survive as four.
+  // Collapsing them into `project: null` lost the difference between "this folder is not a
+  // project" and "this folder's project cannot be told apart"; the second is a binding
+  // waiting to be made, never a licence to write the Bot's own memory (#70).
+  // `sessionChain` is the Sessions this candidate may read from and bind through: the one
+  // it was reported in, plus the earlier parts of the same chat.
+  async function enqueue({ botId, sessionId, roomId, project, projectKind, cwd, sessionChain, callId, result, claims, notes, work, questions, groupWaits }) {
     if (typeof sessionId !== 'string' || typeof callId !== 'string') throw new Error('A candidate needs the session and the tool call')
     const candidateId = candidateIdOf(sessionId, callId)
     // A replay finds the accepted candidate. An unreadable file is quarantined here —
@@ -199,9 +213,21 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
       sessionId,
       roomId: roomId ?? null,
       project: project ?? null,
+      // One of ok / none / unresolved / off, as the resolver answered when the report was
+      // made. A file written before this field existed reads as `none` with no `project`,
+      // which is what it meant then.
+      projectKind: ['ok', 'none', 'unresolved', 'off'].includes(String(projectKind))
+        ? String(projectKind)
+        : (project === null || project === undefined ? 'none' : 'ok'),
       // The folder the report was made in. A file claim is judged against this root for
-      // the rest of the candidate's life, even if the Session moves elsewhere.
+      // the rest of the candidate's life, even if the Session moves elsewhere; a candidate
+      // that was unresolved is bound from this folder only, never from wherever its
+      // Session happens to be at the next check.
       cwd: cwd ?? null,
+      // The Sessions of the same chat the report may read, oldest first, the reporting one
+      // last. A part switch moves the Bot on; the chain is what says the candidate still
+      // belongs to that conversation.
+      sessionChain: relatedIds(sessionChain).length > 0 ? relatedIds(sessionChain) : [sessionId],
       createdAt: now(),
       status: STATUS.pending,
       invalid: 0,
@@ -285,9 +311,18 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
   }
 
   // Applies one item, or explains why it could not be applied. Returns one of
-  // `done` / `deduplicated` / `conflict` / `retrying`, so the caller only decides status.
-  async function applyOne(record, item, seen) {
+  // `done` / `deduplicated` / `conflict` / `retrying` / `stale`, so the caller only decides
+  // status. `check` runs again here, before the write: a candidate can wait hours between
+  // its freeze and its last item, and the Bot, the conversation, the configuration or the
+  // project may have changed in between (design §5, #70).
+  async function applyOne(record, item, seen, check) {
     if (isDone(record, item.reviewId)) return { kind: 'done', skipped: true }
+    const verdict = await check(record)
+    if (verdict?.ok !== true) {
+      return verdict?.waiting === true
+        ? { kind: 'waiting' }
+        : { kind: 'stale', reason: String(verdict?.reason ?? 'check-refused') }
+    }
     const sameId = seen.find(entry => entry.meta.review_id === item.reviewId)
     if (sameId !== undefined) {
       // The id says this is the entry the plan made. Only the exact frozen line counts:
@@ -304,9 +339,12 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
     }
     let result
     try {
-      result = await applyItem(item)
+      result = await applyItem(item, record)
     } catch (error) {
       if (error?.code === CAPACITY_CODE) return { kind: 'capacity' }
+      if (error?.code === STALE_CODE) {
+        return error.waiting === true ? { kind: 'waiting' } : { kind: 'stale', reason: String(error?.message ?? 'stale') }
+      }
       record.retry += 1
       return { kind: 'retrying', error: String(error?.message ?? error) }
     }
@@ -325,12 +363,12 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
   // Walks the frozen plan. Items already done are skipped first (so a deletion by the user
   // is not undone), then the Markdown is checked by review id, and only then is anything
   // written. A conflict stops the whole candidate: it needs a person to look.
-  async function applyPlan(record) {
+  async function applyPlan(record, check) {
     const byScope = new Map()
     for (const item of record.plan.items) {
       if (!byScope.has(item.scope)) byScope.set(item.scope, entriesOf(item.scope))
       const seen = byScope.get(item.scope)
-      const outcome = await applyOne(record, item, seen)
+      const outcome = await applyOne(record, item, seen, check)
       if (outcome.kind === 'conflict') {
         record.status = STATUS.conflict
         record.conflictAt = now()
@@ -340,6 +378,20 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
       if (outcome.kind === 'capacity') {
         record.status = STATUS.capacity
         record.capacityAt = now()
+        await write(record)
+        return outcome
+      }
+      // The conditions changed under the plan: waiting is not a failure, so the same
+      // frozen plan is looked at again; a refusal that can never come true is dropped
+      // with its reason, exactly as the first check would have.
+      if (outcome.kind === 'waiting') {
+        record.status = STATUS.waiting
+        await write(record)
+        return outcome
+      }
+      if (outcome.kind === 'stale') {
+        record.status = STATUS.dropped
+        record.droppedReason = outcome.reason
         await write(record)
         return outcome
       }
@@ -417,7 +469,7 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
     }
     record.status = STATUS.applying
     await write(record)
-    await applyPlan(record)
+    await applyPlan(record, check)
     return record
   }
 

@@ -223,12 +223,12 @@ export function install(rt) {
     return undefined
   }
 
-  // Every consumer goes through here: the Session's working folder, as DSH sees
-  // it, and no other source of a cwd.
-  function projectOf(session) {
+  // One folder's identity through the same resolver every other consumer uses. A task
+  // candidate keeps the folder it was reported in; when its project could not be told
+  // apart then, this is what re-reads that folder — never another Session's.
+  function resolveCwd(cwd) {
     if (rt.config.projectMemory === false) return { status: 'off' }
-    const cwd = rt.sessionFolder?.(session)
-    if (cwd === undefined) return { status: 'none' }
+    if (cwd === undefined || cwd === null) return { status: 'none' }
     const resolved = resolver.resolve(cwd)
     if (resolved.status !== 'ok') return resolved
     const hash = identityOf(resolved.root)
@@ -237,9 +237,19 @@ export function install(rt) {
     return { ...resolved, hash, scope: { kind: 'project', hash, root: resolved.root } }
   }
 
+  // Every consumer goes through here: the Session's working folder, as DSH sees
+  // it, and no other source of a cwd.
+  function projectOf(session) {
+    if (rt.config.projectMemory === false) return { status: 'off' }
+    const cwd = rt.sessionFolder?.(session)
+    if (cwd === undefined) return { status: 'none' }
+    return resolveCwd(cwd)
+  }
+
   Object.assign(rt, {
     projectScope: {
       resolve: projectOf,
+      resolveCwd,
       dirOf: scope => join(projectsDir, scope.hash),
       clearCache: resolver.clear,
       projectsDir,
