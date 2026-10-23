@@ -2601,6 +2601,7 @@ body[data-ds-dark-theme] .bt-theme-chip i{background:var(--da)}
 .bt-mem-entry{display:flex;align-items:center;gap:10px;padding:9px 4px;border-bottom:.5px solid var(--bt-line);transition:opacity .2s ease}
 .bt-mem-entry[data-busy]{opacity:.4}
 .bt-mem-entry-copy{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.bt-mem-entry-number{flex:none;font-size:12px;line-height:20px;color:var(--bt-ink-3);font-variant-numeric:tabular-nums}
 .bt-mem-entry-text{font-size:14px;line-height:20px;overflow-wrap:anywhere}
 .bt-mem-entry-meta{font-size:12px;line-height:16px;color:var(--bt-ink-3);font-variant-numeric:tabular-nums}
 .bt-mem-remove{flex:none;height:28px;min-width:28px;border-radius:999px;border:0;background:none;color:var(--bt-ink-3);display:inline-flex;align-items:center;justify-content:center;cursor:pointer;padding:0 6px;font:inherit;font-size:12px;opacity:0;transition:opacity .12s ease,background-color .12s ease,color .12s ease}
@@ -7910,7 +7911,7 @@ var groupEntries2 = (entries2) => entries2.reduce((groups, entry) => {
   else groups.push({ key, scope: entry.scope, topic: entry.topic, entries: [entry] });
   return groups;
 }, []);
-function EntryRow({ entry, remove }) {
+function EntryRow({ entry, number, remove }) {
   const [confirming, setConfirming] = (0, import_react18.useState)(false);
   const [busy, setBusy] = (0, import_react18.useState)(false);
   (0, import_react18.useEffect)(() => {
@@ -7931,6 +7932,7 @@ function EntryRow({ entry, remove }) {
   return (0, import_react18.createElement)(
     "li",
     { className: "bt-mem-entry", "data-busy": busy || void 0 },
+    (0, import_react18.createElement)("span", { className: "bt-mem-entry-number" }, `[${number}]`),
     (0, import_react18.createElement)(
       "div",
       { className: "bt-mem-entry-copy" },
@@ -7968,6 +7970,7 @@ function ProjectPicker({ view, session, onSession }) {
 }
 function Entries({ bot, view, remove }) {
   const groups = groupEntries2(view.entries);
+  const numberOf = (entry) => view.entries.indexOf(entry) + 1;
   const sections = [
     { scope: "own", title: t("{name}'s memory", { name: bot.name }), size: view.sizes.own },
     { scope: "team", title: t("Team memory"), hint: t("Every Bot reads it"), size: view.sizes.team },
@@ -7990,7 +7993,7 @@ function Entries({ bot, view, remove }) {
         import_react18.Fragment,
         { key: group.key },
         group.topic ? (0, import_react18.createElement)("div", { className: "bt-mem-topic" }, group.topic) : null,
-        (0, import_react18.createElement)("ul", { className: "bt-mem-list" }, group.entries.map((entry) => (0, import_react18.createElement)(EntryRow, { key: `${entry.topic ?? ""}:${entry.text}`, entry, remove })))
+        (0, import_react18.createElement)("ul", { className: "bt-mem-list" }, group.entries.map((entry) => (0, import_react18.createElement)(EntryRow, { key: `${entry.topic ?? ""}:${entry.text}`, entry, number: numberOf(entry), remove })))
       )) : (0, import_react18.createElement)("div", { className: "bt-mem-none" }, t("Nothing saved yet"))
     ))
   );

@@ -92,7 +92,11 @@ const groupEntries = entries => entries.reduce((groups, entry) => {
   return groups
 }, [])
 
-function EntryRow({ entry, remove }) {
+// The number the ask prompt gave this entry. `memory.js` numbers the entries own, then
+// team, then project, in the order `memory-view` returns them, and the model answers
+// "edit 3" with that number. The panel showed no number at all, so a person counting the
+// rows meant a different entry than the model did (#96).
+function EntryRow({ entry, number, remove }) {
   const [confirming, setConfirming] = useState(false)
   const [busy, setBusy] = useState(false)
   useEffect(() => {
@@ -108,6 +112,7 @@ function EntryRow({ entry, remove }) {
     if (!await remove(entry)) setBusy(false)
   }
   return h('li', { className: 'bt-mem-entry', 'data-busy': busy || undefined },
+    h('span', { className: 'bt-mem-entry-number' }, `[${number}]`),
     h('div', { className: 'bt-mem-entry-copy' },
       h('span', { className: 'bt-mem-entry-text' }, entry.text),
       meta ? h('span', { className: 'bt-mem-entry-meta' }, meta) : null),
@@ -138,8 +143,13 @@ export function ProjectPicker({ view, session, onSession }) {
     }, projectNameOf(project))))
 }
 
-function Entries({ bot, view, remove }) {
+// Exported so the rows can be rendered in a test, as ProjectPicker is: the numbers the
+// model sees and the numbers a person sees must be the same list (#96).
+export function Entries({ bot, view, remove }) {
   const groups = groupEntries(view.entries)
+  // The ask prompt numbers `view.entries` as they come, so the row's place in that array
+  // is the number the model knows it by, whichever section the row is drawn in.
+  const numberOf = entry => view.entries.indexOf(entry) + 1
   const sections = [
     { scope: 'own', title: t("{name}'s memory", { name: bot.name }), size: view.sizes.own },
     { scope: 'team', title: t('Team memory'), hint: t('Every Bot reads it'), size: view.sizes.team },
@@ -154,7 +164,7 @@ function Entries({ bot, view, remove }) {
       groups.some(group => group.scope === section.scope)
         ? groups.filter(group => group.scope === section.scope).map(group => h(Fragment, { key: group.key },
             group.topic ? h('div', { className: 'bt-mem-topic' }, group.topic) : null,
-            h('ul', { className: 'bt-mem-list' }, group.entries.map(entry => h(EntryRow, { key: `${entry.topic ?? ''}:${entry.text}`, entry, remove })))))
+            h('ul', { className: 'bt-mem-list' }, group.entries.map(entry => h(EntryRow, { key: `${entry.topic ?? ''}:${entry.text}`, entry, number: numberOf(entry), remove })))))
         : h('div', { className: 'bt-mem-none' }, t('Nothing saved yet')))))
 }
 
