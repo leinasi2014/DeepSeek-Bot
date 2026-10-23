@@ -30,12 +30,16 @@ const TEAM = {
 const HISTORY = {
   b2: [
     { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Please run the release script now.' }] } } },
-    { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Ran scripts/ship.sh; the suite passed: tests 12/12.' }] } } } },
+    { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Ran scripts/ship.sh.' }] } } } },
+    // The tool result that actually shows the run (#66): a command claim quotes a tool
+    // result, never the Bot's own sentence about it.
+    { event: { seq: 12, type: 'tool/call', data: { turn: 1, step: 1, callId: 'k1', name: 'bash', arguments: '{}' } } },
+    { event: { seq: 13, type: 'tool/result', data: { turn: 1, step: 1, message: { role: 'tool', source: { kind: 'tool', callId: 'k1' }, toolCallId: 'k1', content: [{ type: 'text', text: 'tests 12/12 passing\n[exit code: 0]' }] } } } },
   ],
 }
 
 const ITEM = [{ claim: 0, topic: '', text: '发布用 scripts/ship.sh，测试通过后再发布', outcome: 'verified' }]
-const CLAIM = { kind: 'command', statement: '发布脚本跑通了，测试 12/12 通过', evidence: 'tests 12/12', ref: 'part 1 #11' }
+const CLAIM = { kind: 'command', statement: '发布脚本跑通了，测试 12/12 通过', evidence: 'tests 12/12', ref: 'bash k1' }
 const report = { result: '完成发布脚本验证', claims: [CLAIM], notes: '' }
 
 // `works` and `questions` seed state.json: what is open when the report is made.
