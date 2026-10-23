@@ -643,6 +643,10 @@ export function install(rt) {
   }
 
   async function taskReviewCheck(record) {
+    // A guard for a caller that got here anyway: both ways a candidate is looked at
+    // (`taskRecovery` after load, `runSessionTasks` after a turn) return before this while
+    // the review is off, so the record keeps its bytes. This answer is "waiting" and not a
+    // terminal reason, so such a candidate is looked at again once the review is on.
     if (!reviewOn) return { ok: false, waiting: true }
     if (rt.botOf(record.botId) === undefined) return { ok: false, reason: 'bot-gone' }
     if (rt.selfOf(record.sessionId) !== record.botId) return { ok: false, reason: 'session-changed' }
@@ -843,9 +847,15 @@ export function install(rt) {
   })
   // Candidates are resumed after the team loads, and again whenever the files change on
   // disk; a candidate with a frozen plan never asks the model again.
-  const taskRecovery = () => (rt.readOnly() === undefined ? taskReview.recover().catch(error => rt.warn('ds-bot: task review recovery failed: %s', error)) : Promise.resolve([]))
+  //
+  // With the review switched off nothing is scanned at all (#68): `check` has no verdict
+  // to give while it is off, so a scan would rewrite every record as WAITING — a state
+  // that says "waiting on something", not "switched off". The files keep their bytes and
+  // the next pass after it is switched on decides what happens, on the same evidence.
+  const taskRecovery = () => (reviewOn && rt.readOnly() === undefined ? taskReview.recover().catch(error => rt.warn('ds-bot: task review recovery failed: %s', error)) : Promise.resolve([]))
   const taskRunning = new Map()
   function runSessionTasks(sessionId) {
+    if (!reviewOn) return Promise.resolve([])
     if (taskRunning.has(sessionId)) return taskRunning.get(sessionId)
     const job = (async () => {
       const ids = await taskReview.list()
