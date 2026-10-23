@@ -215,7 +215,11 @@ test('an unresolved candidate whose conversation moved elsewhere is not bound to
   s.move('b2', f.a)
   refresh(s.rt)
   s.idle('b2')
-  await settle()
+  // Wait for the review pass to reach its decision instead of sleeping a fixed 40 ms: the
+  // pass runs behind the queue and the model mock, so under load PENDING outlives any
+  // constant. WAITING is the state under test — a moved conversation cannot bind the old
+  // folder — and the extra settle proves it stays there instead of binding a moment later.
+  await until(() => s.plans()[0]?.status !== 'PENDING')
   await settle()
   const record = s.plans()[0]
   assert.equal(record.status, 'WAITING', 'a moved conversation cannot bind the old folder')
