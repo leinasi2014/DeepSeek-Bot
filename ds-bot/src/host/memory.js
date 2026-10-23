@@ -2917,11 +2917,11 @@ export function install(rt) {
     // bounded, and a refusal the bound left out is counted instead of vanishing (#83).
     const frozen = taskReview.freeze(record, accepted)
     if (frozen.refused.length > 0) {
-      const kept = [...record.unverified, ...frozen.refused]
-      const room = TASK_CLAIMS_MAX * 2
-      const lost = Math.max(0, kept.length - room)
-      record.unverified = kept.slice(0, room)
-      if (lost > 0) record.unverifiedDropped = (record.unverifiedDropped ?? 0) + lost
+      // The same bound and the same order as the extract path: one place decides what the
+      // list means, so the two paths cannot drift apart (#83).
+      const merged = taskReview.keepUnverified([...record.unverified, ...frozen.refused], record.unverifiedDropped ?? 0)
+      record.unverified = merged.kept
+      record.unverifiedDropped = merged.dropped
     }
     if (frozen.items.length === 0) {
       // Nothing survived: an empty plan would be applied zero times and the candidate

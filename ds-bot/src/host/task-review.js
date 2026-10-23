@@ -67,9 +67,17 @@ const relatedIds = ids => [...new Set((Array.isArray(ids) ? ids : []).filter(id 
 // Keep the first `UNVERIFIED_MAX` refusals and say how many were left out. A refusal that
 // vanishes leaves no way to tell a quiet candidate from one the gates kept rejecting, and
 // the count is the only trace an over-long list can leave while the file stays bounded (#83).
-const keepUnverified = (entries, dropped = 0) => {
+//
+// `model-unsupported` is the one reason a later pass reads back: the explicit re-verify
+// takes exactly those, and nothing else. The extraction records `plan-full` first, so a
+// plain head of the list let sixteen `plan-full` entries push every re-checkable refusal
+// out; the re-verify then answered `rechecked: 0` with no way to tell why. The order here
+// is the list's meaning, not the order the gates happened to run in.
+export const keepUnverified = (entries, dropped = 0) => {
   const list = Array.isArray(entries) ? entries : []
-  const kept = list.slice(0, UNVERIFIED_MAX)
+  const retryable = list.filter(entry => entry?.reason === 'model-unsupported')
+  const rest = list.filter(entry => entry?.reason !== 'model-unsupported')
+  const kept = [...retryable, ...rest].slice(0, UNVERIFIED_MAX)
   const lost = dropped + Math.max(0, list.length - kept.length)
   return lost > 0 ? { kept, dropped: lost } : { kept, dropped: 0 }
 }
@@ -650,5 +658,5 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
     return results.filter(Boolean)
   }
 
-  return { enqueue, process, recover, retry, read, save: write, list, freeze, entriesOf, dispose, dir }
+  return { enqueue, process, recover, retry, read, save: write, list, freeze, entriesOf, dispose, dir, keepUnverified }
 }

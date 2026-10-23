@@ -4,8 +4,37 @@ import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { candidateIdOf, RETRY_WAIT_MS, reviewIdOf, STATUS, taskReview } from '../src/host/task-review.js'
+import { candidateIdOf, keepUnverified, RETRY_WAIT_MS, reviewIdOf, STATUS, taskReview } from '../src/host/task-review.js'
 import { formatEntry, looksSecret, parseMemory } from '../src/host/memory.js'
+
+// The refusals list is bounded at sixteen, and the bound is not a plain head of the list:
+// the explicit re-verify reads back only `model-unsupported`, so those have to survive the
+// cut. The extraction records `plan-full` first, which used to push every re-checkable
+// refusal out of a list of sixteen and leave the re-verify answering `rechecked: 0` with
+// no trace of why (#83).
+test('the unverified bound keeps the refusals a re-verify can read back', () => {
+  const planFull = count => Array.from({ length: count }, (_, at) => ({ reason: 'plan-full', text: `教训 ${at + 1}` }))
+  const unsupported = count => Array.from({ length: count }, (_, at) => ({ reason: 'model-unsupported', text: `被拒 ${at + 1}` }))
+
+  // Twenty refusals, seventeen of them plan-full: the three a re-verify reads survive the
+  // cut and the remaining thirteen places go to plan-full.
+  const many = keepUnverified([...planFull(17), ...unsupported(3)])
+  assert.equal(many.kept.length, 16)
+  assert.deepEqual(many.kept.filter(entry => entry.reason === 'model-unsupported').map(entry => entry.text), ['被拒 1', '被拒 2', '被拒 3'])
+  assert.equal(many.dropped, 4)
+
+  // The shape the issue was found in: 92 plan-full beside a refusal the gates made. The
+  // refusal is kept, and what did not fit is counted rather than silently gone.
+  const overflow = keepUnverified([...planFull(92), ...unsupported(3)])
+  assert.deepEqual(overflow.kept.slice(0, 3).map(entry => entry.reason), ['model-unsupported', 'model-unsupported', 'model-unsupported'])
+  assert.equal(overflow.kept.length, 16)
+  assert.equal(overflow.dropped, 79)
+
+  // A count carried in from an earlier pass adds up, so two cuts in one pass do not lose it.
+  assert.equal(keepUnverified(planFull(20), 5).dropped, 9)
+  assert.equal(keepUnverified([], 0).dropped, 0)
+  assert.equal(keepUnverified(undefined).kept.length, 0)
+})
 
 // A memory root whose scopes are plain text files, so the review can be driven without a
 // Session, a model, or a DSH_HOME. `calls` records every write the review attempted.
