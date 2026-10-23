@@ -1025,6 +1025,13 @@ export function install(rt) {
     extract: taskReviewExtract,
     applyItem: taskReviewApply,
     linkTopic: taskReviewLinkItem,
+    // The bounded wake for a backed-off apply (#67): a real timer, unref'd, cleaned
+    // up with this module. It goes through the same gate as every other pass — the
+    // review switched off means no candidate change and no model call — and holds
+    // nothing: the pass it wakes does the work.
+    wake: record => {
+      if (reviewOn) void runSessionTasks(record.sessionId)
+    },
     readScope: (key) => {
       const scope = scopeOfKey(key)
       return loadScope(scope).map(file => ({ file: file.file, topic: file.topic ?? '', content: file.content }))
@@ -2580,6 +2587,10 @@ export function install(rt) {
     }, 'ds-bot: memory review')
   }
 
+  // The backoff timers of task candidates belong to this module's life, whatever the
+  // review switch says (#67): they exist only while the plugin does.
+  ctx.effect(() => () => taskReview.dispose?.(), 'ds-bot: task review timers')
+
   async function memoryEndpoint(endpoint, body) {
     if (endpoint === 'memory-view') return memoryView(body)
     if (endpoint === 'memory-ask') return memoryAsk(body)
@@ -2597,7 +2608,9 @@ export function install(rt) {
       const id = String(body?.candidateId ?? '')
       const record = await taskReview.retry(id)
       if (record === undefined) return { ok: false, error: 'No such task candidate.' }
-      if (record.status === TASK_STATUS.pending) void runSessionTasks(record.sessionId)
+      // A reopened plan-less candidate starts from extraction; a reopened frozen plan
+      // goes straight back to applying. Both run on the next pass (#67).
+      if (record.status === TASK_STATUS.pending || record.status === TASK_STATUS.planned) void runSessionTasks(record.sessionId)
       return { ok: true, status: record.status, unverified: record.unverified ?? [] }
     }
     // Re-checking what the semantic gate refused, on the same quotes, without asking the

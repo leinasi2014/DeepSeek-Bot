@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { candidateIdOf, reviewIdOf, STATUS, taskReview } from '../src/host/task-review.js'
+import { candidateIdOf, RETRY_WAIT_MS, reviewIdOf, STATUS, taskReview } from '../src/host/task-review.js'
 import { formatEntry, looksSecret, parseMemory } from '../src/host/memory.js'
 
 // A memory root whose scopes are plain text files, so the review can be driven without a
@@ -93,6 +93,9 @@ function prehashHarness(t) {
   t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 5 }))
   const files = { 'project:a': { 'MEMORY.md': '# Memory\n\n## Index\n' } }
   const calls = { apply: 0, link: 0 }
+  // A movable clock (#67): a failed apply now waits its backoff, so a recovery pass
+  // represents "the next pass after the wait", not the very next tick.
+  let clock = Date.parse('2026-10-23T00:00:00.000Z')
   const build = ({ fail, beforeDecide } = {}) => taskReview({
     root,
     check: async () => ({ ok: true, project: 'project:a' }),
@@ -137,10 +140,10 @@ function prehashHarness(t) {
     format: formatEntry,
     entryProblem: () => undefined,
     secretEntry: () => false,
-    now: () => '2026-10-23T00:00:00.000Z',
+    now: () => new Date(clock).toISOString(),
   })
   const recordOf = id => JSON.parse(readFileSync(join(root, 'task-plans', `${id}.json`), 'utf8'))
-  return { root, files, calls, build, recordOf }
+  return { root, files, calls, build, recordOf, advance: ms => { clock += ms } }
 }
 
 test('an interrupted item whose target file is unchanged goes on to write', async t => {
@@ -153,6 +156,7 @@ test('an interrupted item whose target file is unchanged goes on to write', asyn
   assert.ok(pending !== undefined, 'the pre-write state is on the record')
   assert.deepEqual(Object.keys(pending.files), ['MEMORY.md'])
   assert.equal(s.recordOf(candidateId).progress.pending.files['MEMORY.md'], pending.files['MEMORY.md'], 'the pre-write state was persisted before the write')
+  s.advance(2_000) // past the failed apply's first backoff (#67)
   const done = await s.build({}).process(candidateId)
   assert.equal(done.status, STATUS.done)
   assert.equal(done.progress.pending, undefined, 'settling the item clears the pre-write state')
@@ -165,6 +169,7 @@ test('a person\'s edit of the target file stops the item as a conflict and is pr
   const { candidateId } = await s.build({ fail: 'eio' }).enqueue(candidate)
   await s.build({ fail: 'eio' }).process(candidateId)
   s.files['project:a']['MEMORY.md'] = '# Memory\n\n- 用户手改了这里\n\n## Index\n'
+  s.advance(2_000) // past the failed apply's first backoff (#67)
   const stopped = await s.build({}).process(candidateId)
   assert.equal(stopped.status, STATUS.conflict)
   const conflict = stopped.progress.conflicts.at(-1)
@@ -182,6 +187,7 @@ test('the same text elsewhere in the scope explains the change instead of confli
   // The person moved the fact into a topic file and left a note behind.
   s.files['project:a']['MEMORY.md'] = '# Memory\n\n- 顺带改了一句\n\n## Index\n'
   s.files['project:a']['travel.md'] = '# travel\n\n- 用脚本发布\n\n## Index\n'
+  s.advance(2_000) // past the failed apply's first backoff (#67)
   const settled = await s.build({}).process(candidateId)
   assert.equal(settled.status, STATUS.done)
   const doneEntry = settled.progress.done.at(-1)
@@ -194,6 +200,7 @@ test('a topic item watches the link target too', async t => {
   t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 5 }))
   const files = { 'project:a': { 'MEMORY.md': '# Memory\n\n## Index\n' } }
   let failing = true
+  let clock = Date.parse('2026-10-23T00:00:00.000Z')
   const build = () => taskReview({
     root,
     check: async () => ({ ok: true, project: 'project:a' }),
@@ -216,13 +223,14 @@ test('a topic item watches the link target too', async t => {
     },
     readScope: scope => Object.entries(files[scope] ?? {}).map(([file, content]) => ({ file, topic: file === 'MEMORY.md' ? '' : file.slice(0, -3), content })),
     parse: parseMemory, format: formatEntry, entryProblem: () => undefined, secretEntry: () => false,
-    now: () => '2026-10-23T00:00:00.000Z',
+    now: () => new Date(clock).toISOString(),
   })
   const { candidateId } = await build().enqueue(candidate)
   const interrupted = await build().process(candidateId)
   assert.deepEqual(Object.keys(interrupted.progress.pending.files).sort(), ['MEMORY.md', 'travel.md'], 'both files the item may write are watched')
   files['project:a']['MEMORY.md'] = '# Memory\n\n- 用户只改了 MEMORY.md\n\n## Index\n'
   failing = false
+  clock += 2_000 // past the failed apply's first backoff (#67)
   const stopped = await build().process(candidateId)
   assert.equal(stopped.status, STATUS.conflict)
   assert.equal(stopped.progress.conflicts.at(-1).file, 'MEMORY.md')
@@ -239,6 +247,7 @@ test('a capacity failure keeps the pre-write state without spending a retry, and
   assert.ok(full.progress.pending !== undefined, 'the pre-write state waits with the item')
   // Capacity stays until a person reopens it, the way the panel endpoint does.
   await s.build({}).save({ ...full, status: STATUS.planned })
+  s.advance(2_000) // past the failed apply's first backoff (#67)
   const done = await s.build({}).process(candidateId)
   assert.equal(done.status, STATUS.done)
   assert.equal(done.progress.pending, undefined)
@@ -253,6 +262,7 @@ test('a duplicate committed ahead of the queued apply explains the pending hash'
   const s = prehashHarness(t)
   const { candidateId } = await s.build({ fail: 'eio' }).enqueue(candidate)
   await s.build({ fail: 'eio' }).process(candidateId)
+  s.advance(2_000) // past the failed apply's first backoff (#67)
   const recovered = await s.build({
     beforeDecide: (item, files_) => { files_['MEMORY.md'] = `# Memory\n\n- ${item.text}\n\n## Index\n` },
   }).process(candidateId)
@@ -382,6 +392,281 @@ test('three unusable extractions end the candidate without another model call', 
   assert.equal(h.calls.extract, 3)
   await h.review.process(candidateId)
   assert.equal(h.calls.extract, 3, 'a skipped candidate is never extracted again')
+})
+
+// #67: wakes can overlap — startup recovery and an idle pass, two sessions — so one
+// candidate has one in-flight job; the second caller rides the first one's result
+// instead of extracting twice. (Codex proved the double extraction with a gated
+// extract and two concurrent process calls.)
+test('recovery and idle coalesce processing of the same candidate', async t => {
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  const h = harness(t, { extract: async () => { await gate; return { items: [{ scope: 'project:a', text: 'Keep release notes short', outcome: 'verified' }] } } })
+  const { candidateId } = await h.review.enqueue(candidate)
+  const first = h.review.process(candidateId)
+  for (let i = 0; i < 100 && h.calls.extract === 0; i += 1) await new Promise(resolve => setTimeout(resolve, 2))
+  const second = h.review.process(candidateId)
+  await new Promise(resolve => setTimeout(resolve, 30))
+  release()
+  const [a, b] = await Promise.all([first, second])
+  assert.equal(h.calls.extract, 1, 'one candidate has one in-flight extraction despite two wake-ups')
+  assert.equal(a.status, STATUS.done)
+  assert.equal(b.status, STATUS.done)
+  assert.equal(a.candidateId, b.candidateId)
+})
+
+// #67: backoff, pause and explicit recovery, on a controllable clock. The wait lives
+// on the record, so a fresh instance (a restart) reads the same point in time.
+function backoffHarness(t) {
+  const root = mkdtempSync(join(tmpdir(), 'ds-bot-task-backoff-'))
+  t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 5 }))
+  let clock = Date.parse('2026-10-23T00:00:00.000Z')
+  let failing = true
+  const warnings = []
+  const calls = { apply: 0, extract: 0 }
+  const build = () => taskReview({
+    root,
+    check: async () => ({ ok: true, project: 'project:a' }),
+    extract: async () => { calls.extract += 1; return { items: [{ scope: 'project:a', text: '用脚本发布', outcome: 'verified', source: 'part 1 #2' }] } },
+    applyItem: async (item, hooks) => {
+      const hashes = { 'MEMORY.md': createHash('sha256').update('# Memory\n\n## Index\n').digest('hex') }
+      const verdict = await hooks.decide({ hashes, entries: [], hasLink: true })
+      if (verdict.kind !== 'proceed') return { skipped: verdict.kind, file: verdict.file, conflict: verdict.conflict }
+      calls.apply += 1
+      if (failing) throw Object.assign(new Error('EIO'), { code: 'EIO' })
+      return { changed: true, file: 'MEMORY.md' }
+    },
+    linkTopic: async () => {},
+    readScope: () => [{ file: 'MEMORY.md', topic: '', content: '# Memory\n\n## Index\n' }],
+    parse: parseMemory,
+    format: formatEntry,
+    entryProblem: () => undefined,
+    secretEntry: () => false,
+    now: () => new Date(clock).toISOString(),
+    warn: (...args) => warnings.push(args.join(' ')),
+  })
+  return {
+    build, calls, warnings,
+    advance: ms => { clock += ms },
+    heal: () => { failing = false },
+  }
+}
+
+test('a failed apply waits its backoff, pauses after three, and recovers explicitly', async t => {
+  const s = backoffHarness(t)
+  const { candidateId } = await s.build().enqueue(candidate)
+  // First failure: wait one second before the next try.
+  const first = await s.build().process(candidateId)
+  assert.equal(first.status, STATUS.applying)
+  assert.equal(first.retry, 1)
+  assert.ok(first.retryAt !== undefined, 'the wait is on the record')
+  const tooSoon = await s.build().process(candidateId)
+  assert.equal(tooSoon.status, STATUS.applying)
+  assert.equal(tooSoon.retry, 1)
+  assert.equal(s.calls.apply, 1, 'before the wait is up, nothing is tried')
+  // A fresh instance (a restart) reads the same point and also stays put.
+  s.advance(999)
+  const stillEarly = await s.build().process(candidateId)
+  assert.equal(stillEarly.retry, 1)
+  assert.equal(s.calls.apply, 1, 'a restart before the wait is up does not try either')
+  // Past the wait, the second failure waits five seconds.
+  s.advance(2)
+  const second = await s.build().process(candidateId)
+  assert.equal(second.retry, 2)
+  assert.equal(s.calls.apply, 2)
+  s.advance(5_000)
+  const third = await s.build().process(candidateId)
+  assert.equal(third.status, STATUS.retry, 'the third failure pauses the candidate')
+  assert.equal(third.retry, 3)
+  assert.ok(s.warnings.some(line => line.includes('paused for an explicit retry')), 'the pause is reported')
+  // Paused is terminal for every later wake, however far the clock moves.
+  s.advance(3_600_000 * 24)
+  const parked = await s.build().process(candidateId)
+  assert.equal(parked.status, STATUS.retry)
+  assert.equal(s.calls.apply, 3, 'the fourth try never happens on its own')
+  // The fault is gone; the explicit retry reopens the frozen plan and finishes it,
+  // without extracting again.
+  s.heal()
+  const reopened = await s.build().retry(candidateId)
+  assert.equal(reopened.status, STATUS.planned)
+  assert.equal(reopened.plan.items.length, third.plan.items.length, 'the plan is kept as it was frozen')
+  assert.equal(reopened.retry, 0)
+  const done = await s.build().process(candidateId)
+  assert.equal(done.status, STATUS.done)
+  assert.equal(s.calls.extract, 1, 'a frozen plan is never extracted again')
+  assert.equal(s.calls.apply, 4, 'the reopened plan applies once more and succeeds')
+})
+
+test('a capacity stop reopens onto its frozen plan through the explicit retry', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'ds-bot-task-capacity-retry-'))
+  t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 5 }))
+  let full = true
+  const calls = { apply: 0 }
+  const build = () => taskReview({
+    root,
+    check: async () => ({ ok: true, project: 'project:a' }),
+    extract: async () => ({ items: [{ scope: 'project:a', text: '用脚本发布', outcome: 'verified', source: 'part 1 #2' }] }),
+    applyItem: async (item, hooks) => {
+      const hashes = { 'MEMORY.md': createHash('sha256').update('').digest('hex') }
+      const verdict = await hooks.decide({ hashes, entries: [], hasLink: true })
+      if (verdict.kind !== 'proceed') return { skipped: verdict.kind, file: verdict.file, conflict: verdict.conflict }
+      calls.apply += 1
+      if (full) throw Object.assign(new Error('no room'), { code: 'memory/full' })
+      return { changed: true, file: 'MEMORY.md' }
+    },
+    linkTopic: async () => {},
+    readScope: () => [],
+    parse: parseMemory,
+    format: formatEntry,
+    entryProblem: () => undefined,
+    secretEntry: () => false,
+    now: () => '2026-10-23T00:00:00.000Z',
+  })
+  const { candidateId } = await build().enqueue(candidate)
+  const stopped = await build().process(candidateId)
+  assert.equal(stopped.status, STATUS.capacity)
+  assert.equal(stopped.retry, 0, 'a full file is not a transient failure')
+  full = false
+  const reopened = await build().retry(candidateId)
+  assert.equal(reopened.status, STATUS.planned, 'capacity reopens onto the frozen plan')
+  const done = await build().process(candidateId)
+  assert.equal(done.status, STATUS.done)
+  assert.equal(calls.apply, 2)
+})
+
+// #67, Codex's negative on 9a683e2: after a capacity stop the person makes room — by
+// removing entries, which changes exactly the bytes the old pre-write state hashed —
+// and the explicit retry must resume the frozen plan, not stop as a manual conflict.
+test('freeing space lets an explicit capacity retry resume the frozen plan', async t => {
+  const s = prehashHarness(t)
+  s.files['project:a']['MEMORY.md'] = '# Memory\n\n- Old entry removed to free space\n\n## Index\n'
+  const first = s.build({ fail: 'full' })
+  const { candidateId } = await first.enqueue(candidate)
+  const full = await first.process(candidateId)
+  assert.equal(full.status, STATUS.capacity)
+  assert.ok(full.progress.pending !== undefined, 'the pre-write state was taken before the file was full')
+  s.files['project:a']['MEMORY.md'] = '# Memory\n\n## Index\n'
+  const resume = s.build({})
+  await resume.retry(candidateId)
+  const done = await resume.process(candidateId)
+  assert.equal(done.status, STATUS.done, 'explicit capacity retry after removing old entries must write the retained plan')
+  assert.match(s.files['project:a']['MEMORY.md'], /用脚本发布/)
+})
+
+// #67: a validation the memory module refused is permanent — the plan file was edited
+// into something the limits reject — so it is a person's conflict, not a transient
+// fault: no retry is spent and no backoff waits.
+test('a permanent validation failure at apply is a conflict, never a retry', async t => {
+  const h = harness(t, {
+    extract: () => ({ items: [{ scope: 'project:a', text: '用脚本发布', outcome: 'verified', source: 'part 1 #2' }] }),
+  })
+  // The apply-side check refuses the text, the way a hand-edited plan can be refused.
+  const realApply = h.review
+  const root = h.root
+  const refusing = taskReview({
+    root,
+    check: async () => ({ ok: true, project: 'project:a' }),
+    extract: async () => ({ items: [{ scope: 'project:a', text: '用脚本发布', outcome: 'verified', source: 'part 1 #2' }] }),
+    applyItem: async (item, hooks) => {
+      const hashes = { 'MEMORY.md': createHash('sha256').update('').digest('hex') }
+      const verdict = await hooks.decide({ hashes, entries: [], hasLink: true })
+      if (verdict.kind !== 'proceed') return { skipped: verdict.kind, file: verdict.file, conflict: verdict.conflict }
+      throw Object.assign(new Error('This entry is too long'), { code: 'memory/invalid' })
+    },
+    linkTopic: async () => {},
+    readScope: () => [],
+    parse: parseMemory,
+    format: formatEntry,
+    entryProblem: () => undefined,
+    secretEntry: () => false,
+    now: () => '2026-10-23T00:00:00.000Z',
+  })
+  const { candidateId } = await refusing.enqueue(candidate)
+  const stopped = await refusing.process(candidateId)
+  assert.equal(stopped.status, STATUS.conflict, 'a permanent validation failure stops for a person')
+  assert.equal(stopped.retry, 0, 'no retry is spent on a permanent refusal')
+  assert.equal(stopped.progress.conflicts.at(-1).reason, 'invalid-at-apply')
+  assert.ok(stopped.retryAt === undefined, 'no backoff waits for a permanent refusal')
+  void realApply
+})
+
+// #67: the bounded wake. A timer per candidate fires at the recorded wait and calls
+// the host's wake; whatever pass finds the wait still ahead re-arms it (a restart
+// rebuilds the wait), and dispose clears it with the factory.
+test('the wake timer fires at the recorded wait and is cleared with the factory', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'ds-bot-task-wake-'))
+  t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 5 }))
+  let clock = Date.parse('2026-10-23T00:00:00.000Z')
+  const fired = []
+  const build = () => taskReview({
+    root,
+    check: async () => ({ ok: true, project: 'project:a' }),
+    extract: async () => ({ items: [{ scope: 'project:a', text: '用脚本发布', outcome: 'verified', source: 'part 1 #2' }] }),
+    applyItem: async (item, hooks) => {
+      const hashes = { 'MEMORY.md': createHash('sha256').update('').digest('hex') }
+      const verdict = await hooks.decide({ hashes, entries: [], hasLink: true })
+      if (verdict.kind !== 'proceed') return { skipped: verdict.kind, file: verdict.file, conflict: verdict.conflict }
+      throw Object.assign(new Error('EIO'), { code: 'EIO' })
+    },
+    linkTopic: async () => {},
+    readScope: () => [],
+    parse: parseMemory,
+    format: formatEntry,
+    entryProblem: () => undefined,
+    secretEntry: () => false,
+    now: () => new Date(clock).toISOString(),
+    wake: record => fired.push(record.candidateId),
+  })
+  const review = build()
+  const { candidateId } = await review.enqueue(candidate)
+  await review.process(candidateId) // fails once, arms the one-second timer
+  await new Promise(resolve => setTimeout(resolve, 100))
+  assert.deepEqual(fired, [], 'the timer has not fired yet')
+  await new Promise(resolve => setTimeout(resolve, 1_200))
+  assert.deepEqual(fired, [candidateId], 'the timer fired once at the recorded wait and called the host wake')
+  review.dispose()
+  await review.process(candidateId) // fails again, would arm a five-second timer
+  review.dispose()
+  const armed = fired.length
+  await new Promise(resolve => setTimeout(resolve, 300))
+  assert.equal(fired.length, armed, 'dispose clears the timer: nothing fires after it')
+})
+
+// The in-flight case (#67): disposal can land while an apply is still running. When
+// that apply then fails and reports a wait, the disposed factory must not arm it —
+// old work cannot schedule a wake that outlives the factory it belonged to.
+test('a disposed factory cannot arm a wake from a finishing in-flight apply', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'ds-bot-task-wake-late-'))
+  t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 5 }))
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  let entered
+  const inApply = new Promise(resolve => { entered = resolve })
+  const fired = []
+  const review = taskReview({
+    root,
+    check: async () => ({ ok: true, project: 'project:a' }),
+    extract: async () => ({ items: [{ scope: 'project:a', text: '用脚本发布', outcome: 'verified', source: 'part 1 #2' }] }),
+    applyItem: async () => {
+      entered()
+      await gate
+      throw Object.assign(new Error('EIO'), { code: 'EIO' })
+    },
+    linkTopic: async () => {},
+    readScope: () => [],
+    parse: parseMemory,
+    format: formatEntry,
+    now: () => '2026-10-22T00:00:00.000Z',
+    wake: record => fired.push(record.candidateId),
+  })
+  const { candidateId } = await review.enqueue(candidate)
+  const running = review.process(candidateId)
+  await inApply // the apply is inside its write, its failure has not landed yet
+  review.dispose()
+  release()
+  await running
+  await new Promise(resolve => setTimeout(resolve, RETRY_WAIT_MS[0] + 100))
+  assert.deepEqual(fired, [], 'a disposed factory cannot schedule a future wake from old work')
 })
 
 test('an unreadable candidate file is quarantined and the others still run', async t => {
