@@ -26,11 +26,23 @@ export function install(rt) {
   const workOf = info => (info === undefined ? undefined
     : info.role === 'request' && info.audience !== 'user' ? info.exchangeId : info.work)
 
-  // `parent`: the work the sender was doing when it sent this one.
-  function openWork(id, { from, to, parent, fromRoom, room }) {
+  // `parent`: the work the sender was doing when it sent this one. `session`: the Session
+  // that sent it, when the caller knows it (a Bot can speak from its own chat or a group).
+  function openWork(id, { from, to, parent, fromRoom, room, session }) {
     const above = parent === undefined ? undefined : works()[parent]
     works()[id] = { ...(from ? { from } : {}), ...(to ? { to } : {}), ...(room ? { room } : {}), ...(above ? { parent } : {}), ...(fromRoom ? { fromRoom } : {}), open: [], results: [], at: Date.now() }
     if (above !== undefined) above.open.push(id)
+    // The work a turn set going, on the turn itself: a report made later in the same turn
+    // waits for these even when there was no work above it (the user spoke in its own
+    // chat, so `workOf` has nothing). Process-local like the rest of `live`, and dropped
+    // with the turn, which is what keeps it to this turn rather than the Bot's history.
+    //
+    // Only when the caller named the Session it speaks from. Guessing from `from` would pin
+    // a group line on the Bot's own-chat turn, which is a different conversation: no
+    // `session`, no record. The call still exists in the book; it just cannot be tied to a
+    // report, and it is not this candidate's business.
+    const turn = session === undefined ? undefined : rt.live?.get(session)
+    if (turn !== undefined) (turn.spawned ??= []).push(id)
     save()
   }
 
@@ -69,6 +81,93 @@ export function install(rt) {
 
   const owns = (botId, workId) => workId !== undefined && works()[workId]?.to === botId
   const waits = workId => (works()[workId]?.open.length ?? 0) > 0
+  // A request that has not been answered yet. `waits` only asks whether work is waiting on
+  // its own children, so a request with no children of its own reads false even while the
+  // other Bot has not replied — which is exactly the leaf a report must wait for. Being in
+  // the map at all is what "not answered" means: `closeWork` deletes it, `dropWork` too.
+  const pending = workId => workId !== undefined && works()[workId] !== undefined
+  // The requests this turn opened, by the turn that opened them.
+  const spawnedBy = sessionId => (rt.live?.get(sessionId)?.spawned ?? [])
+
+  // A member a group line calls: work as of the line, which is posted while the caller's
+  // turn is still open. One entry per (room, caller, callee) that has not been answered
+  // yet, so a member that is called again in the same round reuses it instead of stacking
+  // duplicates. `closeRoomCall` deletes it when the member really answers in the group.
+  const roomCallKey = (roomId, from, to) => `room:${roomId}:${from}:${to}`
+  // `since` is the group log position at the moment the call is opened: the calling line is
+  // written at or after it. A restart reads the log from there, so a member's later line
+  // counts as its answer while lines from before the call do not.
+  function openRoomCall(roomId, from, to, session, since) {
+    const id = roomCallKey(roomId, from, to)
+    if (works()[id] !== undefined) return id
+    works()[id] = { from, to, room: roomId, ...(since === undefined ? {} : { since }), open: [], results: [], at: Date.now() }
+    const turn = session === undefined ? undefined : rt.live?.get(session)
+    if (turn !== undefined) (turn.spawned ??= []).push(id)
+    save()
+    return id
+  }
+  // The member answered in the group: what this caller was waiting on is settled.
+  function closeRoomCall(roomId, from, to) {
+    const id = roomCallKey(roomId, from, to)
+    if (works()[id] === undefined) return
+    delete works()[id]
+    save()
+  }
+  // Every call to `to` in this group, settled without a save of its own: the caller's
+  // next save carries the close and the line that answered it in one snapshot, so a
+  // host that dies in between cannot leave an answer on disk with its call still open.
+  function closeRoomCalls(roomId, to) {
+    let closed = 0
+    for (const [id, work] of Object.entries(works())) {
+      if (work === undefined || work.room !== roomId || work.to !== to) continue
+      delete works()[id]
+      closed += 1
+    }
+    return closed
+  }
+  // A call nobody will answer here: the round passed this member over (it had used its
+  // turns), or the member, its group or its Bot is gone for good. Same key as the call
+  // that was opened, so the pairing cannot drift.
+  function dropRoomCall(roomId, from, to) {
+    const id = roomCallKey(roomId, from, to)
+    if (works()[id] === undefined) return
+    dropWork(id)
+  }
+  // A group call that can never be answered any more, judged only by what the disk says.
+  // The process-local turn and waiter maps are empty after a restart, so they cannot tell
+  // a call whose member has gone from one whose member is simply between turns: dropping
+  // on "no turn here" would end every report at the first restart. What is durable is
+  // membership: the group is gone, or the called Bot is no longer in it (removed, or
+  // deleted). Only those calls are dropped; every other one keeps waiting for the member
+  // to speak, which the regular close paths handle after a restart too.
+  function reconcileRoomCalls() {
+    const dropped = []
+    for (const [id, work] of Object.entries(works())) {
+      if (!id.startsWith('room:') || work === undefined || work.room === undefined || work.to === undefined) continue
+      const room = rt.roomOf?.(work.room)
+      const memberGone = room === undefined || !room.members.includes(work.to) || rt.botOf(work.to) === undefined
+      if (!memberGone) continue
+      dropWork(id)
+      dropped.push(id)
+    }
+    return dropped
+  }
+
+  // The calls still in the book, as records: what a restart needs to finish one whose line
+  // was saved but whose member was never asked. `since` is the group log position at the
+  // moment the call was opened, so a member's later line reads as its answer.
+  const roomCallsAwaiting = () => Object.entries(works())
+    .filter(([id, work]) => id.startsWith('room:') && work !== undefined && work.room !== undefined && work.to !== undefined)
+    .map(([id, work]) => ({ id, room: work.room, from: work.from, to: work.to, since: work.since, recovered: work.recovered === true, at: work.at }))
+
+  // A call an earlier start already asked for again: a restart loop must not ask forever.
+  function markRoomCallRecovered(id) {
+    const work = works()[id]
+    if (work === undefined || work.recovered === true) return
+    work.recovered = true
+    save()
+  }
+
   function hold(workId, text) {
     const work = works()[workId]
     if (work === undefined || text === '') return
@@ -129,10 +228,14 @@ export function install(rt) {
     return view
   }
 
-  // A deleted Bot answers no more work and waits for none.
+  // A deleted Bot answers no more work and waits for none. A group call that named it is
+  // settled here as well: it will never speak in that group again.
   function forgetBot(botId) {
     const waiting = Object.entries(works()).filter(([, work]) => work.to === botId).map(([id]) => askedBy(id))
-    for (const [id, work] of Object.entries(works())) if (work.from === botId && work.to !== botId) dropWork(id)
+    for (const [id, work] of Object.entries(works())) {
+      if (work.from === botId && work.to !== botId) dropWork(id)
+      else if (work.room !== undefined && work.to === botId) dropWork(id)
+    }
     return waiting
   }
 
@@ -182,5 +285,10 @@ export function install(rt) {
     return lines.join('; ')
   }
 
-  Object.assign(rt, { workOf, openWork, closeWork, dropWork, takenWork: taken, ownsWork: owns, waitsWork: waits, holdWork: hold, workAsker: askedBy, answerText, upstreamOf, sameWork, forgetBotWork: forgetBot, statusOf, waitingView })
+  Object.assign(rt, { workOf, openWork, closeWork, dropWork, takenWork: taken, ownsWork: owns, waitsWork: waits, pendingWork: pending, spawnedBy, openRoomCall, closeRoomCall, closeRoomCalls, dropRoomCall, reconcileRoomCalls, roomCallsAwaiting, markRoomCallRecovered, holdWork: hold, workAsker: askedBy, answerText, upstreamOf, sameWork, forgetBotWork: forgetBot, statusOf, waitingView })
+
+  // Once the team is on disk, calls whose member can no longer answer are settled, so a
+  // report does not wait on a group or a Bot that is gone. Same load hook the task review
+  // recovery uses; a read-only team still has its disk facts to read.
+  rt.load?.().then(() => { reconcileRoomCalls() }).catch(() => {})
 }

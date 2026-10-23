@@ -183,7 +183,7 @@ export function install(rt) {
       const steer = (args.when !== 'queue' && !toUser) || (joins && earlier.steered)
       const exchangeId = joins ? earlier.message.source.exchangeId : randomUUID()
       if (joins) rt.forgetDelivery?.(exchangeId)
-      else if (!toUser) rt.openWork(exchangeId, { from: sender.id, to: target.id, parent: work })
+      else if (!toUser) rt.openWork(exchangeId, { from: sender.id, to: target.id, parent: work, session: exec.agent?.id })
       try {
         await rt.deliver({ fromId: sender.id, toId: target.id, text: long.text, files: [...long.files, ...(joins ? before.files : [])], length: long.length, role: 'request', steer, exchangeId, ...(joins ? { merged: true } : {}), ...(toUser ? { audience: 'user' } : {}) })
       } catch (error) {
@@ -478,7 +478,7 @@ export function install(rt) {
       // work handed on for that request (handoffs.js).
       const work = reportBack ? worksOf(exec).find(id => rt.ownsWork(self, id)) : undefined
       const sub = work === undefined ? undefined : randomUUID()
-      if (sub !== undefined) rt.openWork(sub, { from: self, room: room.id, parent: work })
+      if (sub !== undefined) rt.openWork(sub, { from: self, room: room.id, parent: work, session: exec.agent?.id })
       try {
         await rt.postToRoom(room, sender, long.text, { ...(reportBack ? { reportBack: true } : {}), ...(sub ? { sub } : {}), ...(long.length ? { length: long.length } : {}) }, long.files)
       } catch (failure) {

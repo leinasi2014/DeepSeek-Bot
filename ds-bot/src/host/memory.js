@@ -379,16 +379,26 @@ const teamRule = (main, writer) => (main
 
 const SUMMARY_SYSTEM = 'You write the memory summary that a user reads in the memory panel of DS Bot, an app where a team of AI Bots works for the user. You only restate saved memory entries; you never add to them.'
 
-const summaryRequest = ({ name, own, team, language }) => [
-  `Here is everything ${name} remembers: its own memory, then the team memory that every Bot shares. Each line is one entry; [[name]] is a topic.`,
+// Bumped when the summary request changes shape, so a summary saved by an older
+// request no longer matches the fingerprint and is written again (#71: project
+// entries joined the request; entries alone did not change).
+const SUMMARY_VERSION = 2
+
+const summaryRequest = ({ name, own, team, project, language }) => [
+  `Here is everything ${name} remembers: its own memory, then the team memory that every Bot shares${project === undefined ? '' : `, then the project memory of ${project.name} that every Bot working in that project shares`}. Each line is one entry; [[name]] is a topic.`,
   '',
   `## ${name}'s memory`,
   ...(own.length > 0 ? own : ['(nothing)']),
   '',
   '## Team memory',
   ...(team.length > 0 ? team : ['(nothing)']),
+  ...(project === undefined ? [] : [
+    '',
+    `## Project memory of ${project.name}`,
+    ...(project.lines.length > 0 ? project.lines : ['(nothing)']),
+  ]),
   '',
-  `Write the summary in ${language}, speaking to the user as "you" about what ${name} knows. Use two to five sections. Each section is a line starting with "## " and a short heading, then one short paragraph of plain sentences: no lists, no bold, no tables. Start with an overview of one sentence that says what kinds of things are saved, and leave the facts to the sections after it: never say the same fact twice. Group related entries; facts from the team memory go in their own section that says the whole team shares them. Write only what the entries say: no guesses, no advice, no sources or dates, nothing before the first heading or after the last paragraph.`,
+  `Write the summary in ${language}, speaking to the user as "you" about what ${name} knows. Use two to five sections. Each section is a line starting with "## " and a short heading, then one short paragraph of plain sentences: no lists, no bold, no tables. Start with an overview of one sentence that says what kinds of things are saved, and leave the facts to the sections after it: never say the same fact twice. Group related entries; facts from the team memory go in their own section that says the whole team shares them${project === undefined ? '' : ', and facts from the project memory go in their own section that names the project'}. Write only what the entries say: no guesses, no advice, no sources or dates, nothing before the first heading or after the last paragraph.`,
 ].join('\n')
 
 const ASK_SYSTEM = [
@@ -622,6 +632,13 @@ export function install(rt) {
   const taskLabel = scope => labelOf(scope, scope.kind === 'bot' ? scope.botId : undefined)
   const taskScopeOf = record => (record.project === null ? ownScope(record.botId) : { kind: 'project', hash: record.project.slice('project:'.length) })
 
+  // Who wrote the entry, for the scopes `metaFor` names the writer in: a project's memory
+  // is shared by every Bot that works there, so a lesson kept by the review has to say
+  // which Bot it came from, exactly as `remember` does. A Bot's own memory says nothing:
+  // the scope already is that Bot. Frozen into the plan with the other fields, never
+  // recomputed at apply time.
+  const taskByOf = (record, scope) => (scope.kind === 'team' || scope.kind === 'project' || scope.botId !== record.botId ? { by: rt.botOf(record.botId)?.name } : {})
+
   const taskCwdOf = (sessionId) => {
     const session = sessionRecord(sessionId)
     return session === undefined ? null : rt.sessionFolder(session) ?? null
@@ -691,6 +708,50 @@ export function install(rt) {
     }
   }
 
+  // The work the calling turn does: the request it answers, the requests that joined it
+  // (tools.js:107 `worksOf`), and the requests it opened itself in this turn.
+  //
+  // A turn in a Bot's own chat has no work above it: the user spoke, and `workOf` answers
+  // undefined for that. That is a normal, complete case — there is nothing to wait for —
+  // not a missing record. What such a turn starts with `message_bot` is a real request to
+  // another Bot, and `openWork` pins each one on the turn that opened it, so this reads
+  // only what this turn set going rather than everything the Bot ever sent.
+  //
+  // Group calls live in the same `spawned` list (they are opened from the same place), so
+  // they are filtered out here and read by `groupWaitsOf`: a room call is not a handoff
+  // work and the two must not be mixed in the record.
+  const isRoomCall = id => id.startsWith('room:')
+  const worksOfTurn = (exec) => {
+    const turn = rt.live.get(exec?.agent?.id)
+    const answered = [rt.workOf(turn?.info), ...(turn?.joined ?? []).map(joined => rt.workOf(joined.info))]
+    return [...new Set([...answered, ...(turn?.spawned ?? [])].filter(id => Boolean(id) && !isRoomCall(id)))]
+  }
+
+  // The group calls this turn made. They are opened when the line that names the member is
+  // posted (`postStep`, while this turn is still open), so a report made later in the same
+  // turn sees them; `callMembers` and the member's own answer reuse and close them.
+  const groupWaitsOf = (exec) => (rt.live.get(exec?.agent?.id)?.spawned ?? []).filter(id => id.startsWith('room:'))
+  // A group call already in the work book has not been answered: `closeRoomCall` removes it
+  // when the member really speaks. Waiting on the round's slot status would miss the
+  // window where the round has moved on but the member has not answered, and a round that
+  // is no longer in `roomProgress` (a restart) would wrongly read as finished.
+  const groupStillWaits = (waits) => {
+    if (!Array.isArray(waits) || waits.length === 0) return false
+    return waits.some(id => rt.pendingWork?.(id) === true)
+  }
+
+  // The questions this Session has open, by id. `ask_user` keeps one per Session, and a
+  // part switch moves it to the fresh Session under the same id (parts.js:805-808), so the
+  // id is what a candidate must remember, not the Session it was asked in.
+  const openQuestionsOf = (sessionId) => {
+    const question = state.questions?.[sessionId]
+    return question?.id === undefined ? [] : [question.id]
+  }
+
+  // The ids of every question still open anywhere: a card moved to the next part is no
+  // longer under the Session that asked it, and the candidate must still wait for it.
+  const openQuestionIds = () => new Set(Object.values(state.questions ?? {}).map(question => question?.id).filter(id => typeof id === 'string'))
+
   async function taskReviewCheck(record) {
     // A guard for a caller that got here anyway: both ways a candidate is looked at
     // (`taskRecovery` after load, `runSessionTasks` after a turn) return before this while
@@ -702,6 +763,19 @@ export function install(rt) {
     const project = projectOf(record.sessionId)
     const current = project.status === 'ok' ? `project:${project.hash}` : null
     if (record.project !== null && current !== record.project) return { ok: false, waiting: true }
+    // Only the work and the questions this candidate recorded. Asking about anything the
+    // Bot happens to be doing would let a busy group chat stall a report from another one.
+    // `pendingWork` is "still in the book", which is what an unanswered request means —
+    // `waitsWork` only asks whether work is waiting on its own children, so a leaf request
+    // (what `message_bot` opens) reads false there even while the other Bot has not replied.
+    const work = Array.isArray(record.work) ? record.work : []
+    if (work.some(id => rt.pendingWork?.(id) === true)) return { ok: false, waiting: true }
+    if (groupStillWaits(record.groupWaits)) return { ok: false, waiting: true }
+    const questions = Array.isArray(record.questions) ? record.questions : []
+    if (questions.length > 0) {
+      const open = openQuestionIds()
+      if (questions.some(id => open.has(id))) return { ok: false, waiting: true }
+    }
     return { ok: true, project: current }
   }
 
@@ -837,6 +911,7 @@ export function install(rt) {
           claim: entry.claim,
           evidence: entry.evidence.slice(0, 200),
           source: source.slice(0, 200),
+          ...taskByOf(record, scope),
           outcome: entry.outcome,
           added: today(),
         },
@@ -848,7 +923,7 @@ export function install(rt) {
   // One item, written through the queue exactly as planned: the frozen line and its
   // metadata, never recomputed. Both checks are re-run here because the plan file can be
   // edited by hand between the freeze and the write.
-  function taskReviewApply(item) {
+  function taskReviewApply(item, hooks = {}) {
     return queued(async () => {
       const scope = scopeOfKey(item.scope)
       writable(scope, { id: 'user', name: 'user' })
@@ -859,6 +934,25 @@ export function install(rt) {
       const metaText = Object.entries(metaForSecretCheck(item.meta)).map(([key, value]) => `${key}: ${value}`).join(' ')
       if (secretEntry(item.text) || secretEntry(metaText)) throw Object.assign(new Error('This entry looks like a secret'), { code: 'memory/invalid' })
       const files = loadScope(scope)
+      // #64: everything the review decides on is read inside this critical section —
+      // the committed hashes, the scope's current entries, the link state — through
+      // the hook, together with the write the decision guards. No other memory write
+      // can land between any of them.
+      if (hooks.decide !== undefined) {
+        const names = [...new Set(item.topic === '' ? [MAIN] : [`${item.topic}.md`, MAIN])]
+        const held = new Map(files.map(file => [file.file, file.content]))
+        const hashes = {}
+        for (const name of names) hashes[name] = createHash('sha256').update(held.get(name) ?? '').digest('hex')
+        const entries = allEntries(files).map(entry => ({ file: entry.file.file, topic: entry.file.topic ?? '', text: entry.text, meta: entry.meta ?? {} }))
+        const hasLink = files.some(file => file.file === MAIN && file.links.includes(item.topic))
+        const verdict = await hooks.decide({ hashes, entries, hasLink })
+        if (verdict.kind !== 'proceed') {
+          // The repair link belongs to the same queued job: a second queued call here
+          // would wait behind itself.
+          if (verdict.link !== undefined) await addLinkInner(scope, verdict.link)
+          return { skipped: verdict.kind, file: verdict.file, conflict: verdict.conflict }
+        }
+      }
       const main = files[0]
       const label = taskLabel(scope)
       const same = matchEntries(allEntries(files), item.text).filter(entry => squash(entry.text) === squash(item.text))
@@ -882,16 +976,19 @@ export function install(rt) {
     })
   }
 
+  // The link write itself, plain so a queued job can call it inline (#64): both the
+  // standalone link tool and the review's repair path run inside the queue.
+  async function addLinkInner(scope, topic) {
+    const files = loadScope(scope)
+    const main = files[0]
+    if (main.links.includes(topic)) return
+    const next = joinLines(addLink(main.lines.length > 0 ? main.lines : parseMemory(EMPTY_MAIN).lines, topic))
+    checkSize(main, next, taskLabel(scope))
+    await commit([{ path: main.path, text: next }], { op: 'task-review-link', scope: scopeKey(scope), file: MAIN, link: topic })
+  }
+
   function taskReviewLinkItem(scopeKeyValue, topic) {
-    return queued(async () => {
-      const scope = scopeOfKey(scopeKeyValue)
-      const files = loadScope(scope)
-      const main = files[0]
-      if (main.links.includes(topic)) return
-      const next = joinLines(addLink(main.lines.length > 0 ? main.lines : parseMemory(EMPTY_MAIN).lines, topic))
-      checkSize(main, next, taskLabel(scope))
-      await commit([{ path: main.path, text: next }], { op: 'task-review-link', scope: scopeKey(scope), file: MAIN, link: topic })
-    })
+    return queued(() => addLinkInner(scopeOfKey(scopeKeyValue), topic))
   }
 
   const taskReview = createTaskReview({
@@ -922,14 +1019,19 @@ export function install(rt) {
   // the next pass after it is switched on decides what happens, on the same evidence.
   const taskRecovery = () => (reviewOn && rt.readOnly() === undefined ? taskReview.recover().catch(error => rt.warn('ds-bot: task review recovery failed: %s', error)) : Promise.resolve([]))
   const taskRunning = new Map()
+  // Candidates are woken by whoever is idle now, compared by the Bot that speaks, not by
+  // the Session id: a conversation that changed part has a new Session id, and a candidate
+  // recorded under the old one would otherwise never be looked at again. The candidate's
+  // own `check` still decides whether anything happens — this only picks the moment.
   function runSessionTasks(sessionId) {
     if (!reviewOn) return Promise.resolve([])
     if (taskRunning.has(sessionId)) return taskRunning.get(sessionId)
+    const who = rt.selfOf(sessionId)
     const job = (async () => {
       const ids = await taskReview.list()
       for (const id of ids) {
         const record = await taskReview.read(id)
-        if (record === undefined || record.sessionId !== sessionId) continue
+        if (record === undefined || rt.selfOf(record.sessionId) !== who) continue
         await taskReview.process(id)
       }
     })().catch(error => rt.warn('ds-bot: task review of %s failed: %s', sessionId, error?.message ?? error))
@@ -1656,6 +1758,9 @@ export function install(rt) {
         result,
         claims,
         notes: String(args.notes ?? '').trim().slice(0, 4000),
+        work: worksOfTurn(exec),
+        questions: openQuestionsOf(caller.sessionId),
+        groupWaits: groupWaitsOf(exec),
       })
       return `Recorded as a candidate (${record.candidateId.slice(0, 8)}). After this turn the host checks the evidence and keeps only what it supports; your memory has not changed yet.`
     },
@@ -1756,9 +1861,11 @@ export function install(rt) {
   const linesFor = files => allEntries(files).map(entry => `- ${entry.file.topic ? `[[${entry.file.topic}]] ` : ''}${entry.text}`)
 
   function startSummary(bot, own, team, project, language, hash, key) {
+    // `project` is `{ name, lines }` for the project the panel reads, or undefined:
+    // its entries belong in the summary, not only the Bot's own and the team's (#71).
     const model = bot.model
     const job = (async () => {
-      const text = await botShot(bot, SUMMARY_SYSTEM, summaryRequest({ name: bot.name, own: linesFor(own), team: linesFor(team), language }), { sessionId: rt.chatOf(bot.id), kind: 'memory' })
+      const text = await botShot(bot, SUMMARY_SYSTEM, summaryRequest({ name: bot.name, own: linesFor(own), team: linesFor(team), project, language }), { sessionId: rt.chatOf(bot.id), kind: 'memory' })
       const value = { hash, scopes: key.slice(key.indexOf('|') + 1), text: text.slice(0, SUMMARY_TEXT_MAX), at: Date.now() }
       summaries.set(key, value)
       summaryFailures.delete(key)
@@ -1816,13 +1923,16 @@ export function install(rt) {
     }
     const entries = [...panelEntries(own, 'own'), ...panelEntries(team, 'team'), ...(project === undefined ? [] : panelEntries(project, 'project'))]
     const language = languageNow()
-    const hash = createHash('sha256').update(JSON.stringify([language, linesFor(own), linesFor(team), project === undefined ? [] : linesFor(project)])).digest('hex')
+    const projectLines = project === undefined ? [] : linesFor(project)
+    // The version sits in the fingerprint next to the entries: a request that changed
+    // shape must replace a summary even when every entry stayed the same (#71).
+    const hash = createHash('sha256').update(JSON.stringify([SUMMARY_VERSION, language, linesFor(own), linesFor(team), projectLines])).digest('hex')
     const key = summaryKey(bot.id, ['bot:' + bot.id, 'team', ...(projectScope === undefined ? [] : [scopeKey(projectScope)])])
     const saved = savedSummary(key)
     const prior = summaryFailures.get(key)
     const failed = prior?.hash === hash && prior.model === bot.model ? prior : undefined
     const wanted = body.regenerate === true || (body.summarize === true && saved?.hash !== hash && failed === undefined)
-    if (wanted && entries.length > 0 && !summarizing.has(key)) startSummary(bot, own, team, project, language, hash, key)
+    if (wanted && entries.length > 0 && !summarizing.has(key)) startSummary(bot, own, team, projectScope === undefined ? undefined : { name: projectName(projectScope.root), lines: projectLines }, language, hash, key)
     return {
       botId: bot.id,
       entries,
@@ -2489,6 +2599,7 @@ export function install(rt) {
             claim: entry.claim,
             evidence: String(entry.evidence ?? '').slice(0, 200),
             source: source.slice(0, 200),
+            ...taskByOf(record, taskScopeOf(record)),
             outcome,
             added: today(),
           },

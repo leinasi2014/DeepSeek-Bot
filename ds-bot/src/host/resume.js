@@ -114,6 +114,12 @@ export function install(rt) {
 
   // What a Session was sent and no turn has read yet.
   rt.unreadOf = sessionId => (queued[sessionId] ?? []).map(item => item.args)
+  // The same, plus what the last run left and this one has not sent again yet: a caller
+  // about to send must not send a second copy of one already noted.
+  rt.pendingOf = sessionId => [...(interrupted.queued[sessionId] ?? []).map(item => item.args), ...(queued[sessionId] ?? []).map(item => item.args)]
+  // A turn the last run noted as running: this start picks it up by itself, so nothing
+  // else may ask the same Session again.
+  rt.interruptedTurnOf = sessionId => interrupted.turns[sessionId]
   rt.forgetDelivery = forgetQueued
 
   // A message is done with once a turn takes it up, or once it leaves the inbox untaken
@@ -214,6 +220,10 @@ export function install(rt) {
   async function resumeAll() {
     await rt.load()
     if (rt.readOnly() !== undefined) return
+    // A group call saved before the restart may never have been asked; this start asks it
+    // through the same room delivery a round uses. It runs here, after the same delay, so
+    // group Sessions are made only once DSH has opened its workspaces.
+    await rt.recoverRoomCalls?.().catch(error => rt.warn('ds-bot: picking up group calls failed: %s', error))
     const { turns: noted, queued: dropped } = interrupted
     interrupted = { turns: {}, queued: {} }
     // Taken up now, so another restart does not pick them up twice.
@@ -240,8 +250,17 @@ export function install(rt) {
 
   ctx.effect(() => {
     const pending = Object.keys(interrupted.turns).length > 0 || Object.keys(interrupted.queued).length > 0
-    const timer = pending ? setTimeout(() => void resumeAll().catch(error => rt.warn('ds-bot: picking up interrupted work failed: %s', error)), RESUME_DELAY_MS) : undefined
-    timer?.unref?.()
+    let timer
+    const arm = () => {
+      if (timer !== undefined) return
+      timer = setTimeout(() => void resumeAll().catch(error => rt.warn('ds-bot: picking up interrupted work failed: %s', error)), rt.config?.roomRecoveryDelayMs ?? RESUME_DELAY_MS)
+      timer.unref?.()
+    }
+    // Also for a group call a crash left open: it is noted nowhere in inflight.json on
+    // purpose (that is the window it covers), so the book itself is what says there is
+    // work to pick up.
+    if (pending) arm()
+    else rt.load().then(() => { if ((rt.roomCallsAwaiting?.() ?? []).length > 0) arm() }).catch(() => {})
     // What the turns stopped by this shutdown left stays as last noted.
     return () => {
       stopped = true

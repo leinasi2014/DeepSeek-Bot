@@ -257,11 +257,34 @@ export function install(rt) {
   const minutesSince = at => Math.max(1, Math.round((Date.now() - at) / 60000))
 
   // A member's message in the round: in the log, for the members after it, and in the
-  // round's replies, for the user.
-  const postInRound = (room, round, member, text) => {
-    appendRoom(room, { who: member.name, botId: member.id, text })
+  // round's replies, for the user. `final` marks the one line that is the turn's answer
+  // rather than something it said on the way. Only such a line is a terminal fact: a
+  // restart may read it as the call being answered, which a step line ("still working")
+  // never is.
+  const postInRound = (room, round, member, text, final = false) => {
+    // The answer and the close of every call to this member go into one snapshot: a host
+    // that died in between would leave an answer on disk with the call it answered still
+    // open, and no later read could tell that apart from a member that never answered.
+    if (final) rt.closeRoomCalls?.(room.id, member.id)
+    appendRoom(room, { who: member.name, botId: member.id, text, ...(final ? { final: true } : {}) })
     round.replies.push({ botId: member.id, name: member.name, color: member.color, text, time: Date.now() })
     void rt.save().catch(() => {})
+  }
+  // The last thing a member wrote in this group is its answer after all: its turn ended
+  // with the steps and nothing more. Marking that line keeps the log's terminal fact true
+  // — a restart reads only marked lines as an answer, never a step spoken mid-turn. The
+  // marked line and the calls it settles are saved in one snapshot, so the two can never
+  // be read apart.
+  const markLastLineFinal = (room, memberId) => {
+    for (let at = room.log.length - 1; at >= 0; at -= 1) {
+      const line = room.log[at]
+      if (line.botId !== memberId || line.kind !== undefined || line.final === true) continue
+      room.log[at] = { ...line, final: true }
+      rt.closeRoomCalls?.(room.id, memberId)
+      void rt.save().catch(() => {})
+      return true
+    }
+    return false
   }
 
   // One member turn inside the room; resolves to its final text, `{ failure }` when its
@@ -294,9 +317,15 @@ export function install(rt) {
         timer = setTimeout(() => finish({ missed: true }), ROOM_REPLY_TIMEOUT_MS)
       }
       const work = () => { grace ??= setTimeout(() => finish({ working: true }), ROOM_WORK_GRACE_MS) }
+      // Every line a member writes is a place it can name another member, and an active
+      // member of a round always comes through here: `postStep` returns on the waiter
+      // before its own capture branch, so capturing only there would miss every round that
+      // matters. `sessionId` is the Session the line is spoken from, which is what ties the
+      // call to this turn.
       const say = (raw) => {
         const step = stripOwnName(member.name, raw)
         if (isPass(step)) return
+        captureRoomCalls(room, member, calleesOf(room, member, step, rt.isAdminOf(room, member.id)), sessionId)
         said.push(step)
         postInRound(room, round, member, step)
       }
@@ -349,13 +378,35 @@ export function install(rt) {
     for (const waiter of waitersOf(sessionId)) waiter.work()
   }
 
+  // Who a line actually calls, for both the dispatcher and the call book: the members it
+  // names, and, for the admin's "@all" only, everyone else. One function, so what is
+  // written down as a call is exactly what the round will ask. `leads` says whether the
+  // speaker may call the whole group; a member's "@all" names nobody.
+  const mentionsOf = (room, member, text) => {
+    const everyone = room.members.map(rt.botOf).filter(Boolean)
+    const mentions = mentionsIn(text, everyone)
+    return { all: mentions.all, found: mentions.found.filter(other => other.id !== member.id) }
+  }
+  const calleesOf = (room, member, text, leads) => {
+    const { all, found } = mentionsOf(room, member, text)
+    if (!leads || !all) return found
+    const others = room.members.map(rt.botOf).filter(other => other !== undefined && other.id !== member.id && !found.includes(other))
+    return [...found, ...others]
+  }
+
   // A called member moves up if it is still waiting, or gets one more turn if it
   // already spoke; either way it goes right after slot `index`. `cap` is the caller's
   // per-member turn bound for the round; `by` is the calling member, if a member called.
   function callMembers(round, turns, index, callees, note, cap, by) {
     let next = index + 1
     for (const peer of callees) {
-      if ((turns.get(peer.id) ?? 0) >= cap) continue
+      if ((turns.get(peer.id) ?? 0) >= cap) {
+        // Out of turns for this round: this member will not be called again, so the call
+        // the line opened has nobody left to answer it. Left in the book it would hold a
+        // report forever; drop it with the dispatcher's own key, not a second rule.
+        if (by !== undefined) rt.dropRoomCall?.(round.roomId, by, peer.id)
+        continue
+      }
       const waiting = round.slots.findIndex((other, at) => at > index && other.id === peer.id && other.status === 'waiting')
       const called = waiting === -1 ? { id: peer.id, name: peer.name, status: 'waiting' } : round.slots.splice(waiting, 1)[0]
       called.note = note
@@ -466,7 +517,10 @@ export function install(rt) {
         round.replies.push({ kind: 'working', botId: member.id, name: member.name, color: member.color, time: Date.now() })
       } else if (final !== undefined || (typeof reply === 'string' && said.length > 0)) {
         slot.status = 'posted'
-        if (final !== undefined) postInRound(room, round, member, final)
+        if (final !== undefined) postInRound(room, round, member, final, true)
+        // It ended on what it already said: that last step is the answer the group gets,
+        // so it is marked as such and the calls to this member are settled with it.
+        else markLastLineFinal(room, member.id)
       } else {
         slot.status = typeof reply === 'string' ? 'passed' : 'missed'
         round.passed.push(member.name)
@@ -475,13 +529,13 @@ export function install(rt) {
       const spoken = final === undefined ? said : [...said, final]
       if (spoken.length === 0) continue
       // Only the admin's "@all" calls everyone, so a member cannot set off a storm.
-      const leads = rt.isAdminOf(room, member.id)
       const everyone = room.members.map(rt.botOf).filter(Boolean)
-      const others = everyone.filter(other => other.id !== member.id)
-      const { all, found: named } = mentionsIn(spoken.join('\n\n'), everyone)
-      const found = named.filter(other => other.id !== member.id)
-      const callees = leads && all ? [...found, ...others.filter(other => !found.includes(other))] : found
+      const leads = rt.isAdminOf(room, member.id)
+      const callees = calleesOf(room, member, spoken.join('\n\n'), leads)
       callMembers(round, turns, index, callees, `${member.name} mentioned you`, leads ? ROOM_ADMIN_TURNS_EACH : ROOM_TURNS_EACH, member.id)
+      // This member has now had its say in the group: whatever was waiting on it from an
+      // earlier line of this round is settled, so the report that waited can go on.
+      for (const peer of everyone) rt.closeRoomCall?.(room.id, peer.id, member.id)
     }
   }
 
@@ -722,6 +776,10 @@ export function install(rt) {
     const text = stripOwnName(member.name, reply)
     const done = isPass(text) && shown && info.askedBy !== undefined
     if (isPass(text) && !done) return
+    // This is where a turn that ran past its round really reports back: the round loop has
+    // already moved on (or ended), so the call it answered is closed here rather than at the
+    // loop's tail. A pass with nothing more to say still counts as having answered.
+    for (const peer of room.members.map(rt.botOf).filter(Boolean)) rt.closeRoomCall?.(room.id, peer.id, member.id)
     const quiet = (room.lateRounds ?? 0) >= ROOM_LATE_ROUNDS
     if (!quiet) room.lateRounds = (room.lateRounds ?? 0) + 1
     await rt.save()
@@ -738,7 +796,72 @@ export function install(rt) {
     const member = rt.botOf(owner?.botId)
     return room !== undefined && member !== undefined && room.members.includes(member.id) ? { room, member } : undefined
   }
-  const callsIn = (room, member, text) => mentionsIn(text, room.members.map(rt.botOf).filter(Boolean)).found.some(bot => bot.id !== member.id)
+  const callsIn = (room, member, text) => mentionsOf(room, member, text).found.length > 0
+
+  // A line that names members is a call as of the line, and the line is written while the
+  // calling turn is still open. Both places a line can arrive go through this: `say` (a
+  // member already speaking in a round) and `postStep`'s later branch (a member posting
+  // outside a waiting round). Anything a round only records afterwards would be too late
+  // for a report made in this same turn.
+  //
+  // `peers` is the set the round will actually call, not just the names written: the
+  // admin's "@all" calls every other member, so the book must say so too. Both sides read
+  // it from `calleesOf`, so what is written down cannot drift from what is dispatched.
+  function captureRoomCalls(room, member, peers, sessionId) {
+    if (member === undefined || room === undefined) return
+    // The log position before the calling line: a restart reads from here to see whether
+    // the member the line named answered in the group afterwards.
+    for (const peer of peers) rt.openRoomCall?.(room.id, member.id, peer.id, sessionId, room.seq)
+  }
+
+  // A call whose line was saved but whose member was never asked: the round that would have
+  // asked it did not get that far before the host went down, and no round is left to run
+  // after a restart. The member is asked again through the same room delivery a round uses,
+  // and its answer closes the call by the ordinary late path.
+  //
+  // Two other shapes are read from what is on disk rather than guessed from empty
+  // process-local maps: a line the member's turn ended on (marked `final` — a terminal
+  // answer, never a "still working" step) after the call means the member did answer and
+  // only the close was lost, so the call is settled; a call whose member, group or Bot is
+  // gone is settled by handoffs' load hook. The ask is noted in the work (`recovered`) and
+  // its exchange id is fixed, so a restart loop asks once and a queued ask is not sent twice.
+  async function recoverRoomCalls() {
+    for (const call of rt.roomCallsAwaiting?.() ?? []) {
+      const room = rt.roomOf(call.room)
+      const member = rt.botOf(call.to)
+      if (room === undefined || member === undefined || !room.members.includes(member.id)) continue
+      if (call.since !== undefined && (room.log ?? []).some(line => line.final === true && line.botId === member.id && line.seq > call.since)) {
+        rt.closeRoomCall?.(room.id, call.from, member.id)
+        continue
+      }
+      if (call.recovered === true) continue
+      const session = await groupSessionFor(room, member)
+      if (session === undefined) continue
+      if (rt.live.get(session.id)?.turn !== undefined) continue
+      // Already asked: either noted as a turn the last run cut off (resume.js picks that up
+      // itself), or queued and not yet taken up (this run's queue, or the last run's notes
+      // resume.js will send again). Asking a second time would repeat the work.
+      if (rt.interruptedTurnOf?.(session.id) !== undefined) continue
+      if ((rt.pendingOf?.(session.id) ?? []).some(args => args.role === 'room' && args.roomId === room.id)) continue
+      const exchangeId = `room-recover:${call.id}`
+      const caller = rt.botOf(call.from)?.name ?? 'another member'
+      try {
+        await rt.deliver({
+          toId: member.id,
+          sessionId: session.id,
+          role: 'room',
+          roomId: room.id,
+          exchangeId,
+          note: 'picking up after a restart',
+          resumed: true,
+          text: `${caller} called you in this group before DeepSeek Harness restarted and your turn there never started. Read the group and answer there.`,
+        })
+        rt.markRoomCallRecovered?.(call.id)
+      } catch (error) {
+        rt.warn('ds-bot: asking %s again in %s failed: %s', member.name, room.name, error)
+      }
+    }
+  }
 
   // What a member says while it works, into the group. While the member holds its place
   // in a round, it joins that round. Later, it joins whatever round runs in the group, or
@@ -746,11 +869,16 @@ export function install(rt) {
   // round limit; the member that asked for the work answers the result.
   async function postStep(sessionId, info, text) {
     const waiter = info?.role === 'room' ? rt.roomWaiters.get(info.exchangeId) : undefined
+    // A member holding a place in a round comes through here first; `say` does the capture.
     if (waiter !== undefined) return waiter.say(text)
     const { room, member } = memberIn(sessionId, info) ?? {}
     if (room === undefined) return
     ensureRoomLog(room)
     const calls = callsIn(room, member, text)
+    // A step posted outside a round calls only the members it names (the post goes out as
+    // a progress/late line, which does not expand "@all"), so the book records exactly
+    // those.
+    captureRoomCalls(room, member, mentionsOf(room, member, text).found, sessionId)
     const running = [...rt.roomProgress.values()].find(round => round.roomId === room.id)
     if (!calls && running !== undefined) return postInRound(room, running, member, text)
     const quiet = !calls || (room.lateRounds ?? 0) >= ROOM_LATE_ROUNDS
@@ -821,11 +949,17 @@ export function install(rt) {
     const member = rt.botOf(owner?.botId)
     if (room === undefined || member === undefined || !room.members.includes(member.id)) return
     const { code, status, message } = failure
+    // A turn that failed is over too: it will not answer, so what waited on it must not be
+    // held forever. The failure is posted in the group, which is the visible record of it.
+    for (const peer of room.members.map(rt.botOf).filter(Boolean)) rt.closeRoomCall?.(room.id, peer.id, member.id)
     await postToRoom(room, member, `Could not finish: its model call failed (${failureLine(failure)}).`, {
       late: true, quiet: true, failed: { code, ...(status ? { status } : {}), message },
     }).catch(error => rt.warn('ds-bot: late group failure from %s failed: %s', member.name, error))
   }
   rt.lateRoomFailure = lateRoomFailure
+  // Asked by resume.js once its start delay has passed, the same way a cut-off turn is
+  // picked up: a group Session is created here, which waits until DSH has opened.
+  rt.recoverRoomCalls = recoverRoomCalls
 
   // A group the user just made opens with its admin asking what the group is for.
   async function greetRoom(roomId) {
