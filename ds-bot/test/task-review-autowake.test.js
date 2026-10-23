@@ -22,7 +22,7 @@ const TEAM = {
 const HISTORY = {
   b2: [
     { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Please run the release script now.' }] } } },
-    { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Ran scripts/ship.sh; the suite passed: tests 12/12.' }] } } } },
+    { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'On it — running the release script.' }] } } } },
   ],
 }
 
@@ -80,8 +80,9 @@ test('a backed-off apply retries itself when its wait expires, with no new idle'
   const planFile = () => join(planDir, readdirSync(planDir).find(n => n.endsWith('.json')))
   const memoryFile = join(home, 'memory', 'bots', 'b2', 'MEMORY.md')
 
-  // Exactly one idle: the report turn ends, the first apply fails with EIO.
-  await tool('complete_task', { result: 'done', claims: [{ kind: 'command', statement: '发布脚本跑通', evidence: 'tests 12/12', ref: 'part 1 #11' }] }, 'autowake-1')
+  // Exactly one idle: the report turn ends, the first apply fails with EIO. The claim
+  // is the user's own line 10, verbatim — a real user preference, not a self-report.
+  await tool('complete_task', { result: 'done', claims: [{ kind: 'user', statement: '发布前先跑发布脚本', evidence: 'Please run the release script now.', ref: 'part 1 #10' }] }, 'autowake-1')
   ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
   const settle = () => new Promise(resolve => setTimeout(resolve, 50))
   for (let i = 0; i < 100; i++) {
