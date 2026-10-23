@@ -23,12 +23,16 @@ const TEAM = {
   questions: {},
 }
 
-// A user line, then the answer that holds the evidence: `partLines` flushes an answer
-// only when it reaches the message it answers, exactly as a real part does.
+// A user line, the plain answer, and the tool result the claims quote: `command` and
+// `test` claims may only rest on a real tool result (#66), so the fixture carries one —
+// its tool name, its output and its exit code — instead of the Bot saying its own tests
+// passed. The Bot's own words could never prove that.
 const HISTORY = {
   b2: [
     { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Please run the release script now.' }] } } },
-    { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Ran scripts/ship.sh; the suite passed: tests 12/12.' }] } } } },
+    { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Ran scripts/ship.sh.' }] } } } },
+    { event: { seq: 12, type: 'tool/call', data: { turn: 1, step: 1, callId: 'k1', name: 'bash', arguments: '{"command":"npm test"}' } } },
+    { event: { seq: 13, type: 'tool/result', data: { turn: 1, step: 1, message: { role: 'tool', source: { kind: 'tool', callId: 'k1' }, toolCallId: 'k1', content: [{ type: 'text', text: 'tests 12/12 passing' }, { type: 'text', text: '[exit code: 0]' }] } } } },
   ],
 }
 
@@ -108,9 +112,27 @@ async function until(check) {
 }
 const idle = ctx => ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
 
-const CLAIM = { kind: 'command', statement: '发布脚本跑通了，测试 12/12 通过', evidence: 'tests 12/12', ref: 'part 1 #11' }
+const CLAIM = { kind: 'command', statement: '发布脚本跑通了，测试 12/12 通过', evidence: 'tests 12/12', ref: 'bash k1' }
 const report = { result: '完成发布脚本验证', claims: [CLAIM], notes: '' }
 const ONE_ITEM = [{ claim: 0, topic: '', text: '发布用 scripts/ship.sh，测试通过后再发布', outcome: 'verified' }]
+
+// The answers are matched to the questions by position, so the number of questions has to
+// be the number the caller can use. A plan holds eight entries; a ninth lesson extracted
+// from the same report used to be verified and then dropped by the freeze with no trace.
+// It is now recorded as unverified, and the batch stays at the eight the plan can hold.
+test('a report that yields more lessons than a plan holds keeps the extras on record', async t => {
+  const items = Array.from({ length: 9 }, (_, at) => ({ claim: 0, topic: '', text: `发布教训 ${at + 1}`, outcome: 'verified' }))
+  const s = start({ items, support: Array.from({ length: 8 }, () => 'yes') })
+  t.after(() => s.stop())
+  await s.tool('complete_task', report, 'b2', 'call-over-plan')
+  idle(s.ctx)
+  await until(() => s.plans()[0]?.status === 'DONE', () => `status=${s.plans()[0]?.status}`)
+  const record = s.plans()[0]
+  assert.equal(record.plan.items.length, 8, 'a plan holds eight entries')
+  assert.equal(record.unverified.filter(entry => entry.reason === 'plan-full').length, 1, 'the ninth lesson is kept on record')
+  assert.equal(s.requests.filter(request => String(request.system).startsWith('You check whether')).length, 1, 'one batch, not two')
+  assert.equal(parseMemory(readFileSync(s.memoryPathOf(record), 'utf8')).entries.length, 8)
+})
 
 test('a report without claims is refused and records nothing', async t => {
   const s = start()
@@ -149,7 +171,7 @@ test('a verified claim writes one entry with its review id, and the plan is kept
   const text = readFileSync(s.memoryFile(), 'utf8')
   // The entry carries the metadata §5/§6 require: where it came from, when it was added
   // (frozen with the plan, never recomputed), and whether it held.
-  assert.match(text, /- 发布用 scripts\/ship\.sh，测试通过后再发布 \[kind: howto; claim: 0; evidence: tests 12\/12; source: part 1 #11; outcome: verified; added: \d{4}-\d{2}-\d{2}; review_id: [0-9a-f]{16}\]/)
+  assert.match(text, /- 发布用 scripts\/ship\.sh，测试通过后再发布 \[kind: howto; claim: 0; evidence: tests 12\/12; source: bash k1; outcome: verified; added: \d{4}-\d{2}-\d{2}; review_id: [0-9a-f]{16}\]/)
   assert.equal(parseMemory(text).entries.length, 1)
   const [record] = s.plans()
   assert.equal(record.status, 'DONE')
@@ -283,7 +305,7 @@ test('a failed lesson is written with its outcome, so it is told apart from one 
   await until(() => existsSync(s.memoryFile()) && s.plans()[0]?.status === 'DONE')
   const text = readFileSync(s.memoryFile(), 'utf8')
   assert.match(text, /outcome: failed/)
-  assert.match(text, /source: part 1 #11/)
+  assert.match(text, /source: bash k1/)
   assert.match(text, /added: \d{4}-\d{2}-\d{2}/)
   assert.equal(parseMemory(text).entries.length, 1)
 })
@@ -307,7 +329,7 @@ test('an explicit re-verify reuses the stored lesson without extracting again', 
   // Re-verified or extracted, an entry carries the same metadata: a lesson that came
   // back through the explicit retry must not be the one line without a source or a date.
   const line = readFileSync(s.memoryPathOf(s.plans()[0]), 'utf8')
-  assert.match(line, /source: part 1 #11/)
+  assert.match(line, /source: bash k1/)
   assert.match(line, /outcome: verified/)
   assert.match(line, /added: \d{4}-\d{2}-\d{2}/)
 })

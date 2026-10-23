@@ -114,8 +114,10 @@ const TEAM = {
   questions: {},
 }
 
+// The default user line carries the facts the canned reviews below keep, so every positive
+// case rests on something the user really said (#66). A review quotes it in `evidence`.
 const ownChat = [
-  { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Please remember this' }] } } },
+  { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Please remember this: I like tea; I want short answers of one page at most; I like a plain style, mostly black and white; I am in Hangzhou; I use Rust; the team meets on Monday.' }] } } },
   { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Saved.' }] } } } },
 ]
 
@@ -123,19 +125,42 @@ const ownChat = [
 // of a Session, oldest first; each own chat has one user message, at seq 10, unless
 // it says otherwise. `requireSession` turns down a request without a Session, as
 // some routes do.
-function start({ home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-')), replies = [], config = {}, history = {}, reasoning = { efforts: [{ id: 'off' }, { id: 'high' }] }, models = ['v4'], defaultModel, requireSession = false } = {}) {
+//
+// The shared semantic gate (#66) asks its own prompt - 'You check whether quoted
+// evidence supports a claim' - once per review with changes, so it must NOT consume
+// the `replies` queue or every fixture after it would shift. `verify` is a separate
+// queue for explicit answers ('no' for the rejection cases); by default every entry
+// gets a canned 'yes', which is only used by fixtures whose evidence is a real,
+// verbatim source line. These calls emit no usage chunk, so token assertions stay
+// about the review call they measured before.
+function start({ home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-')), replies = [], verify = [], config = {}, history = {}, reasoning = { efforts: [{ id: 'off' }, { id: 'high' }] }, models = ['v4'], defaultModel, requireSession = false } = {}) {
   if (!existsSync(join(home, 'state.json'))) writeFileSync(join(home, 'state.json'), JSON.stringify(TEAM))
   const services = defaultModel === undefined ? {} : { agentDefaultModel: { currentSelection: () => ({ provider: 'deepseek', model: defaultModel }) } }
   const ctx = fakeContext({ services })
   const requests = []
+  // The semantic gate's calls land here, NOT in `requests`: every existing assertion
+  // counts and inspects the review passes it always meant, while the gate stays
+  // observable for the fixtures that assert it. Empty candidate sets make no call.
+  const verifyRequests = []
   Object.assign(ctx, {
     llm: {
       listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }],
       listModels: async () => models.map(id => ({ id })),
       resolveModelInfo: async () => ({ reasoning }),
       async* stream(request) {
-        requests.push(request)
         if (requireSession && request.sessionId === undefined) throw new Error('400: {"type":"MissingSessionID","message":"Request is missing x-opencode-session"}')
+        const system = String(request.system ?? '')
+        if (system.startsWith('You check whether quoted evidence supports')) {
+          verifyRequests.push(request)
+          const raw = request.messages?.at(-1)?.content
+          const body = typeof raw === 'string' ? raw : Array.isArray(raw) ? raw.map(block => block?.text ?? '').join('\n') : String(raw ?? '')
+          const entries = body.split('\n').filter(line => line.trim().startsWith('{')).length
+          const answer = verify.length > 0 ? verify.shift() : JSON.stringify({ support: Array.from({ length: entries }, () => 'yes') })
+          yield { type: 'text-delta', index: 0, text: typeof answer === 'string' ? answer : JSON.stringify(answer) }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+          return
+        }
+        requests.push(request)
         const reply = await replies.shift()
         if (reply instanceof Error) throw reply
         const out = typeof reply === 'object' && reply !== null ? reply : { text: reply ?? '' }
@@ -174,7 +199,7 @@ function start({ home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-')), replies =
     await ctx.dispose()
     if (!keep) rmSync(home, { recursive: true, force: true, maxRetries: 5 })
   }
-  return { ctx, home, call, tool, section, read, journal, requests, stop }
+  return { ctx, home, call, tool, section, read, journal, requests, verifyRequests, stop }
 }
 
 const settle = () => new Promise(resolve => setTimeout(resolve, 20))
@@ -671,11 +696,11 @@ test('"ask or update" answers from the entries and changes them through the same
   replies.push(JSON.stringify({
     reply: 'Done.',
     changes: [
-      { op: 'edit', entry: 1, text: 'Likes green tea' },
-      { op: 'add', text: 'Lives in Hangzhou' },
-      { op: 'add', text: 'Team meets on Monday', team: true },
+      { op: 'edit', entry: 1, text: 'Likes green tea', evidence: 'I like tea' },
+      { op: 'add', text: 'Lives in Hangzhou', evidence: 'I am in Hangzhou' },
+      { op: 'add', text: 'Team meets on Monday', evidence: 'the team meets on Monday', team: true },
       { op: 'remove', entry: 2 },
-      { op: 'add', text: 'token aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dE3f' },
+      { op: 'add', text: 'token aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dE3f', evidence: 'Please remember this' },
       { op: 'remove', entry: 9 },
     ],
   }))
@@ -698,8 +723,8 @@ test('"ask or update" answers from the entries and changes them through the same
 
 test('"ask or update" puts an add in a topic, and a name that cannot be one is refused', async (t) => {
   const replies = [JSON.stringify({ reply: 'Done.', changes: [
-    { op: 'add', text: 'Deploys between 8pm and 11pm on weekdays', topic: 'deploy' },
-    { op: 'add', text: 'Likes tea', topic: 'not a topic!!' },
+    { op: 'add', text: 'Deploys between 8pm and 11pm on weekdays', evidence: 'Please remember this', topic: 'deploy' },
+    { op: 'add', text: 'Likes tea', evidence: 'I like tea', topic: 'not a topic!!' },
   ] })]
   const { call, read, requests, stop } = start({ replies })
   t.after(() => stop())
@@ -717,7 +742,7 @@ test('"ask or update" puts an add in a topic, and a name that cannot be one is r
 
 test('"ask or update" says an add was not saved when the entry already sits in another file', async (t) => {
   const replies = [JSON.stringify({ reply: 'Done.', changes: [
-    { op: 'add', text: 'Likes tea', topic: 'travel' },
+    { op: 'add', text: 'Likes tea', evidence: 'I like tea', topic: 'travel' },
   ] })]
   const { tool, call, home, read, journal, stop } = start({ replies })
   t.after(() => stop())
@@ -771,10 +796,10 @@ test('when a turn ends, the memory review keeps what the user said, through the 
 
   replies.push(`\`\`\`json\n${JSON.stringify({
     changes: [
-      { op: 'add', text: 'The user likes a plain style, mostly black and white' },
-      { op: 'add', text: 'Everyone should keep it plain', team: true },
-      { op: 'edit', entry: 1, text: 'The user writes Rust' },
-      { op: 'add', text: 'The root password is hunter2' },
+      { op: 'add', text: 'The user likes a plain style, mostly black and white', evidence: 'I like it plain, mostly black and white' },
+      { op: 'add', text: 'Everyone should keep it plain', evidence: 'I like it plain, mostly black and white', team: true },
+      { op: 'edit', entry: 1, text: 'The user writes Rust', evidence: 'I moved to Rust' },
+      { op: 'add', text: 'The root password is hunter2', evidence: 'Please remember this' },
     ],
   })}\n\`\`\``)
   ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
@@ -831,7 +856,7 @@ test('when a turn ends, the memory review keeps what the user said, through the 
   assert.equal(existsSync(join(home, 'memory', 'team', 'MEMORY.md')), false)
 
   // Changes the user makes in the memory panel are no news.
-  replies.push(JSON.stringify({ reply: 'Done.', changes: [{ op: 'add', text: 'Likes tea' }] }))
+  replies.push(JSON.stringify({ reply: 'Done.', changes: [{ op: 'add', text: 'Likes tea', evidence: 'I like tea' }] }))
   await call('memory-ask', { botId: 'b2', text: 'I like tea' })
   assert.equal((await call('state', {})).value.memoryNews.b2.text, 'The user writes Rust')
 })
@@ -858,7 +883,7 @@ test('the memory review moves an entry out of MEMORY.md into a topic', async (t)
 })
 
 test('in a group, each member reviews the log, and an admin may keep it for the team', async (t) => {
-  const replies = [JSON.stringify({ changes: [{ op: 'add', text: 'The user wants everything under one page', team: true }] })]
+  const replies = [JSON.stringify({ changes: [{ op: 'add', text: 'The user wants everything under one page', evidence: 'Keep everything you send me under one page', team: true }] })]
   const { ctx, call, read, requests, stop } = start({ replies, config: { memoryReviewDelayMs: 0 } })
   t.after(() => stop())
   await call('state', {})
@@ -887,7 +912,7 @@ test('a first group review reads back to the user\'s line past a round of replie
 })
 
 test('an answer that is no list of changes keeps the review\'s place, and the next one reads the turn again', async (t) => {
-  const replies = ['Nothing worth keeping here.', JSON.stringify({ changes: [{ op: 'add', text: 'The user wants this remembered' }] })]
+  const replies = ['Nothing worth keeping here.', JSON.stringify({ changes: [{ op: 'add', text: 'The user wants this remembered', evidence: 'Please remember this' }] })]
   const { ctx, call, read, requests, stop } = start({ replies, config: { memoryReviewDelayMs: 0 } })
   t.after(() => stop())
   await call('state', {})
@@ -906,15 +931,15 @@ test('an answer that is no list of changes keeps the review\'s place, and the ne
 
 test('an answer with a malformed change, an unlisted entry, an entry too long, or a bad topic changes nothing and keeps the review\'s place', async (t) => {
   const invalid = [
-    JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }, { op: 'add' }] }),
-    JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }, { op: 'remove', entry: 7 }] }),
-    JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }, { op: 'add', text: `The user tells ${'a long story '.repeat(30)}` }] }),
-    JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }, { op: 'add', text: 'The user writes C++', topic: 'C++' }] }),
-    JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }, { op: 'edit', entry: 1, text: 'The user likes green tea', kind: 'fact' }] }),
+    JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea', evidence: 'I like tea' }, { op: 'add' }] }),
+    JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea', evidence: 'I like tea' }, { op: 'remove', entry: 7 }] }),
+    JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea', evidence: 'I like tea' }, { op: 'add', text: `The user tells ${'a long story '.repeat(30)}` }] }),
+    JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea', evidence: 'I like tea' }, { op: 'add', text: 'The user writes C++', evidence: 'Please remember this', topic: 'C++' }] }),
+    JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea', evidence: 'I like tea' }, { op: 'edit', entry: 1, text: 'The user likes green tea', evidence: 'I like tea', kind: 'fact' }] }),
   ]
   for (const [at, answer] of invalid.entries()) {
     await t.test(`invalid answer ${at + 1}`, async (t) => {
-      const replies = [answer, JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }, { op: 'add', text: 'I use hunter2 as my password' }] })]
+      const replies = [answer, JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea', evidence: 'I like tea' }, { op: 'add', text: 'I use hunter2 as my password', evidence: 'Please remember this' }] })]
       const { ctx, call, read, requests, stop } = start({ replies, config: { memoryReviewDelayMs: 0 } })
       t.after(() => stop())
       await call('state', {})
@@ -955,7 +980,7 @@ test('a backlog past the text limit is reviewed in passes, oldest first', async 
 })
 
 test('an answer past the change limit is applied in part, and the same lines are read once more', async (t) => {
-  const many = Array.from({ length: 9 }, (_, at) => ({ op: 'add', text: `The user likes thing ${at + 1}` }))
+  const many = Array.from({ length: 9 }, (_, at) => ({ op: 'add', text: `The user likes thing ${at + 1}`, evidence: 'Please remember this' }))
   const replies = [JSON.stringify({ changes: many }), JSON.stringify({ changes: [many[8]] })]
   const { ctx, call, read, requests, stop } = start({ replies, config: { memoryReviewDelayMs: 0 } })
   t.after(() => stop())
@@ -970,7 +995,7 @@ test('an answer past the change limit is applied in part, and the same lines are
 })
 
 test('an answer that reaches the change limit exactly is followed by another pass', async (t) => {
-  const many = Array.from({ length: 9 }, (_, at) => ({ op: 'add', text: `The user likes item ${at + 1}` }))
+  const many = Array.from({ length: 9 }, (_, at) => ({ op: 'add', text: `The user likes item ${at + 1}`, evidence: 'Please remember this' }))
   const replies = [JSON.stringify({ changes: many.slice(0, 8) }), JSON.stringify({ changes: [many[8]] })]
   const { ctx, call, read, requests, stop } = start({ replies, config: { memoryReviewDelayMs: 0 } })
   t.after(() => stop())
@@ -987,7 +1012,7 @@ test('a full MEMORY.md records a skip and moves on, and a later add with a topic
   mkdirSync(join(home, 'memory', 'bots', 'b2'), { recursive: true })
   const filler = Array.from({ length: 13 }, (_, at) => `- Filler fact number ${at + 1} ${'y'.repeat(280)}`)
   writeFileSync(join(home, 'memory', 'bots', 'b2', 'MEMORY.md'), `# Memory\n\n${filler.join('\n')}\n\n## Index\n`)
-  const replies = [JSON.stringify({ changes: [{ op: 'add', text: 'The user flies with Air China' }] }), JSON.stringify({ changes: [{ op: 'add', text: 'The user flies with Air China', topic: '出行' }] })]
+  const replies = [JSON.stringify({ changes: [{ op: 'add', text: 'The user flies with Air China', evidence: 'Please remember this' }] }), JSON.stringify({ changes: [{ op: 'add', text: 'The user flies with Air China', evidence: 'with Air China', topic: '出行' }] })]
   const history = { b2: [...ownChat] }
   const { ctx, call, read, requests, stop, journal } = start({ home, replies, history, config: { memoryReviewDelayMs: 0 } })
   t.after(() => stop())
@@ -1007,7 +1032,7 @@ test('a full MEMORY.md records a skip and moves on, and a later add with a topic
   assert.match(skipped.after, /Air China/)
   assert.doesNotMatch(read('bots', 'b2', 'MEMORY.md'), /Air China/)
   // New lines in the next turn start a new review; that add carries a topic and lands.
-  history.b2.push({ event: { seq: 12, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'I booked the flight today' }] } } })
+  history.b2.push({ event: { seq: 12, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'I booked the flight to Hangzhou with Air China' }] } } })
   history.b2.push({ event: { seq: 13, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Noted.' }] } } } })
   ctx.emit('agent/status', { agent: { id: 'b2' }, status: 'idle' })
   await reviewed(call)
@@ -1122,7 +1147,7 @@ for (const rejoins of [false, true]) {
 }
 
 test('a group admin deleted while its review writes leaves the team memory alone', async (t) => {
-  const many = Array.from({ length: 8 }, (_, at) => ({ op: 'add', text: `The team likes thing ${at + 1}`, team: true }))
+  const many = Array.from({ length: 8 }, (_, at) => ({ op: 'add', text: `The team likes thing ${at + 1}`, team: true, evidence: 'Keep everything you send me under one page' }))
   const { ctx, home, call, stop } = start({ replies: [JSON.stringify({ changes: many })], config: { memoryReviewDelayMs: 0 } })
   t.after(() => stop())
   await call('state', {})
@@ -1139,7 +1164,7 @@ test('a group admin deleted while its review writes leaves the team memory alone
 test('a member removed from the group while its turn runs is still reviewed', async (t) => {
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-'))
   writeFileSync(join(home, 'state.json'), JSON.stringify({ ...TEAM, rooms: { r1: { ...TEAM.rooms.r1, members: ['b2', 'b3', 'b4'], sessions: { b2: 'g2', b3: 'g3' } } } }))
-  const { ctx, call, read, requests, stop } = start({ home, replies: [JSON.stringify({ changes: [{ op: 'add', text: 'The user wants one page' }] })], config: { memoryReviewDelayMs: 0 } })
+  const { ctx, call, read, requests, stop } = start({ home, replies: [JSON.stringify({ changes: [{ op: 'add', text: 'The user wants one page', evidence: 'Keep everything you send me under one page' }] })], config: { memoryReviewDelayMs: 0 } })
   t.after(() => stop())
   await call('state', {})
   ctx.emit('agent/status', { agent: { id: 'g2' }, status: 'running' })
@@ -1152,7 +1177,7 @@ test('a member removed from the group while its turn runs is still reviewed', as
 })
 
 test('a Bot deleted while its review writes keeps no more of it, and its folder stays gone', async (t) => {
-  const many = Array.from({ length: 8 }, (_, at) => ({ op: 'add', text: `The user likes thing ${at + 1}` }))
+  const many = Array.from({ length: 8 }, (_, at) => ({ op: 'add', text: `The user likes thing ${at + 1}`, evidence: 'Please remember this' }))
   const { ctx, home, call, stop } = start({ replies: [JSON.stringify({ changes: many })], config: { memoryReviewDelayMs: 0 } })
   t.after(() => stop())
   await call('state', {})
@@ -1185,7 +1210,7 @@ for (const [how, act] of [
     const home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-'))
     const room = { ...TEAM.rooms.r1, members: ['b2', 'b3', 'b4'], sessions: { b2: 'g2', b3: 'g3' } }
     writeFileSync(join(home, 'state.json'), JSON.stringify({ ...TEAM, rooms: { r1: room } }))
-    const { ctx, call, read, requests, stop } = start({ home, replies: [JSON.stringify({ changes: [{ op: 'add', text: 'The user wants one page' }] })], config: { memoryReviewDelayMs: 200 } })
+    const { ctx, call, read, requests, stop } = start({ home, replies: [JSON.stringify({ changes: [{ op: 'add', text: 'The user wants one page', evidence: 'Keep everything you send me under one page' }] })], config: { memoryReviewDelayMs: 200 } })
     t.after(() => stop())
     await call('state', {})
     ctx.emit('agent/status', { agent: { id: 'g2' }, status: 'idle' })
@@ -1245,7 +1270,7 @@ test('a review shows both MEMORY.md files whole, then the newest topic entries t
 test('a turn whose Session moves to a fresh part before its review is still reviewed', async (t) => {
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-'))
   writeFileSync(join(home, 'state.lock'), JSON.stringify({ pid: process.ppid, host: hostname(), token: 'other' }))
-  const replies = [JSON.stringify({ changes: [{ op: 'add', text: 'The user wants short answers' }] })]
+  const replies = [JSON.stringify({ changes: [{ op: 'add', text: 'The user wants short answers', evidence: 'short answers of one page at most' }] })]
   const { ctx, call, read, requests, stop } = start({ home, replies, config: { memoryReviewDelayMs: 200 } })
   t.after(() => stop())
   await call('state', {})
@@ -1310,7 +1335,7 @@ test('a memory panel question names the Bot chat', async (t) => {
 test('a memory review of a Bot chat names that chat and saves its changes', async (t) => {
   const { ctx, call, read, requests, stop } = start({
     requireSession: true, config: { memoryReviewDelayMs: 0 },
-    replies: [JSON.stringify({ changes: [{ op: 'add', text: 'The user wants this remembered' }] })],
+    replies: [JSON.stringify({ changes: [{ op: 'add', text: 'The user wants this remembered', evidence: 'Please remember this' }] })],
   })
   t.after(() => stop())
   await call('state', {})
@@ -1324,7 +1349,7 @@ test('a memory review of a Bot chat names that chat and saves its changes', asyn
 test('a memory review of a group names the member Bot chat', async (t) => {
   const { ctx, call, read, requests, stop } = start({
     requireSession: true, config: { memoryReviewDelayMs: 0 },
-    replies: [JSON.stringify({ changes: [{ op: 'add', text: 'Keep replies under one page', team: true }] })],
+    replies: [JSON.stringify({ changes: [{ op: 'add', text: 'Keep replies under one page', evidence: 'Keep everything you send me under one page', team: true }] })],
   })
   t.after(() => stop())
   await call('state', {})
@@ -1494,9 +1519,9 @@ test('three unreadable reviews in a row give the batch up, with the lines kept',
 })
 
 test('one readable review clears the count, so two more bad ones do not give the batch up', async (t) => {
-  const replies = ['bad', 'bad', JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }] }), 'bad', 'bad']
+  const replies = ['bad', 'bad', JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea', evidence: 'I like tea' }] }), 'bad', 'bad']
   const lines = [
-    { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Please remember this' }] } } },
+    { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Please remember this: I like tea' }] } } },
     { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Saved.' }] } } } },
   ]
   const { ctx, call, read, requests, stop } = start({ home: undefined, replies, history: { b2: lines }, config: { memoryReviewDelayMs: 0 } })
@@ -1567,9 +1592,9 @@ test('after a cleared count, the next reviews each read their own new lines', as
 
 test('three semantically invalid reviews give up the batch, redact secrets, and start the next batch fresh', async (t) => {
   const invalid = [
-    { name: 'unlisted entry', change: { op: 'edit', entry: 999, text: 'The user likes tea' } },
-    { name: 'entry too long', change: { op: 'add', text: `The user says ${'a long story '.repeat(30)}` } },
-    { name: 'invalid topic', change: { op: 'add', text: 'The user writes C++', topic: 'C++' } },
+    { name: 'unlisted entry', change: { op: 'edit', entry: 999, text: 'The user likes tea', evidence: 'I like tea' } },
+    { name: 'entry too long', change: { op: 'add', text: `The user says ${'a long story '.repeat(30)}`, evidence: 'Please remember this' } },
+    { name: 'invalid topic', change: { op: 'add', text: 'The user writes C++', evidence: 'Please remember this', topic: 'C++' } },
   ]
   for (const { name, change } of invalid) {
     await t.test(name, async (t) => {
@@ -1647,7 +1672,7 @@ test('a model connection failure neither counts nor clears a rejected answer', a
 
 test('a failed memory write neither counts nor clears a rejected answer', async (t) => {
   const bad = JSON.stringify({ changes: [{ op: 'remove', entry: 999 }] })
-  const { ctx, home, call, read, requests, stop } = start({ replies: [bad, JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea' }] }), bad, JSON.stringify({ changes: [] })], config: { memoryReviewDelayMs: 0 } })
+  const { ctx, home, call, read, requests, stop } = start({ replies: [bad, JSON.stringify({ changes: [{ op: 'add', text: 'The user likes tea', evidence: 'I like tea' }] }), bad, JSON.stringify({ changes: [] })], config: { memoryReviewDelayMs: 0 } })
   t.after(() => stop())
   await call('state', {})
   const journalPath = join(home, 'memory', 'journal.jsonl')

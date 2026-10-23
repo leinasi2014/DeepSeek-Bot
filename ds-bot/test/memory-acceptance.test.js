@@ -287,7 +287,10 @@ test('scope: one Bot reading two projects keeps each summary to its own project 
 // with a healthy project lands in that project, not in the Bot's own memory.
 test('scope: the automatic review defaults to project and rejects unresolved', async t => {
   const broken = join(scopeWork, 'broken')
-  const reply = JSON.stringify({ changes: [{ op: 'add', text: 'The deploy window is 8pm' }] })
+  // The change quotes the user line the fixture yields (#66): a review entry rests on the
+  // exact words it came from, so the fixture carries them rather than relying on a looser
+  // gate that no longer exists.
+  const reply = JSON.stringify({ changes: [{ op: 'add', text: 'The deploy window is 8pm', evidence: 'The deploy window is 8pm.' }] })
   const startReview = (session, modelReplies) => {
     const ctx = fakeContext()
     const home = mkdtempSync(join(tmpdir(), '.dsh-test-memory-rt-'))
@@ -310,7 +313,17 @@ test('scope: the automatic review defaults to project and rejects unresolved', a
       llm: {
         listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }],
         resolveModelInfo: async () => ({ reasoning: { efforts: [{ id: 'off' }] } }),
-        async* stream() {
+        async* stream(request) {
+          // The shared semantic gate (#66) asks its own question once per review, so it must
+          // not consume the review replies. Every change here quotes the real user line the
+          // fixture yields, so a canned 'yes' per entry is the honest answer.
+          if (String(request?.system ?? '').startsWith('You check whether')) {
+            const body = [].concat(request?.messages?.at(-1)?.content ?? []).map(part => String(part?.text ?? '')).join('')
+            const entries = body.split('\n').filter(line => line.trim().startsWith('{')).length
+            yield { type: 'text-delta', index: 0, text: JSON.stringify({ support: Array.from({ length: entries }, () => 'yes') }) }
+            yield { type: 'finish', reason: { kind: 'stop' } }
+            return
+          }
           const out = modelReplies.shift()
           yield { type: 'text-delta', index: 0, text: out ?? '' }
           yield { type: 'finish', reason: { kind: 'stop' } }

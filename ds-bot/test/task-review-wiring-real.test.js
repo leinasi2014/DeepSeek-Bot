@@ -29,10 +29,18 @@ const TEAM = {
   questions: {},
 }
 
+const TOOL_RUN = [
+  // The tool result that actually shows the run (#66): a command claim quotes a tool
+  // result, never a Bot's own sentence about it.
+  { event: { seq: 12, type: 'tool/call', data: { turn: 1, step: 1, callId: 'k1', name: 'bash', arguments: '{}' } } },
+  { event: { seq: 13, type: 'tool/result', data: { turn: 1, step: 1, message: { role: 'tool', source: { kind: 'tool', callId: 'k1' }, toolCallId: 'k1', content: [{ type: 'text', text: 'tests 12/12 passing\n[exit code: 0]' }] } } } },
+]
+
 const HISTORY = {
   chief: [
     { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Please have the release notes written.' }] } } },
     { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'I asked Writer; the notes say tests 12/12.' }] } } } },
+    ...TOOL_RUN,
   ],
   'desk-chief': [
     { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '@Chief 安排一下发布说明.' }] } } },
@@ -41,11 +49,12 @@ const HISTORY = {
   'desk-writer': [
     { event: { seq: 10, type: 'user/message', data: { source: { kind: 'bot', role: 'room' }, content: [{ type: 'text', text: '你的回合' }] } } },
     { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '写好了，测试 12/12 通过。' }] } } } },
+    ...TOOL_RUN.map(({ event }) => ({ event: { ...event, seq: event.seq + 1 } })),
   ],
 }
 
 const ITEM = [{ claim: 0, topic: '', text: '发布说明由 Writer 写，测试通过后再发', outcome: 'verified' }]
-const CLAIM = { kind: 'command', statement: '发布脚本跑通了，测试 12/12 通过', evidence: 'tests 12/12', ref: 'part 1 #11' }
+const CLAIM = { kind: 'command', statement: '发布脚本跑通了，测试 12/12 通过', evidence: 'tests 12/12', ref: 'bash k1' }
 const report = { result: '完成发布脚本验证', claims: [CLAIM], notes: '' }
 
 async function start(t) {
@@ -223,7 +232,7 @@ test('a member the admin called in a group holds the report until it answers the
   // The report is made inside the same turn, before `turn/end`: the call is already there.
   // The evidence must be in this group Session's own lines, so the claim quotes what the
   // user said there.
-  const groupReport = { result: '完成发布说明安排', claims: [{ kind: 'command', statement: '发布说明已安排', evidence: '@Chief 安排一下发布说明', ref: 'part 1 #10' }], notes: '' }
+  const groupReport = { result: '完成发布说明安排', claims: [{ kind: 'user', statement: '发布说明已安排', evidence: '@Chief 安排一下发布说明', ref: 'part 1 #10' }], notes: '' }
   const accepted = await s.tool('complete_task', groupReport, 'desk-chief', 'call-group-report')
   assert.match(String(accepted), /Recorded as a candidate/)
   assert.equal(s.plans().length, 1, 'the report was accepted as a candidate')
@@ -264,7 +273,7 @@ test('a member that started speaking in the group still holds the report', async
   s.emit('desk-chief', 'turn/start', { turn: 1 })
   s.emit('desk-chief', 'user/message', { content: chiefBrief.content, source: chiefBrief.source })
   await s.rt.roomStepText('desk-chief', s.rt.live.get('desk-chief')?.info, '@Writer 写发布说明，测试 12/12 通过。', true)
-  const groupReport = { result: '完成发布说明安排', claims: [{ kind: 'command', statement: '发布说明已安排', evidence: '@Chief 安排一下发布说明', ref: 'part 1 #10' }], notes: '' }
+  const groupReport = { result: '完成发布说明安排', claims: [{ kind: 'user', statement: '发布说明已安排', evidence: '@Chief 安排一下发布说明', ref: 'part 1 #10' }], notes: '' }
   await s.tool('complete_task', groupReport, 'desk-chief', 'call-group-speaking')
   s.emit('desk-chief', 'assistant/message', { message: { content: [{ type: 'text', text: '@Writer 写发布说明，测试 12/12 通过。' }] } })
   s.emit('desk-chief', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
