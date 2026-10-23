@@ -249,3 +249,41 @@ test('a member the admin called in a group holds the report until it answers the
   s.idle('desk-chief')
   await until(() => s.plans()[0]?.status === 'DONE')
 })
+
+// A member that has started speaking has not answered yet. The wait ends when it really
+// says something, not when its turn begins: opening the turn must not let the report out.
+test('a member that started speaking in the group still holds the report', async t => {
+  const s = await start(t)
+  const stop = new AbortController()
+  t.after(() => stop.abort())
+  s.emit('desk', 'user/message', { content: [{ type: 'text', text: '@Chief 安排一下发布说明.' }], source: { kind: 'user' } })
+  void s.tool('group_relay', {}, 'desk', 'call-relay-2', { signal: stop.signal }).catch(() => {})
+
+  await until(() => s.agentOf('desk-chief').calls.length === 1)
+  const chiefBrief = s.agentOf('desk-chief').calls.at(-1)
+  s.emit('desk-chief', 'turn/start', { turn: 1 })
+  s.emit('desk-chief', 'user/message', { content: chiefBrief.content, source: chiefBrief.source })
+  await s.rt.roomStepText('desk-chief', s.rt.live.get('desk-chief')?.info, '@Writer 写发布说明，测试 12/12 通过。', true)
+  const groupReport = { result: '完成发布说明安排', claims: [{ kind: 'command', statement: '发布说明已安排', evidence: '@Chief 安排一下发布说明', ref: 'part 1 #10' }], notes: '' }
+  await s.tool('complete_task', groupReport, 'desk-chief', 'call-group-speaking')
+  s.emit('desk-chief', 'assistant/message', { message: { content: [{ type: 'text', text: '@Writer 写发布说明，测试 12/12 通过。' }] } })
+  s.emit('desk-chief', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
+  s.idle('desk-chief')
+  await until(() => s.plans()[0]?.status === 'WAITING')
+
+  // Writer takes its turn (turn/start) but has not said anything yet.
+  await until(() => s.agentOf('desk-writer').calls.length === 1)
+  const writerBrief = s.agentOf('desk-writer').calls.at(-1)
+  s.emit('desk-writer', 'turn/start', { turn: 1 })
+  s.emit('desk-writer', 'user/message', { content: writerBrief.content, source: writerBrief.source })
+  s.idle('desk-chief')
+  await new Promise(resolve => setTimeout(resolve, 400))
+  assert.equal(s.plans()[0]?.status, 'WAITING', 'a member that has only started its turn has not answered')
+  assert.equal(s.memoryText(), '', 'nothing is written while it is still speaking')
+
+  // It answers: now the candidate goes on.
+  s.emit('desk-writer', 'assistant/message', { message: { content: [{ type: 'text', text: '写好了，测试 12/12 通过。' }] } })
+  s.emit('desk-writer', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
+  s.idle('desk-chief')
+  await until(() => s.plans()[0]?.status === 'DONE')
+})
