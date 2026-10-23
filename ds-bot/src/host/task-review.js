@@ -414,21 +414,27 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
 
   // The bounded wake for a backed-off apply (#67): one timer per candidate, unref'd,
   // re-armed by whatever pass finds a wait still ahead (a restart rebuilds it), cleared
-  // with this factory. It holds nothing — the pass it wakes does the work.
+  // with this factory. It holds nothing — the pass it wakes does the work. Disposal is
+  // final: work that was still in flight when dispose ran may finish and report a wait,
+  // but a disposed factory never arms that timer and never fires a wake from it.
   const wakeTimers = new Map()
+  let disposed = false
   function scheduleWake(record) {
+    if (disposed) return
     if (record.retryAt === undefined) return
     const running = wakeTimers.get(record.candidateId)
     if (running !== undefined) clearTimeout(running)
     const wait = Math.max(0, Date.parse(record.retryAt) - Date.parse(now()))
     const timer = setTimeout(() => {
       wakeTimers.delete(record.candidateId)
+      if (disposed) return
       wake(record)
     }, wait)
     timer.unref?.()
     wakeTimers.set(record.candidateId, timer)
   }
   function dispose() {
+    disposed = true
     for (const timer of wakeTimers.values()) clearTimeout(timer)
     wakeTimers.clear()
   }

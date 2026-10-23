@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { candidateIdOf, reviewIdOf, STATUS, taskReview } from '../src/host/task-review.js'
+import { candidateIdOf, RETRY_WAIT_MS, reviewIdOf, STATUS, taskReview } from '../src/host/task-review.js'
 import { formatEntry, looksSecret, parseMemory } from '../src/host/memory.js'
 
 // A memory root whose scopes are plain text files, so the review can be driven without a
@@ -630,6 +630,43 @@ test('the wake timer fires at the recorded wait and is cleared with the factory'
   const armed = fired.length
   await new Promise(resolve => setTimeout(resolve, 300))
   assert.equal(fired.length, armed, 'dispose clears the timer: nothing fires after it')
+})
+
+// The in-flight case (#67): disposal can land while an apply is still running. When
+// that apply then fails and reports a wait, the disposed factory must not arm it —
+// old work cannot schedule a wake that outlives the factory it belonged to.
+test('a disposed factory cannot arm a wake from a finishing in-flight apply', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'ds-bot-task-wake-late-'))
+  t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 5 }))
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  let entered
+  const inApply = new Promise(resolve => { entered = resolve })
+  const fired = []
+  const review = taskReview({
+    root,
+    check: async () => ({ ok: true, project: 'project:a' }),
+    extract: async () => ({ items: [{ scope: 'project:a', text: '用脚本发布', outcome: 'verified', source: 'part 1 #2' }] }),
+    applyItem: async () => {
+      entered()
+      await gate
+      throw Object.assign(new Error('EIO'), { code: 'EIO' })
+    },
+    linkTopic: async () => {},
+    readScope: () => [],
+    parse: parseMemory,
+    format: formatEntry,
+    now: () => '2026-10-22T00:00:00.000Z',
+    wake: record => fired.push(record.candidateId),
+  })
+  const { candidateId } = await review.enqueue(candidate)
+  const running = review.process(candidateId)
+  await inApply // the apply is inside its write, its failure has not landed yet
+  review.dispose()
+  release()
+  await running
+  await new Promise(resolve => setTimeout(resolve, RETRY_WAIT_MS[0] + 100))
+  assert.deepEqual(fired, [], 'a disposed factory cannot schedule a future wake from old work')
 })
 
 test('an unreadable candidate file is quarantined and the others still run', async t => {
