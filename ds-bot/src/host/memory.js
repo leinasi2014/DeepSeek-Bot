@@ -694,6 +694,10 @@ export function install(rt) {
   const openQuestionIds = () => new Set(Object.values(state.questions ?? {}).map(question => question?.id).filter(id => typeof id === 'string'))
 
   async function taskReviewCheck(record) {
+    // A guard for a caller that got here anyway: both ways a candidate is looked at
+    // (`taskRecovery` after load, `runSessionTasks` after a turn) return before this while
+    // the review is off, so the record keeps its bytes. This answer is "waiting" and not a
+    // terminal reason, so such a candidate is looked at again once the review is on.
     if (!reviewOn) return { ok: false, waiting: true }
     if (rt.botOf(record.botId) === undefined) return { ok: false, reason: 'bot-gone' }
     if (rt.selfOf(record.sessionId) !== record.botId) return { ok: false, reason: 'session-changed' }
@@ -908,13 +912,19 @@ export function install(rt) {
   })
   // Candidates are resumed after the team loads, and again whenever the files change on
   // disk; a candidate with a frozen plan never asks the model again.
-  const taskRecovery = () => (rt.readOnly() === undefined ? taskReview.recover().catch(error => rt.warn('ds-bot: task review recovery failed: %s', error)) : Promise.resolve([]))
+  //
+  // With the review switched off nothing is scanned at all (#68): `check` has no verdict
+  // to give while it is off, so a scan would rewrite every record as WAITING — a state
+  // that says "waiting on something", not "switched off". The files keep their bytes and
+  // the next pass after it is switched on decides what happens, on the same evidence.
+  const taskRecovery = () => (reviewOn && rt.readOnly() === undefined ? taskReview.recover().catch(error => rt.warn('ds-bot: task review recovery failed: %s', error)) : Promise.resolve([]))
   const taskRunning = new Map()
   // Candidates are woken by whoever is idle now, compared by the Bot that speaks, not by
   // the Session id: a conversation that changed part has a new Session id, and a candidate
   // recorded under the old one would otherwise never be looked at again. The candidate's
   // own `check` still decides whether anything happens — this only picks the moment.
   function runSessionTasks(sessionId) {
+    if (!reviewOn) return Promise.resolve([])
     if (taskRunning.has(sessionId)) return taskRunning.get(sessionId)
     const who = rt.selfOf(sessionId)
     const job = (async () => {
@@ -2355,6 +2365,13 @@ export function install(rt) {
     if (endpoint === 'memory-view') return memoryView(body)
     if (endpoint === 'memory-ask') return memoryAsk(body)
     if (endpoint === 'memory-forget') return memoryForget(body)
+    // With the review off, the two explicit task endpoints are refused as well: retry
+    // rewrites the candidate and re-verify may save it and ask the model, and both would
+    // walk the queue the switch stopped (#68). The candidate keeps its bytes until the
+    // review is on again; nothing is added, no state changes.
+    if (!reviewOn && (endpoint === 'memory-task-retry' || endpoint === 'memory-task-reverify')) {
+      return { ok: false, error: 'Task review is turned off, so the candidate was left untouched.' }
+    }
     // The explicit way back for a task whose lessons the evidence gates refused: nothing
     // retries by itself, and a frozen plan is never extracted again.
     if (endpoint === 'memory-task-retry') {
