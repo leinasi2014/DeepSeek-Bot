@@ -35,10 +35,25 @@ function harness(t, {
       calls.extract += 1
       return extract === undefined ? { items: [{ scope: 'project:a', text: '用脚本发布', outcome: 'verified', source: 'part 1 #2' }] } : extract(record, calls)
     },
-    applyItem: async (item) => {
+    applyItem: async (item, hooks) => {
+      // Emulates the memory module's queue side (#64): fresh committed state, the
+      // review's decision on it, the repair link in the same step, then the write.
+      const files_ = scopeFiles(item.scope)
+      const names = [...new Set(item.topic === '' ? ['MEMORY.md'] : [`${item.topic}.md`, 'MEMORY.md'])]
+      const hashes = {}
+      for (const name of names) hashes[name] = createHash('sha256').update(files_[name] ?? '').digest('hex')
+      const entries = Object.entries(files_).flatMap(([file, content]) => parseMemory(content).entries.map(entry => ({ file, topic: file === 'MEMORY.md' ? '' : file.slice(0, -3), text: entry.text, meta: entry.meta ?? {} })))
+      const hasLink = item.topic === '' || (files_['MEMORY.md'] ?? '').includes(`[[${item.topic}]]`)
+      const verdict = await hooks.decide({ hashes, entries, hasLink })
+      if (verdict.kind !== 'proceed') {
+        if (verdict.link !== undefined && !files_['MEMORY.md'].includes(`[[${verdict.link}]]`)) {
+          calls.link.push(`${item.scope}/${verdict.link}`)
+          files_['MEMORY.md'] = files_['MEMORY.md'].replace('\n## Index', `\n## Index\n\n- [[${verdict.link}]]`)
+        }
+        return { skipped: verdict.kind, file: verdict.file, conflict: verdict.conflict }
+      }
       calls.apply.push(item)
       if (fail !== undefined) throw fail
-      const files_ = scopeFiles(item.scope)
       const name = item.topic === '' ? 'MEMORY.md' : `${item.topic}.md`
       const content = files_[name] ?? blank(item.topic)
       // The memory module deduplicates across the whole scope, not just the target file.
@@ -70,27 +85,37 @@ const only = (text, meta) => formatEntry(text, meta)
 
 // #64: a builder whose first factory fails inside apply and whose recovery factory
 // does not, both over one shared files state, so an interruption and its recovery
-// see the same scope.
+// see the same scope. `beforeDecide` mutates the files right before the queued
+// decision reads them — the seam a commit landing ahead of the queued apply comes
+// through.
 function prehashHarness(t) {
   const root = mkdtempSync(join(tmpdir(), 'ds-bot-task-prehash-'))
   t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 5 }))
   const files = { 'project:a': { 'MEMORY.md': '# Memory\n\n## Index\n' } }
   const calls = { apply: 0, link: 0 }
-  const build = ({ fail } = {}) => taskReview({
+  const build = ({ fail, beforeDecide } = {}) => taskReview({
     root,
     check: async () => ({ ok: true, project: 'project:a' }),
     extract: async () => ({ items: [{ scope: 'project:a', text: '用脚本发布', outcome: 'verified', source: 'part 1 #2' }] }),
     applyItem: async (item, hooks) => {
       const files_ = files[item.scope]
-      // The queue-side contract the real memory module runs: committed hashes of the
-      // files this item may write, the review's pre-write decision, and only then
-      // the write — the stub throws after the hook, the way the real one does (#64).
-      const names = [...new Set(item.topic === '' ? ['MEMORY.md'] : [`${item.topic}.md`, 'MEMORY.md'])]
-      const held = new Map(Object.entries(files_))
-      const hashes = {}
-      for (const name of names) hashes[name] = createHash('sha256').update(held.get(name) ?? '').digest('hex')
-      const verdict = await hooks.preWrite(hashes)
-      if (verdict?.skip === true) return { skipped: true, verdict }
+      const state = () => {
+        const names = [...new Set(item.topic === '' ? ['MEMORY.md'] : [`${item.topic}.md`, 'MEMORY.md'])]
+        const hashes = {}
+        for (const name of names) hashes[name] = createHash('sha256').update(files_[name] ?? '').digest('hex')
+        const entries = Object.entries(files_).flatMap(([file, content]) => parseMemory(content).entries.map(entry => ({ file, topic: file === 'MEMORY.md' ? '' : file.slice(0, -3), text: entry.text, meta: entry.meta ?? {} })))
+        const hasLink = item.topic === '' || (files_['MEMORY.md'] ?? '').includes(`[[${item.topic}]]`)
+        return { hashes, entries, hasLink }
+      }
+      if (beforeDecide !== undefined) beforeDecide(item, files_)
+      const verdict = await hooks.decide(state())
+      if (verdict.kind !== 'proceed') {
+        if (verdict.link !== undefined && !files_['MEMORY.md'].includes(`[[${verdict.link}]]`)) {
+          calls.link += 1
+          files_['MEMORY.md'] = files_['MEMORY.md'].replace('\n## Index', `\n## Index\n\n- [[${verdict.link}]]`)
+        }
+        return { skipped: verdict.kind, file: verdict.file, conflict: verdict.conflict }
+      }
       calls.apply += 1
       if (fail === 'eio') throw Object.assign(new Error('EIO'), { code: 'EIO' })
       if (fail === 'full') throw Object.assign(new Error('memory is full'), { code: 'memory/full' })
@@ -105,7 +130,7 @@ function prehashHarness(t) {
     },
     linkTopic: async (scope, topic) => {
       calls.link += 1
-      files[scope].MEMORY.md = files[scope].MEMORY.md.replace('\n## Index', `\n## Index\n\n- [[${topic}]]`)
+      files[scope]['MEMORY.md'] = files[scope]['MEMORY.md'].replace('\n## Index', `\n## Index\n\n- [[${topic}]]`)
     },
     readScope: scope => Object.entries(files[scope] ?? {}).map(([file, content]) => ({ file, topic: file === 'MEMORY.md' ? '' : file.slice(0, -3), content })),
     parse: parseMemory,
@@ -174,18 +199,20 @@ test('a topic item watches the link target too', async t => {
     check: async () => ({ ok: true, project: 'project:a' }),
     extract: async () => ({ items: [{ scope: 'project:a', topic: 'travel', text: '用脚本发布', outcome: 'verified', source: 'part 1 #2' }] }),
     applyItem: async (item, hooks) => {
+      const files_ = files['project:a']
       const names = [...new Set(item.topic === '' ? ['MEMORY.md'] : [`${item.topic}.md`, 'MEMORY.md'])]
-      const held = new Map(Object.entries(files['project:a']))
       const hashes = {}
-      for (const name of names) hashes[name] = createHash('sha256').update(held.get(name) ?? '').digest('hex')
-      const verdict = await hooks.preWrite(hashes)
-      if (verdict?.skip === true) return { skipped: true, verdict }
+      for (const name of names) hashes[name] = createHash('sha256').update(files_[name] ?? '').digest('hex')
+      const entries = Object.entries(files_).flatMap(([file, content]) => parseMemory(content).entries.map(entry => ({ file, topic: file === 'MEMORY.md' ? '' : file.slice(0, -3), text: entry.text, meta: entry.meta ?? {} })))
+      const hasLink = item.topic === '' || (files_['MEMORY.md'] ?? '').includes(`[[${item.topic}]]`)
+      const verdict = await hooks.decide({ hashes, entries, hasLink })
+      if (verdict.kind !== 'proceed') return { skipped: verdict.kind, file: verdict.file, conflict: verdict.conflict }
       if (failing) throw Object.assign(new Error('EIO'), { code: 'EIO' })
       files[item.scope]['travel.md'] = `# travel\n\n${item.line}\n\n## Index\n`
       return { changed: true, file: 'travel.md' }
     },
     linkTopic: async (scope, topic) => {
-      files[scope].MEMORY.md = files[scope].MEMORY.md.replace('\n## Index', `\n## Index\n\n- [[${topic}]]`)
+      files[scope]['MEMORY.md'] = files[scope]['MEMORY.md'].replace('\n## Index', `\n## Index\n\n- [[${topic}]]`)
     },
     readScope: scope => Object.entries(files[scope] ?? {}).map(([file, content]) => ({ file, topic: file === 'MEMORY.md' ? '' : file.slice(0, -3), content })),
     parse: parseMemory, format: formatEntry, entryProblem: () => undefined, secretEntry: () => false,
@@ -216,6 +243,21 @@ test('a capacity failure keeps the pre-write state without spending a retry, and
   assert.equal(done.status, STATUS.done)
   assert.equal(done.progress.pending, undefined)
   assert.match(s.files['project:a']['MEMORY.md'], /用脚本发布/)
+})
+
+// #64, the queue-boundary case Codex proved on 08dddd8: a same-text commit landing
+// between the decision's read and the item's write. The decision reads inside the
+// queue, so it sees the committed duplicate and ends the item as done on that file,
+// never as a manual conflict — and writes no second copy.
+test('a duplicate committed ahead of the queued apply explains the pending hash', async t => {
+  const s = prehashHarness(t)
+  const { candidateId } = await s.build({ fail: 'eio' }).enqueue(candidate)
+  await s.build({ fail: 'eio' }).process(candidateId)
+  const recovered = await s.build({
+    beforeDecide: (item, files_) => { files_['MEMORY.md'] = `# Memory\n\n- ${item.text}\n\n## Index\n` },
+  }).process(candidateId)
+  assert.equal(recovered.status, STATUS.done, 'a same-text committed predecessor is deduplicated, not held as a manual conflict')
+  assert.equal(parseMemory(s.files['project:a']['MEMORY.md']).entries.length, 1)
 })
 
 test('a candidate is identified by its session and tool call, and a plan item by its review id', () => {

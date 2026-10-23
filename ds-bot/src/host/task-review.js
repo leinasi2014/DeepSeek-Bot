@@ -249,7 +249,8 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
   }
 
   // What the scope holds right now, by committed content. One parse per file, and only for
-  // the files of the scopes the plan actually touches.
+  // the files of the scopes the plan actually touches. The apply path reads nothing here
+  // anymore: its reads happen inside the memory write queue (#64).
   function entriesOf(scope) {
     const files = readScope(scope) ?? []
     return files.flatMap(file => parse(file.content ?? '').entries.map(entry => ({
@@ -264,53 +265,44 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
 
   // Applies one item, or explains why it could not be applied. Returns one of
   // `done` / `deduplicated` / `conflict` / `retrying`, so the caller only decides status.
-  async function applyOne(record, item, seen) {
+  // Every read the decision needs — the scope's current entries, the pre-write
+  // hashes, the link state — happens inside the memory write queue, in the same
+  // critical section as the write itself, through the hook below: nothing can move
+  // under the decision, and no queue-outside snapshot goes stale (#64).
+  async function applyOne(record, item) {
     if (isDone(record, item.reviewId)) return { kind: 'done', skipped: true }
-    const sameId = seen.find(entry => entry.meta.review_id === item.reviewId)
-    if (sameId !== undefined) {
-      // The id says this is the entry the plan made. Only the exact frozen line counts:
-      // a user edit keeps the id but changes the line, and that must not be overwritten.
-      if (format(sameId.text, sameId.meta) === item.line) {
-        if (item.topic !== '' && !(readScope(item.scope).some(file => file.file === item.topic + '.md' && file.content.includes(`[[${item.topic}]]`)))) {
-          await linkTopic(item.scope, item.topic)
-        }
-        markDone(record, item.reviewId, sameId.file)
-        return { kind: 'done', repaired: true, file: sameId.file }
-      }
-      record.progress.conflicts.push({ reviewId: item.reviewId, file: sameId.file, expected: item.line, found: format(sameId.text, sameId.meta) })
-      return { kind: 'conflict', file: sameId.file }
-    }
     let result
     try {
       result = await applyItem(item, {
-        // Runs inside the memory write queue, in the same critical section as the
-        // write itself: the committed hashes the decision reads cannot move under
-        // it, and the pre-write state is persisted with the very write it guards,
-        // so no other memory write — a remember, a move, another review — can land
-        // between the two (#64).
-        preWrite: async (hashes) => {
+        decide: async ({ hashes, entries, hasLink }) => {
+          // The id says an entry is the one this plan made. Only the exact frozen line
+          // counts: a user edit keeps the id but changes the line, and that must not
+          // be overwritten. A missing topic link is repaired in the same queued job.
+          const sameId = entries.find(entry => entry.meta.review_id === item.reviewId)
+          if (sameId !== undefined) {
+            if (format(sameId.text, sameId.meta) === item.line) {
+              return { kind: 'done', file: sameId.file, ...(item.topic !== '' && !hasLink ? { link: item.topic } : {}) }
+            }
+            return { kind: 'conflict', file: sameId.file, conflict: { reviewId: item.reviewId, file: sameId.file, expected: item.line, found: format(sameId.text, sameId.meta) } }
+          }
           // An interrupted attempt left this item's pre-write state. When a file it
-          // was about to write no longer matches it, that change is either one of
-          // this plan's own writes (explained by the review id and the exact frozen
-          // line above), the same text elsewhere in the scope (the duplicate below),
-          // or a person's edit — the last one stops for the person instead of
-          // writing over their words (#64).
+          // was about to write no longer matches it, that change is either the same
+          // text elsewhere in the scope (the duplicate below) or a person's edit —
+          // the last one stops for the person instead of writing over their words.
           const pending = record.progress.pending
           if (pending !== undefined && pending.reviewId === item.reviewId) {
             const changedFile = Object.keys(pending.files).find(file => hashes[file] !== pending.files[file])
             if (changedFile !== undefined) {
-              const twin = seen.find(entry => entry.text === item.text)
-              if (twin !== undefined) {
-                markDone(record, item.reviewId, twin.file)
-                return { skip: true, kind: 'deduplicated', file: twin.file }
-              }
-              record.progress.conflicts.push({ reviewId: item.reviewId, file: changedFile, expected: item.line, found: null, reason: 'pre-write content changed', expectedHash: pending.files[changedFile], foundHash: hashes[changedFile] })
-              return { skip: true, kind: 'conflict', file: changedFile }
+              const twin = entries.find(entry => entry.text === item.text)
+              if (twin !== undefined) return { kind: 'deduplicated', file: twin.file }
+              return { kind: 'conflict', file: changedFile, conflict: { reviewId: item.reviewId, file: changedFile, expected: item.line, found: null, reason: 'pre-write content changed', expectedHash: pending.files[changedFile], foundHash: hashes[changedFile] } }
             }
           }
+          // What the files look like before this item writes them, persisted in the
+          // same critical section as the write itself (#64).
           record.progress.pending = { reviewId: item.reviewId, scope: item.scope, files: hashes }
           await write(record)
-          return { skip: false }
+          return { kind: 'proceed' }
         },
       })
     } catch (error) {
@@ -318,11 +310,16 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
       record.retry += 1
       return { kind: 'retrying', error: String(error?.message ?? error) }
     }
-    // The queue-side hook decided this item must not write: the entry above already
-    // recorded why, and the person's file stays as it is (#64).
-    if (result?.skipped === true) {
-      if (result.verdict.kind === 'conflict') return { kind: 'conflict', file: result.verdict.file }
-      return { kind: 'deduplicated', file: result.verdict.file, explained: 'same text elsewhere in the scope' }
+    // The queue-side hook decided this item must not write: the link repair and the
+    // conflict detail already happened inside the queued job; the file stays as it is.
+    if (result?.skipped !== undefined) {
+      if (result.skipped === 'conflict') {
+        record.progress.conflicts.push(result.conflict)
+        return { kind: 'conflict', file: result.file }
+      }
+      markDone(record, item.reviewId, result.file)
+      if (result.skipped === 'done') return { kind: 'done', repaired: true, file: result.file }
+      return { kind: 'deduplicated', file: result.file, explained: 'same text elsewhere in the scope' }
     }
     if (result?.changed === false) {
       // Another topic already holds the same text: the memory has it, so this item is
@@ -338,13 +335,11 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
 
   // Walks the frozen plan. Items already done are skipped first (so a deletion by the user
   // is not undone), then the Markdown is checked by review id, and only then is anything
-  // written. A conflict stops the whole candidate: it needs a person to look.
+  // written — all inside the memory write queue, per item. A conflict stops the whole
+  // candidate: it needs a person to look.
   async function applyPlan(record) {
-    const byScope = new Map()
     for (const item of record.plan.items) {
-      if (!byScope.has(item.scope)) byScope.set(item.scope, entriesOf(item.scope))
-      const seen = byScope.get(item.scope)
-      const outcome = await applyOne(record, item, seen)
+      const outcome = await applyOne(record, item)
       if (outcome.kind === 'conflict') {
         record.status = STATUS.conflict
         record.conflictAt = now()
