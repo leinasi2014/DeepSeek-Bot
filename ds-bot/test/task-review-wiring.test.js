@@ -134,6 +134,24 @@ test('a report that yields more lessons than a plan holds keeps the extras on re
   assert.equal(parseMemory(readFileSync(s.memoryPathOf(record), 'utf8')).entries.length, 8)
 })
 
+// The refusals are bounded at sixteen so the candidate file cannot grow with whatever a
+// model returns. What the bound leaves out is counted on the record: a model answering with
+// a hundred items used to lose 76 refusals with no trace at all, which made an over-long
+// answer look like a quiet one (#83).
+test('refusals past the bound are counted, not lost without a trace', async t => {
+  const items = Array.from({ length: 100 }, (_, at) => ({ claim: 0, topic: '', text: `发布教训 ${at + 1}`, outcome: 'verified' }))
+  const s = start({ items, support: Array.from({ length: 8 }, () => 'yes') })
+  t.after(() => s.stop())
+  await s.tool('complete_task', report, 'b2', 'call-many')
+  idle(s.ctx)
+  await until(() => s.plans()[0]?.status === 'DONE', () => `status=${s.plans()[0]?.status}`)
+  const record = s.plans()[0]
+  assert.equal(record.plan.items.length, 8, 'a plan holds eight entries')
+  assert.equal(record.unverified.length, 16, 'the file keeps a bounded list')
+  assert.equal(record.unverified.filter(entry => entry.reason === 'plan-full').length, 16)
+  assert.equal(record.unverifiedDropped, 76, 'the refusals the bound left out are counted')
+})
+
 test('a report without claims is refused and records nothing', async t => {
   const s = start()
   t.after(() => s.stop())
