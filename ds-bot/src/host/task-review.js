@@ -241,7 +241,24 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
   }
 
   const isDone = (record, reviewId) => record.progress.done.some(item => item.reviewId === reviewId)
-  const markDone = (record, reviewId, file) => { record.progress.done.push({ reviewId, file }) }
+  const markDone = (record, reviewId, file) => {
+    // Settling the item also clears the pre-write state it left: `done` is the
+    // authority from here on (#64).
+    delete record.progress.pending
+    record.progress.done.push({ reviewId, file })
+  }
+
+  // The files one item may write: its target file, and MEMORY.md when a topic link
+  // may be added to it (#64).
+  const filesOf = item => [...new Set([item.topic === '' ? 'MEMORY.md' : `${item.topic}.md`, ...(item.topic !== '' ? ['MEMORY.md'] : [])])]
+  // Their committed content hashes, from the same committed reader recovery compares
+  // with. An absent file hashes as the empty string, so its first write is covered too.
+  function hashesOf(scope, files) {
+    const held = new Map((readScope(scope) ?? []).map(file => [file.file, file.content ?? '']))
+    const hashes = {}
+    for (const file of files) hashes[file] = createHash('sha256').update(held.get(file) ?? '').digest('hex')
+    return hashes
+  }
 
   // What the scope holds right now, by committed content. One parse per file, and only for
   // the files of the scopes the plan actually touches.
@@ -276,6 +293,31 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
       return { kind: 'conflict', file: sameId.file }
     }
     let result
+    // An interrupted attempt left this item's pre-write state. When a file it was
+    // about to write no longer matches it, that change is either one of this plan's
+    // own writes (explained by the review id and the exact frozen line above), the
+    // same text elsewhere in the scope (explained by the duplicate below), or a
+    // person's edit — the last one stops for the person instead of writing over
+    // their words (#64).
+    const pending = record.progress.pending
+    if (pending !== undefined && pending.reviewId === item.reviewId) {
+      const current = hashesOf(item.scope, Object.keys(pending.files))
+      const changedFile = Object.keys(pending.files).find(file => current[file] !== pending.files[file])
+      if (changedFile !== undefined) {
+        const twin = seen.find(entry => entry.text === item.text)
+        if (twin !== undefined) {
+          markDone(record, item.reviewId, twin.file)
+          return { kind: 'deduplicated', file: twin.file, explained: 'same text elsewhere in the scope' }
+        }
+        record.progress.conflicts.push({ reviewId: item.reviewId, file: changedFile, expected: item.line, found: null, reason: 'pre-write content changed', expectedHash: pending.files[changedFile], foundHash: current[changedFile] })
+        return { kind: 'conflict', file: changedFile }
+      }
+    }
+    // What the files look like before this item writes them, persisted before the
+    // write itself: an interruption can then tell its own writes from a person's
+    // edits (#64).
+    record.progress.pending = { reviewId: item.reviewId, scope: item.scope, files: hashesOf(item.scope, filesOf(item)) }
+    await write(record)
     try {
       result = await applyItem(item)
     } catch (error) {
