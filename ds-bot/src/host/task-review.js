@@ -20,6 +20,9 @@ export const CLAIMS_MAX = 8
 export const INVALID_MAX = 3
 export const RETRY_MAX = 3
 export const CAPACITY_CODE = 'memory/full'
+// A failed apply waits before it is tried again, and the wait grows with each failure.
+// The third failure pauses the candidate for an explicit retry (#67).
+export const RETRY_WAIT_MS = [60_000, 600_000, 3_600_000]
 
 export const STATUS = {
   pending: 'PENDING',
@@ -380,7 +383,12 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
         return outcome
       }
       if (outcome.kind === 'retrying') {
+        // The backoff lives on the record, never in a sleep: the next pass — an idle,
+        // a restart, a load — reads it and leaves the candidate alone until the time
+        // arrives. The wait holds nothing, least of all the memory write queue (#67).
         record.status = record.retry >= RETRY_MAX ? STATUS.retry : STATUS.applying
+        record.retryAt = new Date(Date.parse(now()) + RETRY_WAIT_MS[Math.min(record.retry, RETRY_MAX) - 1]).toISOString()
+        if (record.status === STATUS.retry) warn('ds-bot: task candidate %s failed %d times and is paused for an explicit retry', record.candidateId, record.retry)
         await write(record)
         return outcome
       }
@@ -393,13 +401,31 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
 
   // One pass over one candidate: re-validate, extract once, freeze the plan once, then
   // apply it. Extraction and freezing only happen when no plan exists yet, which is what
-  // makes recovery independent of the model.
-  async function process(id) {
+  // makes recovery independent of the model. Wakes can overlap — startup recovery and an
+  // idle pass, two sessions — so one candidate has one in-flight job: the second caller
+  // rides the first one's result instead of extracting twice (#67). The job is a
+  // promise in this process, not new persisted state.
+  const inFlight = new Map()
+  function process(id) {
+    const running = inFlight.get(id)
+    if (running !== undefined) return running
+    const job = processOne(id).finally(() => inFlight.delete(id))
+    inFlight.set(id, job)
+    return job
+  }
+
+  async function processOne(id) {
     let record = await read(id)
     if (record === undefined) return undefined
     if (record.status === STATUS.done || record.status === STATUS.skipped || record.status === STATUS.dropped) return record
     if (record.status === STATUS.conflict || record.status === STATUS.corrupt || record.status === STATUS.capacity) return record
     if (record.status === STATUS.held) return record
+    // RETRY is paused for a person; it leaves through an explicit retry, never on its
+    // own, however often a wake arrives (#67).
+    if (record.status === STATUS.retry) return record
+    // A failed apply waits its backoff before it is tried again. The wake is whatever
+    // pass happens along, so nothing sleeps and nothing is held (#67).
+    if (record.status === STATUS.applying && record.retryAt !== undefined && Date.parse(record.retryAt) > Date.parse(now())) return record
     const verdict = await check(record)
     if (verdict?.ok !== true) {
       record.status = verdict?.waiting === true ? STATUS.waiting : STATUS.dropped
@@ -457,15 +483,24 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
     return record
   }
 
-  // The explicit way back for a candidate the gates held. A frozen plan is never
-  // re-extracted, so only a candidate that never got one can be reopened; everything
-  // else is left exactly as it is.
+  // The explicit way back. A frozen plan is never re-extracted: RETRY and CAPACITY
+  // reopen onto the plan they already have — entries already done are skipped by the
+  // apply pass, review ids and metadata stay exactly as frozen — while HELD and
+  // SKIPPED, which never got a plan, start over from extraction. Everything else is
+  // left exactly as it is (#67).
   async function retry(id) {
     const record = await read(id)
     if (record === undefined) return undefined
-    if (record.plan !== null || (record.status !== STATUS.held && record.status !== STATUS.skipped && record.status !== STATUS.retry)) return record
-    record.status = STATUS.pending
-    record.invalid = 0
+    const ontoPlan = record.plan !== null && (record.status === STATUS.retry || record.status === STATUS.capacity)
+    const fromScratch = record.plan === null && (record.status === STATUS.held || record.status === STATUS.skipped || record.status === STATUS.retry)
+    if (!ontoPlan && !fromScratch) return record
+    if (ontoPlan) {
+      record.status = STATUS.planned
+      delete record.retryAt
+    } else {
+      record.status = STATUS.pending
+      record.invalid = 0
+    }
     record.retry = 0
     record.retriedAt = now()
     await write(record)

@@ -2415,7 +2415,9 @@ export function install(rt) {
       const id = String(body?.candidateId ?? '')
       const record = await taskReview.retry(id)
       if (record === undefined) return { ok: false, error: 'No such task candidate.' }
-      if (record.status === TASK_STATUS.pending) void runSessionTasks(record.sessionId)
+      // A reopened plan-less candidate starts from extraction; a reopened frozen plan
+      // goes straight back to applying. Both run on the next pass (#67).
+      if (record.status === TASK_STATUS.pending || record.status === TASK_STATUS.planned) void runSessionTasks(record.sessionId)
       return { ok: true, status: record.status, unverified: record.unverified ?? [] }
     }
     // Re-checking what the semantic gate refused, on the same quotes, without asking the
