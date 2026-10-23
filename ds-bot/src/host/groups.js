@@ -783,7 +783,57 @@ export function install(rt) {
   // it from `calleesOf`, so what is written down cannot drift from what is dispatched.
   function captureRoomCalls(room, member, peers, sessionId) {
     if (member === undefined || room === undefined) return
-    for (const peer of peers) rt.openRoomCall?.(room.id, member.id, peer.id, sessionId)
+    // The log position before the calling line: a restart reads from here to see whether
+    // the member the line named answered in the group afterwards.
+    for (const peer of peers) rt.openRoomCall?.(room.id, member.id, peer.id, sessionId, room.seq)
+  }
+
+  // A call whose line was saved but whose member was never asked: the round that would have
+  // asked it did not get that far before the host went down, and no round is left to run
+  // after a restart. The member is asked again through the same room delivery a round uses,
+  // and its answer closes the call by the ordinary late path.
+  //
+  // Two other shapes are read from what is on disk rather than guessed from empty
+  // process-local maps: a member line after the call means the member did answer and only
+  // the close was lost, so the call is settled; a call whose member, group or Bot is gone
+  // is settled by handoffs' load hook. The ask is noted in the work (`recovered`) and its
+  // exchange id is fixed, so a restart loop asks once and a queued ask is not sent twice.
+  async function recoverRoomCalls() {
+    for (const call of rt.roomCallsAwaiting?.() ?? []) {
+      const room = rt.roomOf(call.room)
+      const member = rt.botOf(call.to)
+      if (room === undefined || member === undefined || !room.members.includes(member.id)) continue
+      if (call.since !== undefined && (room.log ?? []).some(line => line.botId === member.id && line.seq > call.since)) {
+        rt.closeRoomCall?.(room.id, call.from, member.id)
+        continue
+      }
+      if (call.recovered === true) continue
+      const session = await groupSessionFor(room, member)
+      if (session === undefined) continue
+      if (rt.live.get(session.id)?.turn !== undefined) continue
+      // Already asked: either noted as a turn the last run cut off (resume.js picks that up
+      // itself), or queued and not yet taken up (this run's queue, or the last run's notes
+      // resume.js will send again). Asking a second time would repeat the work.
+      if (rt.interruptedTurnOf?.(session.id) !== undefined) continue
+      if ((rt.pendingOf?.(session.id) ?? []).some(args => args.role === 'room' && args.roomId === room.id)) continue
+      const exchangeId = `room-recover:${call.id}`
+      const caller = rt.botOf(call.from)?.name ?? 'another member'
+      try {
+        await rt.deliver({
+          toId: member.id,
+          sessionId: session.id,
+          role: 'room',
+          roomId: room.id,
+          exchangeId,
+          note: 'picking up after a restart',
+          resumed: true,
+          text: `${caller} called you in this group before DeepSeek Harness restarted and your turn there never started. Read the group and answer there.`,
+        })
+        rt.markRoomCallRecovered?.(call.id)
+      } catch (error) {
+        rt.warn('ds-bot: asking %s again in %s failed: %s', member.name, room.name, error)
+      }
+    }
   }
 
   // What a member says while it works, into the group. While the member holds its place
@@ -880,6 +930,9 @@ export function install(rt) {
     }).catch(error => rt.warn('ds-bot: late group failure from %s failed: %s', member.name, error))
   }
   rt.lateRoomFailure = lateRoomFailure
+  // Asked by resume.js once its start delay has passed, the same way a cut-off turn is
+  // picked up: a group Session is created here, which waits until DSH has opened.
+  rt.recoverRoomCalls = recoverRoomCalls
 
   // A group the user just made opens with its admin asking what the group is for.
   async function greetRoom(roomId) {

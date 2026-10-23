@@ -128,7 +128,7 @@ async function start(t, { home: existing } = {}) {
   })
   const register = ctx.connection.fetch.register
   ctx.connection.fetch.register = (options) => register(options)
-  const rt = createRuntime(ctx, { home, memoryReviewDelayMs: 0 })
+  const rt = createRuntime(ctx, { home, memoryReviewDelayMs: 0, roomRecoveryDelayMs: 20 })
   await rt.load()
   // Record what is sent, then deliver it for real: a group round only starts when its
   // member Session actually receives the brief.
@@ -324,6 +324,134 @@ test('a call whose member was removed is settled when the team loads', async t =
 
   const second = await start(t, { home })
   await until(() => second.roomCalls().length === 0, () => JSON.stringify(second.roomCalls()))
+  second.idle('chief')
+  await until(() => second.plans()[0]?.status === 'DONE', () => `status=${second.plans()[0]?.status}`)
+  assert.match(second.memoryOf('chief'), /发布说明由 Writer 写/)
+})
+
+// A call saved and never asked: the line that named the member is in the group log and the
+// call is in the book, but the round did not get as far as delivering the brief before the
+// host went down, and nothing was noted in inflight for the member. A restart must ask the
+// member again through the same room delivery a round uses; the report keeps waiting until
+// the member really answers.
+test('a call saved but never asked is asked again after a restart, and the report waits', async t => {
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-group-book-unasked-'))
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }))
+  writeFileSync(join(home, 'state.json'), JSON.stringify(TEAM))
+
+  const first = await start(t, { home })
+  const stop = new AbortController()
+  t.after(() => stop.abort())
+  first.emit('desk', 'user/message', { content: [{ type: 'text', text: '@Chief 安排一下发布说明.' }], source: { kind: 'user' } })
+  void first.tool('group_relay', {}, 'desk', 'relay-unasked', { signal: stop.signal }).catch(() => {})
+  await called(first, 'desk-chief')
+  first.begin('desk-chief')
+  await first.say('desk-chief', '@Writer 写发布说明，测试 12/12 通过。')
+  await first.tool('complete_task', report, 'desk-chief', 'report-unasked')
+  // The report is checked while Chief's turn is still open, so the call is open and the
+  // candidate waits. The round has not reached Writer yet: no brief, no inflight note.
+  first.idle('desk-chief')
+  await until(() => first.plans()[0]?.status === 'WAITING')
+  assert.deepEqual(first.roomCalls(), ['room:desk:chief:writer'])
+  assert.equal(first.agentOf('desk-writer').calls.length, 0, 'Writer was never asked before the restart')
+  await first.ctx.dispose()
+
+  const second = await start(t, { home })
+  // The member is still in the group, so the call must not be dropped: it is asked again.
+  await until(() => second.agentOf('desk-writer').calls.length === 1, () => JSON.stringify(second.roomCalls()))
+  const brief = second.agentOf('desk-writer').calls.at(-1)
+  assert.equal(brief.source.role, 'room')
+  assert.equal(brief.source.roomId, 'desk')
+  assert.deepEqual(second.roomCalls(), ['room:desk:chief:writer'], 'the call is still open until it is answered')
+  second.idle('chief')
+  await new Promise(resolve => setTimeout(resolve, 200))
+  assert.equal(second.plans()[0]?.status, 'WAITING', 'being asked again is not an answer')
+  assert.equal(second.memoryOf('chief'), '', 'nothing is written before the member answers')
+
+  // Writer takes the brief and answers in the group: the ordinary late path closes the call.
+  second.emit('desk-writer', 'turn/start', { turn: 1 })
+  second.emit('desk-writer', 'user/message', { content: brief.content, source: brief.source })
+  second.emit('desk-writer', 'assistant/message', { message: { content: [{ type: 'text', text: '写好了，测试 12/12 通过。' }] } })
+  second.emit('desk-writer', 'turn/end', { turn: 1, reason: { kind: 'completed' } })
+  await until(() => second.roomCalls().length === 0, () => JSON.stringify(second.roomCalls()))
+  second.idle('chief')
+  await until(() => second.plans()[0]?.status === 'DONE', () => `status=${second.plans()[0]?.status}`)
+  assert.match(second.memoryOf('chief'), /发布说明由 Writer 写/)
+})
+
+// The same crash window, but the member was taken out of the group while the host was down.
+// Nobody can answer, so the call is settled and the report goes on instead of waiting.
+test('a call saved but never asked is settled after a restart when its member was removed', async t => {
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-group-book-unasked-gone-'))
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }))
+  writeFileSync(join(home, 'state.json'), JSON.stringify(TEAM))
+
+  const first = await start(t, { home })
+  const stop = new AbortController()
+  t.after(() => stop.abort())
+  first.emit('desk', 'user/message', { content: [{ type: 'text', text: '@Chief 安排一下发布说明.' }], source: { kind: 'user' } })
+  void first.tool('group_relay', {}, 'desk', 'relay-unasked-gone', { signal: stop.signal }).catch(() => {})
+  await called(first, 'desk-chief')
+  first.begin('desk-chief')
+  await first.say('desk-chief', '@Writer 写发布说明，测试 12/12 通过。')
+  await first.tool('complete_task', report, 'desk-chief', 'report-unasked-gone')
+  first.idle('desk-chief')
+  await until(() => first.plans()[0]?.status === 'WAITING')
+  assert.equal(first.agentOf('desk-writer').calls.length, 0)
+  await first.ctx.dispose()
+
+  const state = JSON.parse(readFileSync(join(home, 'state.json'), 'utf8'))
+  state.rooms.desk.members = state.rooms.desk.members.filter(id => id !== 'writer')
+  writeFileSync(join(home, 'state.json'), JSON.stringify(state))
+
+  const second = await start(t, { home })
+  await until(() => second.roomCalls().length === 0, () => JSON.stringify(second.roomCalls()))
+  assert.equal(second.agentOf('desk-writer').calls.length, 0, 'a member who left is not asked')
+  second.idle('chief')
+  await until(() => second.plans()[0]?.status === 'DONE', () => `status=${second.plans()[0]?.status}`)
+  assert.match(second.memoryOf('chief'), /发布说明由 Writer 写/)
+})
+
+// The other crash window: the member did answer, its line is on disk, and the close that
+// would have deleted the call never landed. After a restart the call is settled from the
+// log — not asked again, and not left waiting.
+test('a call whose member already answered is settled after a restart instead of asked again', async t => {
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-group-book-answered-'))
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }))
+  writeFileSync(join(home, 'state.json'), JSON.stringify(TEAM))
+
+  const first = await start(t, { home })
+  const stop = new AbortController()
+  t.after(() => stop.abort())
+  first.emit('desk', 'user/message', { content: [{ type: 'text', text: '@Chief 安排一下发布说明.' }], source: { kind: 'user' } })
+  void first.tool('group_relay', {}, 'desk', 'relay-answered', { signal: stop.signal }).catch(() => {})
+  await called(first, 'desk-chief')
+  first.begin('desk-chief')
+  await first.say('desk-chief', '@Writer 写发布说明，测试 12/12 通过。')
+  await first.tool('complete_task', report, 'desk-chief', 'report-answered')
+  // Chief's turn really ends, so the round hands on to Writer.
+  first.finish('desk-chief', '@Writer 写发布说明，测试 12/12 通过。')
+  first.idle('desk-chief')
+  await until(() => first.plans()[0]?.status === 'WAITING')
+
+  // Writer answers in the group through the product's own step path, which writes its
+  // line into the log and saves it while the round still waits for the turn to end. The
+  // host goes down before that turn ends, so the round's closing pass never runs.
+  await called(first, 'desk-writer')
+  first.begin('desk-writer')
+  await first.say('desk-writer', '写好了，测试 12/12 通过。')
+  await new Promise(resolve => setTimeout(resolve, 150))
+  await first.ctx.dispose()
+  const state = JSON.parse(readFileSync(join(home, 'state.json'), 'utf8'))
+  assert.equal(state.rooms.desk.log.some(line => line.botId === 'writer' && line.text.includes('写好了')), true, 'the answer line is on disk')
+  assert.equal(state.works['room:desk:chief:writer'] !== undefined, true, 'the close never landed, so the call is still in the book')
+
+  const second = await start(t, { home })
+  // Settled from the log: the call is closed and no recovery brief is sent. (The cut-off
+  // turn itself is a separate note in inflight.json and may still be picked up; that is
+  // the ordinary resume path, not this call.)
+  await until(() => second.roomCalls().length === 0, () => JSON.stringify(second.roomCalls()))
+  assert.equal(second.agentOf('desk-writer').calls.some(call => String(call.source?.exchangeId ?? '').startsWith('room-recover:')), false, 'a member that already answered is not asked again')
   second.idle('chief')
   await until(() => second.plans()[0]?.status === 'DONE', () => `status=${second.plans()[0]?.status}`)
   assert.match(second.memoryOf('chief'), /发布说明由 Writer 写/)

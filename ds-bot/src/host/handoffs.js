@@ -94,10 +94,13 @@ export function install(rt) {
   // yet, so a member that is called again in the same round reuses it instead of stacking
   // duplicates. `closeRoomCall` deletes it when the member really answers in the group.
   const roomCallKey = (roomId, from, to) => `room:${roomId}:${from}:${to}`
-  function openRoomCall(roomId, from, to, session) {
+  // `since` is the group log position at the moment the call is opened: the calling line is
+  // written at or after it. A restart reads the log from there, so a member's later line
+  // counts as its answer while lines from before the call do not.
+  function openRoomCall(roomId, from, to, session, since) {
     const id = roomCallKey(roomId, from, to)
     if (works()[id] !== undefined) return id
-    works()[id] = { from, to, room: roomId, open: [], results: [], at: Date.now() }
+    works()[id] = { from, to, room: roomId, ...(since === undefined ? {} : { since }), open: [], results: [], at: Date.now() }
     const turn = session === undefined ? undefined : rt.live?.get(session)
     if (turn !== undefined) (turn.spawned ??= []).push(id)
     save()
@@ -128,7 +131,7 @@ export function install(rt) {
   function reconcileRoomCalls() {
     const dropped = []
     for (const [id, work] of Object.entries(works())) {
-      if (work === undefined || work.room === undefined || work.to === undefined) continue
+      if (!id.startsWith('room:') || work === undefined || work.room === undefined || work.to === undefined) continue
       const room = rt.roomOf?.(work.room)
       const memberGone = room === undefined || !room.members.includes(work.to) || rt.botOf(work.to) === undefined
       if (!memberGone) continue
@@ -136,6 +139,21 @@ export function install(rt) {
       dropped.push(id)
     }
     return dropped
+  }
+
+  // The calls still in the book, as records: what a restart needs to finish one whose line
+  // was saved but whose member was never asked. `since` is the group log position at the
+  // moment the call was opened, so a member's later line reads as its answer.
+  const roomCallsAwaiting = () => Object.entries(works())
+    .filter(([id, work]) => id.startsWith('room:') && work !== undefined && work.room !== undefined && work.to !== undefined)
+    .map(([id, work]) => ({ id, room: work.room, from: work.from, to: work.to, since: work.since, recovered: work.recovered === true, at: work.at }))
+
+  // A call an earlier start already asked for again: a restart loop must not ask forever.
+  function markRoomCallRecovered(id) {
+    const work = works()[id]
+    if (work === undefined || work.recovered === true) return
+    work.recovered = true
+    save()
   }
 
   function hold(workId, text) {
@@ -255,7 +273,7 @@ export function install(rt) {
     return lines.join('; ')
   }
 
-  Object.assign(rt, { workOf, openWork, closeWork, dropWork, takenWork: taken, ownsWork: owns, waitsWork: waits, pendingWork: pending, spawnedBy, openRoomCall, closeRoomCall, dropRoomCall, reconcileRoomCalls, holdWork: hold, workAsker: askedBy, answerText, upstreamOf, sameWork, forgetBotWork: forgetBot, statusOf, waitingView })
+  Object.assign(rt, { workOf, openWork, closeWork, dropWork, takenWork: taken, ownsWork: owns, waitsWork: waits, pendingWork: pending, spawnedBy, openRoomCall, closeRoomCall, dropRoomCall, reconcileRoomCalls, roomCallsAwaiting, markRoomCallRecovered, holdWork: hold, workAsker: askedBy, answerText, upstreamOf, sameWork, forgetBotWork: forgetBot, statusOf, waitingView })
 
   // Once the team is on disk, calls whose member can no longer answer are settled, so a
   // report does not wait on a group or a Bot that is gone. Same load hook the task review
