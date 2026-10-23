@@ -126,9 +126,9 @@ export function extractInput(report = {}) {
 // built from the fields the check uses and nothing else, so a caller's own object cannot
 // carry an unbounded field into the request; the kind, the source type, the tool's name and
 // its failure state are what make the quote's provenance checkable, and the budget never
-// cuts them away. Only the quoted text and the claim's wording shrink.
-const VERIFY_FIELDS = { claim: 1_000, evidence: 500, context: 300 }
-const VERIFY_FLOOR = { claim: 20, evidence: 10, context: 0 }
+// cuts them away. Only the quoted text, the claim's wording and the reported claim shrink.
+const VERIFY_FIELDS = { claim: 1_000, evidence: 500, context: 300, reportedClaim: 300 }
+const VERIFY_FLOOR = { claim: 20, evidence: 10, context: 0, reportedClaim: 0 }
 
 const verifyEntry = (entry, shape) => {
   const out = {
@@ -137,6 +137,8 @@ const verifyEntry = (entry, shape) => {
     evidence: clip(entry?.evidence, shape.evidence),
     context: clip(entry?.context, shape.context),
   }
+  // What the Bot said it did, background only: the prompt names it, so it has to arrive.
+  if (entry?.reportedClaim !== undefined) out.reportedClaim = clip(entry.reportedClaim, shape.reportedClaim)
   if (entry?.sourceType !== undefined) out.sourceType = clip(entry.sourceType, 16)
   if (entry?.tool !== undefined) out.tool = clip(entry.tool, 64)
   // An error code, not a report: whatever a caller passes, the model gets at most this.
@@ -159,6 +161,7 @@ const fitEntry = (entry, shape) => {
       claim: halve(next.claim, VERIFY_FLOOR.claim),
       evidence: halve(next.evidence, VERIFY_FLOOR.evidence),
       context: halve(next.context, VERIFY_FLOOR.context),
+      reportedClaim: halve(next.reportedClaim, VERIFY_FLOOR.reportedClaim),
     }
     if (sameShape(grown, next)) break
     next = grown
@@ -166,14 +169,20 @@ const fitEntry = (entry, shape) => {
   return next
 }
 
+// Every entry is asked about: the answer is matched to its question by position, so one
+// left out of the request would be read as a "no" the model never gave. The batch is
+// therefore bounded by shrinking the fields, never by dropping a question. Each caller
+// bounds its own count before it gets here — a report makes at most eight claims, a plan
+// holds at most eight entries — and eight fit at the floors even when every field is full
+// of characters that double under JSON escaping.
 export function verifyShape(entries = []) {
-  const kept = entries.slice(0, CLAIMS_MAX)
-  const measure = shape => verifyText(kept, shape).length
+  const measure = shape => verifyText(entries, shape).length
   let shape = { ...VERIFY_FIELDS }
   for (const step of [
     shape => ({ ...shape, evidence: Math.min(shape.evidence, 100) }),
     shape => ({ ...shape, context: Math.min(shape.context, 120) }),
     shape => ({ ...shape, claim: Math.min(shape.claim, 200) }),
+    shape => ({ ...shape, reportedClaim: Math.min(shape.reportedClaim, 120) }),
   ]) {
     if (measure(shape) <= INPUT_MAX) return shape
     shape = step(shape)
@@ -184,6 +193,7 @@ export function verifyShape(entries = []) {
       claim: halve(shape.claim, VERIFY_FLOOR.claim),
       evidence: halve(shape.evidence, VERIFY_FLOOR.evidence),
       context: halve(shape.context, VERIFY_FLOOR.context),
+      reportedClaim: halve(shape.reportedClaim, VERIFY_FLOOR.reportedClaim),
     }
     if (sameShape(next, shape)) break
     shape = next
@@ -192,7 +202,6 @@ export function verifyShape(entries = []) {
 }
 
 export function verifyInput(entries = []) {
-  const kept = entries.slice(0, CLAIMS_MAX)
-  const shape = verifyShape(kept)
-  return kept.map(entry => JSON.stringify(verifyEntry(entry, fitEntry(entry, shape)))).join('\n')
+  const shape = verifyShape(entries)
+  return entries.map(entry => JSON.stringify(verifyEntry(entry, fitEntry(entry, shape)))).join('\n')
 }

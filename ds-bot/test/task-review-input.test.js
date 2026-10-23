@@ -340,7 +340,42 @@ test('a verification entry that fits is unchanged, field for field', () => {
   assert.equal(verifyInput([entry]), JSON.stringify(entry))
 })
 
-test('an empty or oversized verification list is one object per kept candidate', () => {
+test('an empty verification list is an empty request', () => {
   assert.equal(verifyInput(), '')
-  assert.equal(verifyInput(candidates(10)).split('\n').length, CLAIMS_MAX)
+})
+
+// The answers come back matched to the questions by position, so a candidate left out of
+// the request is read as a "no" the model never gave. The helper therefore shrinks the
+// fields and keeps every question it is given; the callers bound their own count (a plan
+// holds eight entries, a review answers eight changes, a re-check asks about eight held
+// lessons), and this test holds the helper to that even when it is handed more.
+test('every candidate is asked about, even past the claim limit, inside the budget', () => {
+  for (const count of [CLAIMS_MAX + 1, 16, 20]) {
+    const request = verifyInput(candidates(count))
+    const parsed = request.split('\n').map(line => JSON.parse(line))
+    assert.equal(parsed.length, count, `all ${count} candidates are asked about`)
+    assert.ok(parsed.every((entry, at) => entry.claim.startsWith(`claim ${at + 1} `)), 'in the order the answers come back')
+    assert.ok(request.length <= INPUT_MAX, `the request is ${request.length}`)
+    for (const line of request.split('\n')) assert.ok(line.length <= SOURCE_MAX, `a verification entry is ${line.length}`)
+  }
+})
+
+// The check prompt names `reportedClaim` as background, so the field has to reach the model
+// rather than be dropped by the whitelist that keeps a caller's own object out.
+test('the reported claim the prompt names reaches the model, bounded', () => {
+  assert.equal(JSON.parse(verifyInput([{ claim: 'c', kind: 'command', evidence: 'e', context: 'x', reportedClaim: 'r'.repeat(5_000) }])).reportedClaim.length, 300)
+  assert.equal(JSON.parse(verifyInput([{ claim: 'c', kind: 'user', evidence: 'e', context: 'x', reportedClaim: '每次发版前先运行发布脚本' }])).reportedClaim, '每次发版前先运行发布脚本')
+})
+
+// The widest reachable batch is eight entries (a plan holds eight), and a real quote can be
+// full of characters that double under JSON escaping. Even then the two limits hold.
+test('eight entries of quoted text still fit both limits', () => {
+  const quoted = count => Array.from({ length: count }, (_, at) => ({
+    claim: `claim ${at} "${'"'.repeat(1_000)}`, kind: 'command', evidence: '"'.repeat(500), context: '"'.repeat(300),
+    reportedClaim: '"'.repeat(300), sourceType: 'tool', tool: 'bash', toolCallFailed: true, toolReportedFailure: true, toolError: '"'.repeat(120),
+  }))
+  const request = verifyInput(quoted(CLAIMS_MAX))
+  assert.ok(request.length <= INPUT_MAX, `the request is ${request.length}`)
+  assert.equal(request.split('\n').length, CLAIMS_MAX)
+  for (const line of request.split('\n')) assert.ok(line.length <= SOURCE_MAX, `a verification entry is ${line.length}`)
 })
