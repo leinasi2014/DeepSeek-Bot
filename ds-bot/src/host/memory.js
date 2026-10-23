@@ -2292,6 +2292,13 @@ export function install(rt) {
     if (endpoint === 'memory-view') return memoryView(body)
     if (endpoint === 'memory-ask') return memoryAsk(body)
     if (endpoint === 'memory-forget') return memoryForget(body)
+    // With the review off, the two explicit task endpoints are refused as well: retry
+    // rewrites the candidate and re-verify may save it and ask the model, and both would
+    // walk the queue the switch stopped (#68). The candidate keeps its bytes until the
+    // review is on again; nothing is added, no state changes.
+    if (!reviewOn && (endpoint === 'memory-task-retry' || endpoint === 'memory-task-reverify')) {
+      return { ok: false, error: 'Task review is turned off, so the candidate was left untouched.' }
+    }
     // The explicit way back for a task whose lessons the evidence gates refused: nothing
     // retries by itself, and a frozen plan is never extracted again.
     if (endpoint === 'memory-task-retry') {

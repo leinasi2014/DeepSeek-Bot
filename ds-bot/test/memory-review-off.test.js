@@ -22,11 +22,14 @@ const TEAM = {
 }
 
 // The line the candidate quotes: the evidence must be a verbatim substring of this
-// Session's own conversation, or the mechanical gate refuses it.
+// Session's own conversation, or the mechanical gate refuses it. The claim is what the
+// user said, not what the Bot said about itself: evidence that only the Bot's own message
+// carries is the defect #66 describes, and a case that leaned on it would pass for the
+// wrong reason.
 const HISTORY = {
   b2: [
-    { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Please run the release script now.' }] } } },
-    { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Ran scripts/ship.sh; the suite passed: tests 12/12.' }] } } } },
+    { event: { seq: 10, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'For every release, always run scripts/ship.sh from the repo root before tagging.' }] } } },
+    { event: { seq: 11, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'Understood; I run that before every tag.' }] } } } },
   ],
 }
 
@@ -43,8 +46,8 @@ const CANDIDATE = {
   status: 'PENDING',
   invalid: 0,
   retry: 0,
-  result: '发布脚本跑通了',
-  claims: [{ kind: 'test', statement: '发布脚本跑通', evidence: 'tests 12/12', ref: 'part 1 #11' }],
+  result: '记下了发版前的约定',
+  claims: [{ kind: 'user', statement: '每次发版前先运行发布脚本', evidence: 'always run scripts/ship.sh from the repo root before tagging', ref: 'part 1 #10' }],
   notes: '',
   plan: null,
   progress: { done: [], conflicts: [] },
@@ -76,6 +79,9 @@ function start(t, home, config, requests) {
     sessions: { messageProjections: [], get: () => undefined },
     workspaceRegistry: { archiveSession: async () => {} },
   })
+  let route
+  const register = ctx.connection.fetch.register
+  ctx.connection.fetch.register = (options) => { route = options; return register(options) }
   apply(ctx, { home, ...config })
   const candidatePath = () => join(home, 'memory', 'task-plans', `${CANDIDATE_ID}.json`)
   const memoryText = () => {
@@ -83,7 +89,13 @@ function start(t, home, config, requests) {
     return existsSync(path) ? readFileSync(path, 'utf8') : ''
   }
   const tool = (name, args, callId) => ctx.registeredTools.get(name).execute(args, { agent: { id: 'b2' }, callId })
-  return { ctx, candidatePath, memoryText, tool }
+  // The panel's own entry point: the two explicit task endpoints go through the same
+  // channel the browser posts to, so the test exercises the wiring and not just a function.
+  const json = async (endpoint, payload) => {
+    const response = await route.fetch(new Request('http://localhost/api/bot', { method: 'POST', body: JSON.stringify({ endpoint, payload }) }))
+    return response.json()
+  }
+  return { ctx, candidatePath, memoryText, tool, json }
 }
 
 const settle = (ms = 20) => new Promise(resolve => setTimeout(resolve, ms))
@@ -110,7 +122,7 @@ test('the review being off leaves a queued candidate untouched, and turning it o
   assert.deepEqual(readdirSync(join(home, 'memory', 'task-plans')).filter(name => name.endsWith('.json')), [`${CANDIDATE_ID}.json`], 'no second candidate appears')
 
   // A new report is refused, not queued and not held.
-  const refused = await off.tool('complete_task', { result: 'done', claims: [{ kind: 'test', statement: '发布脚本跑通', evidence: 'tests 12/12', ref: 'part 1 #11' }] }, 'off-1')
+  const refused = await off.tool('complete_task', { result: 'done', claims: [{ kind: 'user', statement: '每次发版前先运行发布脚本', evidence: 'always run scripts/ship.sh from the repo root before tagging', ref: 'part 1 #10' }] }, 'off-1')
   assert.match(String(refused), /Task review is turned off/)
   assert.deepEqual(readdirSync(join(home, 'memory', 'task-plans')).filter(name => name.endsWith('.json')), [`${CANDIDATE_ID}.json`], 'the refused report adds no file')
   await off.ctx.dispose()
@@ -121,4 +133,37 @@ test('the review being off leaves a queued candidate untouched, and turning it o
   await until(() => JSON.parse(readFileSync(on.candidatePath(), 'utf8')).status === 'DONE', () => `status=${JSON.parse(readFileSync(on.candidatePath(), 'utf8')).status}`)
   assert.match(on.memoryText(), /发布用 scripts\/ship\.sh/)
   assert.ok(requests.some(system => system.startsWith('You turn a reported finished task')), 'the extract ran once the review came back on')
+})
+
+// The panel's two explicit endpoints are the only other way into the queue. Retry writes
+// the candidate back as PENDING; re-verify may save it and ask the model for a verdict.
+// Both would move a candidate the switch stopped, so both are refused while it is off.
+test('the two explicit task endpoints change nothing while the review is off', async t => {
+  const home = mkdtempSync(join(tmpdir(), 'ds-bot-review-off-endpoints-'))
+  t.after(() => rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }))
+  writeFileSync(join(home, 'state.json'), JSON.stringify(TEAM))
+  mkdirSync(join(home, 'memory', 'task-plans'), { recursive: true })
+  // HELD with a refused lesson: retry would rewrite it, re-verify would ask the model.
+  const held = {
+    ...CANDIDATE,
+    status: 'HELD',
+    heldAt: '2026-10-23T00:00:00.000Z',
+    unverified: [{ reason: 'model-unsupported', claim: 0, text: '发布前先跑 scripts/ship.sh', topic: '', outcome: 'verified', evidence: 'always run scripts/ship.sh from the repo root before tagging', statement: '每次发版前先运行发布脚本', kind: 'user', context: 'User: For every release, always run scripts/ship.sh from the repo root before tagging.' }],
+  }
+  const original = `${JSON.stringify(held, null, 2)}\n`
+  writeFileSync(join(home, 'memory', 'task-plans', `${CANDIDATE_ID}.json`), original)
+
+  const requests = []
+  const off = start(t, home, { memoryReview: false }, requests)
+  await settle(600)
+  for (const endpoint of ['memory-task-retry', 'memory-task-reverify']) {
+    // The channel wraps every endpoint answer: `{ ok: true, value: <endpoint answer> }`.
+    const answer = await off.json(endpoint, { candidateId: CANDIDATE_ID })
+    assert.equal(answer.value?.ok, false, `${endpoint} is refused while the review is off: ${JSON.stringify(answer)}`)
+    assert.match(String(answer.value?.error ?? ''), /Task review is turned off/)
+    assert.equal(readFileSync(off.candidatePath(), 'utf8'), original, `${endpoint} leaves the candidate's bytes alone`)
+  }
+  assert.equal(requests.length, 0, 'neither endpoint calls a model while the review is off')
+  assert.equal(off.memoryText(), '', 'neither endpoint writes memory')
+  await off.ctx.dispose()
 })
