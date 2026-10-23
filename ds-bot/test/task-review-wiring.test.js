@@ -34,12 +34,18 @@ const HISTORY = {
 
 // The three model calls are answered by their system prompt, so the order in which the
 // idle handlers happen to run does not matter.
-function start({ items = [], support = [], memory = '{"changes":[]}', cwd } = {}) {
+function start({ items = [], support = [], memory = '{"changes":[]}', cwd, works, questions } = {}) {
   // Each verify call takes the next list, so a retry can be answered differently.
   const supportQueue = Array.isArray(support[0]) ? [...support] : undefined
   let folder = cwd
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-task-review-wiring-'))
-  writeFileSync(join(home, 'state.json'), JSON.stringify(TEAM))
+  // Work still open when the report is made, and the question card on screen: both are
+  // what WAITING must consult, and neither is derived from the Bot id.
+  writeFileSync(join(home, 'state.json'), JSON.stringify({
+    ...TEAM,
+    works: works ?? {},
+    questions: questions ?? {},
+  }))
   const ctx = fakeContext()
   const requests = []
   Object.assign(ctx, {
@@ -374,4 +380,58 @@ test('a plain commit landing after the pre-write state is decided inside the que
     assert.match(text, /发布用脚本 x-2/)
     assert.equal(s.plans()[0].progress.pending, undefined)
   }
+})
+
+// A project's memory is shared by every Bot that works there, so an entry kept by the
+// review must name the Bot it came from — the same rule `remember` follows through
+// `metaFor`. A Bot's own memory is that Bot's already, and must not gain a writer.
+test('a reviewed lesson in a project names the Bot that kept it, and one in its own memory does not', async t => {
+  const repo = mkdtempSync(join(tmpdir(), 'ds-bot-project-by-'))
+  mkdirSync(join(repo, '.git'), { recursive: true })
+  t.after(() => rmSync(repo, { recursive: true, force: true }))
+
+  const project = start({ cwd: repo, items: ONE_ITEM, support: ['yes'] })
+  t.after(() => project.stop())
+  await project.tool('complete_task', report, 'b2', 'call-project-by')
+  idle(project.ctx)
+  await until(() => project.plans()[0]?.status === 'DONE')
+  const record = project.plans()[0]
+  assert.notEqual(record.project, null, 'the report was made in a repository')
+  const line = readFileSync(project.memoryPathOf(record), 'utf8')
+  assert.match(line, /by: Writer/, 'the project entry names the Bot that kept it')
+  // Frozen with the plan, like the other metadata: the plan carries the same value.
+  assert.equal(record.plan.items[0].meta.by, 'Writer')
+
+  // The same report with no project: the entry lives in the Bot's own memory.
+  const own = start({ items: ONE_ITEM, support: ['yes'] })
+  t.after(() => own.stop())
+  await own.tool('complete_task', report, 'b2', 'call-own-by')
+  idle(own.ctx)
+  await until(() => own.plans()[0]?.status === 'DONE')
+  const ownLine = readFileSync(own.memoryFile(), 'utf8')
+  assert.doesNotMatch(ownLine, /by:/, 'own memory does not name a writer; the scope already is that Bot')
+  assert.equal('by' in own.plans()[0].plan.items[0].meta, false)
+})
+
+// The re-verify path builds its own metadata rather than reusing the extraction's, so it
+// has to name the writer too; otherwise a lesson that came back through the explicit retry
+// would be the project entry with no author.
+test('a re-verified lesson in a project also names the Bot that kept it', async t => {
+  const repo = mkdtempSync(join(tmpdir(), 'ds-bot-project-by-reverify-'))
+  mkdirSync(join(repo, '.git'), { recursive: true })
+  t.after(() => rmSync(repo, { recursive: true, force: true }))
+  const s = start({ cwd: repo, items: ONE_ITEM, support: [['no'], ['yes']] })
+  t.after(() => s.stop())
+  await s.tool('complete_task', report, 'b2', 'call-project-reverify-by')
+  idle(s.ctx)
+  await until(() => s.plans()[0]?.status === 'HELD')
+  const id = s.plans()[0].candidateId
+  const rechecked = await s.json('memory-task-reverify', { candidateId: id })
+  assert.equal(rechecked.value.rechecked, 1)
+  idle(s.ctx)
+  await until(() => s.plans()[0]?.status === 'DONE')
+  const record = s.plans()[0]
+  assert.notEqual(record.project, null)
+  assert.equal(record.plan.items[0].meta.by, 'Writer', 'frozen with the plan')
+  assert.match(readFileSync(s.memoryPathOf(record), 'utf8'), /by: Writer/)
 })
