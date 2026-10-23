@@ -167,7 +167,7 @@ test('the memory review skips project writes when the project is unresolved, and
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-memory-project-rt-'))
   const replies = [JSON.stringify({ changes: [
     { op: 'add', text: 'The deploy window is 8pm to 11pm' },
-    { op: 'add', text: 'Ship on Friday too', team: true },
+    { op: 'add', text: 'Ship on Friday too', team: true, evidence: 'ship on Friday' },
   ] })]
   const rt = {
     ctx, home, config: { memoryReviewDelayMs: 0 }, state: { rooms: {} },

@@ -27,7 +27,7 @@ import { mkdir, readdir, rename, unlink, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join } from 'node:path'
 import { BlockAssembler } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { splitRef, unquote } from './text.js'
+import { splitRef, textOf, unquote } from './text.js'
 import { speakerOf } from '../shared/mentions.js'
 import { output } from './tools.js'
 import { memoryFiles } from './memory-files.js'
@@ -341,9 +341,13 @@ const wellFormed = (change) => {
   if (change === null || typeof change !== 'object') return false
   const texted = typeof change.text === 'string' && change.text.trim() !== ''
   const numbered = Number.isInteger(Number(change.entry)) && Number(change.entry) >= 1
-  if (change.op === 'add') return texted && (change.topic === undefined || typeof change.topic === 'string') && (change.team === undefined || typeof change.team === 'boolean') && kindOk(change.kind)
+  // `evidence` is the exact words the change rests on; the host checks it against the lines
+  // the review read. It is optional: a change that merges or summarises several lines is
+  // checked by what it says instead.
+  const quoted = change.evidence === undefined || typeof change.evidence === 'string'
+  if (change.op === 'add') return texted && quoted && (change.topic === undefined || typeof change.topic === 'string') && (change.team === undefined || typeof change.team === 'boolean') && kindOk(change.kind)
   if (change.op === 'move') return texted && numbered && typeof change.topic === 'string' && change.topic.trim() !== '' && kindOk(change.kind)
-  if (change.op === 'edit') return texted && numbered && kindOk(change.kind)
+  if (change.op === 'edit') return texted && quoted && numbered && kindOk(change.kind)
   return change.op === 'remove' && numbered
 }
 
@@ -432,6 +436,7 @@ const reviewSystem = teamWrites => [
   '  {"op": "move", "entry": 3, "topic": "travel", "text": "…"}  moves entry 3 out of MEMORY.md into that topic, when MEMORY.md must get shorter',
   '  {"op": "edit", "entry": 3, "text": "…"}  replaces entry 3',
   '  {"op": "remove", "entry": 3}',
+  'Every add and every edit also names "evidence": the exact words, copied from one line of the messages above, that the entry rests on. The host checks that quote against those lines and refuses the change when it is not there word for word; a merge or a summary quotes the sentence it rests on, and the entry itself may reword and combine what the lines say.',
   `An entry is one short fact of at most ${MEMORY_LIMITS.entry} characters, in the language the user writes in, that says whom it is about ("The user likes a plain style, mostly black, white, and grey", not "Plain style"). A name, a city, and a preference are three entries.`,
   ...(teamWrites ? [] : ['Team entries are read only for you: keep what the whole team needs as an entry of this Bot.']),
 ].join('\n')
@@ -622,13 +627,57 @@ export function install(rt) {
     return session === undefined ? null : rt.sessionFolder(session) ?? null
   }
 
-  // The lines of the candidate's own conversation, oldest first: the only evidence the
-  // host will quote from, so an anchor cannot reach another Bot's or another project's log.
-  async function taskLines(sessionId) {
-    const lines = []
-    for await (const line of rt.partLines(sessionId, AbortSignal.timeout(SOURCE_READ_MS), { pages: Infinity })) lines.push(line)
-    return lines.reverse()
+  // What the host may quote as evidence, from one Session and nothing else: what the user
+  // wrote, what another Bot wrote, what this Bot answered, and what a tool returned with
+  // its name and its failure state. A claim about a command or a test is only ever checked
+  // against a tool result (#66): the Bot's own words saying that its tests passed are not
+  // evidence that they did, and the same rule serves the task review and the per-turn
+  // review, so neither path can be talked past by a prompt.
+  async function sessionSources(sessionId) {
+    const events = []
+    for await (const event of rt.eventsBackwards(sessionId, AbortSignal.timeout(SOURCE_READ_MS), Infinity)) events.push(event)
+    const named = new Map()
+    for (const event of events) {
+      if (event.type === 'tool/call') named.set(String(event.data?.callId ?? ''), String(event.data?.name ?? ''))
+      else if (event.type === 'tool/ptc-dispatch-start') named.set(String(event.data?.subCallId ?? ''), String(event.data?.name ?? ''))
+    }
+    const sources = []
+    for (const event of events) {
+      const entry = rt.historyEntry(event, false)
+      if (entry !== undefined) {
+        if (entry.text !== '') sources.push({ who: entry.answer ? 'you' : entry.who, text: entry.text, seq: event.seq })
+        continue
+      }
+      if (event.type !== 'tool/result') continue
+      const text = textOf(event.data?.message?.content)
+      if (text === '') continue
+      const callId = String(event.data?.message?.toolCallId ?? '')
+      const error = event.data?.error
+      sources.push({
+        who: 'tool',
+        text,
+        seq: event.seq,
+        tool: {
+          name: named.get(callId) ?? '',
+          callId,
+          isError: event.data?.message?.isError === true,
+          ...(error === undefined ? {} : { error: String(error?.code ?? '') || undefined, reason: String(error?.reason ?? '') || undefined }),
+        },
+      })
+    }
+    return sources.reverse()
   }
+
+  // A quote is evidence only as the exact words of one source line: newlines and the ends
+  // are normalised, nothing else. `who` decides what it can prove.
+  const quoteIn = (sources, quote) => {
+    const wanted = String(quote ?? '').replace(/\r\n/g, '\n').trim()
+    if (wanted === '') return undefined
+    return sources.find(source => String(source.text ?? '').replace(/\r\n/g, '\n').includes(wanted))
+  }
+  // What each kind of claim may quote (design §5). A Bot's own answer proves only that it
+  // said so; it never proves that its work succeeded.
+  const SOURCE_FOR = { user: ['user'], command: ['tool'], test: ['tool'], answer: ['you'], file: [] }
 
   function parseTaskJson(text) {
     const body = String(text ?? '').trim().replace(/^```(?:json)?\s*/i, '').replace(/```$/, '').trim()
@@ -687,8 +736,11 @@ export function install(rt) {
   async function taskReviewExtract(record) {
     const bot = rt.botOf(record.botId)
     if (bot === undefined) return { invalid: 'the Bot is gone' }
-    const lines = await taskLines(record.sessionId)
-    const excerpt = lines.slice(-TASK_EXCERPT_LINES).map(line => `${line.who}: ${line.text}`.replace(/\s+/g, ' ').slice(0, 400))
+    const sources = await sessionSources(record.sessionId)
+    const excerpt = sources.slice(-TASK_EXCERPT_LINES).map((line) => {
+      const who = line.who === 'tool' ? `tool ${line.tool?.name || 'result'}${line.tool?.isError ? ' (failed)' : ''}` : line.who
+      return `${who}: ${line.text}`.replace(/\s+/g, ' ').slice(0, 400)
+    })
     const claims = record.claims.map((claim, index) => ({ index, kind: claim.kind, statement: claim.statement, evidence: claim.evidence, ref: claim.ref }))
     const reply = await botShot(bot, TASK_EXTRACT_SYSTEM, [
       `The Bot reported: ${record.result}`,
@@ -713,39 +765,55 @@ export function install(rt) {
       const outcome = item?.outcome === 'failed' ? 'failed' : 'verified'
       const evidence = String(claim.evidence ?? '').replace(/\r\n/g, '\n').trim()
       if (evidence === '' || evidence.length > 500) { drop('evidence-missing', { claim: claim.index }); continue }
-      // Gate one: the quote must appear verbatim in an authorized line. A claim that names
-      // an absolute path is checked against that file instead, and only when the file is
-      // inside the Session's folder: a path that cannot be proven to be inside is refused
-      // rather than falling back to the conversation.
+      // Gate one: the quote must be the exact words of a line that can prove this kind of
+      // claim. What the Bot said about itself is not evidence that its work succeeded
+      // (#66): `command` and `test` quote a tool result, `user` quotes the user, `answer`
+      // quotes the Bot, and anything else quotes whatever is allowed for it. A claim that
+      // names a file is checked against that file instead, and only when the file is inside
+      // the Session's folder: a path that cannot be proven to be inside is refused rather
+      // than falling back to the conversation.
       const isFileClaim = claim.kind === 'file'
+      const allowed = SOURCE_FOR[claim.kind] ?? ['user', 'bot', 'you']
       let supported
       let context = ''
+      let deemed
       if (isFileClaim) {
         const file = taskClaimFile(record, claim.ref)
         supported = file !== undefined && file.includes(evidence)
         context = supported ? `file ${claim.ref}` : ''
       } else {
-        const line = lines.find(candidate => String(candidate.text ?? '').replace(/\r\n/g, '\n').includes(evidence))
+        const line = quoteIn(sources.filter(source => allowed.includes(source.who)), evidence)
         supported = line !== undefined
         context = supported ? String(line.text ?? '').slice(0, 300) : ''
+        if (supported && line.who === 'tool') deemed = line.tool
       }
       if (!supported) { drop('evidence-unsupported', { claim: claim.index, text, evidence: evidence.slice(0, 120) }); continue }
       // A command or test result carries its own failure markers in the text the tool
-      // rendered; the semantic check is told about them rather than left to guess.
-      const toolFailed = claim.kind === 'command' || claim.kind === 'test'
-        ? /\[exit code: [1-9]\d*\]|\[timed out|\[killed by signal|\[stderr\]/.test(context)
-        : undefined
-      candidates.push({ claim: claim.index, topic: cleanTopic(item?.topic) ?? '', text, outcome, evidence, context, toolFailed })
+      // rendered, or says it failed itself; the semantic check is told about both rather
+      // than left to guess, and a failed result cannot become a lesson that held.
+      const toolFailed = isFileClaim
+        ? undefined
+        : deemed === undefined
+          ? undefined
+          : deemed.isError === true
+            || /\[exit code: [1-9]\d*\]|\[timed out|\[killed by signal|\[stderr\]/.test(context)
+      if (toolFailed === true && outcome === 'verified' && (claim.kind === 'command' || claim.kind === 'test')) {
+        drop('tool-failed', { claim: claim.index, text, evidence: evidence.slice(0, 120) })
+        continue
+      }
+      candidates.push({ claim: claim.index, topic: cleanTopic(item?.topic) ?? '', text, outcome, evidence, context, toolFailed, source: deemed ?? undefined })
     }
     if (candidates.length === 0) return { items: [], dropped }
     // Gate two: the model judges whether each quote really supports its claim, and its
     // answer is recorded with the entry. It reads the surrounding line too, so a negation
-    // just outside the quote is not cut away.
+    // just outside the quote is not cut away; for a tool result it also reads which tool
+    // ran and whether that call failed.
     const verdict = await botShot(bot, TASK_VERIFY_SYSTEM, candidates.map(entry => JSON.stringify({
       claim: claims[entry.claim].statement,
       kind: claims[entry.claim].kind,
       evidence: entry.evidence,
       context: entry.context,
+      ...(entry.source === undefined ? {} : { sourceType: 'tool', tool: entry.source.name, toolCallFailed: entry.source.isError === true, ...(entry.source.error === undefined ? {} : { toolError: entry.source.error }) }),
       ...(entry.toolFailed === undefined ? {} : { toolReportedFailure: entry.toolFailed }),
     })).join('\n'), { sessionId: record.sessionId, kind: 'memory' })
     const support = parseTaskJson(verdict)?.support
@@ -1945,7 +2013,46 @@ export function install(rt) {
     return { texts: kept, count: kept.length }
   }
 
-  async function applyReview(bot, sessionId, numbered, changes, source) {
+  // The lines exactly as the review was shown them, with who wrote each: a change's quote
+  // is checked against this list, so what the host accepts is what the model actually read.
+  const reviewLineSources = (lines, bot) => lines.map(line => ({ who: line.who, text: reviewLine(line.who, line.text, bot) }))
+
+  // What the per-turn review may rest a change on (#66). Two ways, and no other:
+  //  - it quotes the words it rests on in `evidence`: the exact span of a user line, or of
+  //    a tool result for a howto. A merge or a reworded summary keeps working this way;
+  //  - it says only what the user's own lines say: the words the entry carries (the
+  //    third-person framing and the small words left out) appear in the user's lines, so a
+  //    summary of several messages is still possible while a sentence nobody wrote is not.
+  // The Bot's own answer proves only that the Bot said so, so it is never a source here,
+  // and a tool result that failed never becomes a rule that held. `move` and `remove` act
+  // on an entry they name, so they need no quote of their own.
+  const REVIEW_STOP = new Set(['the', 'and', 'for', 'with', 'that', 'this', 'its', 'his', 'her', 'their', 'user', 'users', 'from', 'have', 'has', 'was', 'were', 'are', 'you', 'your', 'not', 'but', 'all', 'any', 'can', 'will', 'should', 'must', 'one', 'more', 'them', 'then', 'than', 'into', 'out', 'per', 'new', 'old'])
+  const reviewTokens = text => [...wordsOf(text)].filter(word => !REVIEW_STOP.has(word))
+  const sameWord = (a, b) => a === b || (a.length >= 4 && b.length >= 4 && a.slice(0, 4) === b.slice(0, 4))
+  const reviewEvidence = (change, lines) => {
+    const op = String(change?.op ?? '')
+    if (op !== 'add' && op !== 'edit') return { ok: true }
+    const quote = String(change?.evidence ?? '').replace(/\r\n/g, '\n').trim()
+    const allowed = change?.kind === 'howto' ? ['user', 'tool'] : ['user']
+    if (quote !== '') {
+      const line = quoteIn(lines.filter(source => allowed.includes(source.who)), quote)
+      if (line === undefined) return { ok: false, reason: 'evidence-unsupported' }
+      // A lesson taken from a tool result that failed is kept as a failure, never as a rule
+      // that held: the result itself says otherwise.
+      if (line.who === 'tool' && line.tool?.isError === true && change?.outcome !== 'failed') return { ok: false, reason: 'tool-failed' }
+      return { ok: true, quote, line }
+    }
+    const wanted = reviewTokens(change?.text)
+    if (wanted.length === 0) return { ok: false, reason: 'evidence-missing' }
+    const said = lines.filter(source => source.who === 'user').flatMap(source => reviewTokens(source.text))
+    // Every content word of the entry has to come from the user's own lines. A reworded
+    // summary passes; a fact, a name or a rule the user never mentioned does not.
+    const missing = wanted.filter(word => !said.some(other => sameWord(word, other)))
+    if (missing.length > 0) return { ok: false, reason: 'evidence-unsupported', missing }
+    return { ok: true }
+  }
+
+  async function applyReview(bot, sessionId, numbered, changes, source, lines) {
     const actor = { id: bot.id, name: bot.name, session: sessionId, auto: true }
     const done = []
     let failed
@@ -1994,6 +2101,11 @@ export function install(rt) {
         })
         continue
       }
+      // The host's own check comes before any write: a change the review could not quote
+      // from the lines it read is recorded and left out, never written (#66). The prompt
+      // can be talked past; this cannot.
+      const grounded = reviewEvidence(change, lines)
+      const ungrounded = grounded.ok !== true
       const scope = op === 'add'
         ? (change.team === true && teamWrites ? TEAM : projectWrite.status === 'ok' ? projectWrite.scope : ownScope(bot.id))
         : target?.scope === 'team' ? TEAM : target?.scope === 'project' ? (projectWrite.status === 'ok' ? projectWrite.scope : ownScope(bot.id)) : ownScope(bot.id)
@@ -2012,6 +2124,22 @@ export function install(rt) {
         if (op === 'move' && target.file.topic !== undefined) continue
         if (scope.kind === 'team' && !teamWrites) continue
         if ((op === 'add' || op === 'edit' || op === 'move') && entryProblem(text) !== undefined) continue
+        // A secret is dropped without a record, as it always was: the record would hold it.
+        if (secretEntry(text)) continue
+        if (ungrounded) {
+          rt.warn('ds-bot: memory review of %s skipped a change: %s', bot.name, grounded.reason)
+          await journal({
+            op: 'skip',
+            scope: 'unverified-review',
+            file: target?.file?.file ?? (topic === undefined ? MAIN : `${topic}.md`),
+            ...actorOf(actor),
+            after: text,
+            before: target?.text,
+            intendedOp: op,
+            reason: grounded.reason,
+          })
+          continue
+        }
         if (op === 'add') done.push(await addEntry({ scope, topic, text, meta, actor, label }))
         else if (op === 'edit') done.push(await replaceEntry({ scope, topic: target.file.topic, match: target.text, text, meta, actor, label }))
         else if (op === 'move') done.push(await moveEntry({ scope, topic, match: target.text, actor, label }))
@@ -2177,7 +2305,7 @@ export function install(rt) {
         throw new Error(invalid)
       }
       if (rt.botOf(bot.id) === undefined) return
-      const changed = await applyReview(bot, sessionId, numbered, applied, batch.source(read))
+      const changed = await applyReview(bot, sessionId, numbered, applied, batch.source(read), reviewLineSources(read, bot))
       if (rt.botOf(bot.id) === undefined) return
       // Operational failures are not bad model answers. Only a valid review that
       // finished applying its changes clears the prior refusal count.
