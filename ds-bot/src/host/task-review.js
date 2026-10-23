@@ -24,6 +24,13 @@ export const CAPACITY_CODE = 'memory/full'
 // The waits are short: the wake is a timer in this module's life (#67), not a person.
 export const RETRY_WAIT_MS = [1_000, 5_000, 25_000]
 
+// Raised by `applyItem` when the conditions the candidate was checked under no longer
+// hold at the moment of the write: the Bot left the group, the conversation changed
+// hands, project memory was switched off, or the project id is no longer the one the
+// frozen plan names. It is not a write failure and not a retry: the candidate stops, and
+// the record says why (#70).
+export const STALE_CODE = 'memory/task-stale'
+
 export const STATUS = {
   pending: 'PENDING',
   waiting: 'WAITING',
@@ -70,9 +77,12 @@ export const metaForSecretCheck = meta => Object.fromEntries(Object.entries(meta
 //   `{ ok: true, project }`, `{ ok: false, waiting: true }` or `{ ok: false, dropped }`.
 // - `extract(candidate)` asks the model for the claims once; resolves
 //   `{ items: [...] }` or `{ invalid: reason }`.
-// - `applyItem(item)` writes one entry through the memory queue and resolves
+// - `applyItem(item, hooks)` writes one entry through the memory queue and resolves
 //   `{ changed, file }`; it throws `memory/full` when the file is full and
-//   `memory/invalid` for a check that cannot pass by trying again.
+//   `memory/invalid` for a check that cannot pass by trying again. `hooks` carries
+//   `record` (the candidate, for the standing re-check #70 makes in the queued job) and
+//   `decide` (#64's in-queue hook: fresh hashes/entries/hasLink, and the persisted
+//   pre-write state); the second argument is a hooks bag, never the record alone.
 // - `linkTopic(scope, topic)` adds the missing `[[topic]]` link to MEMORY.md.
 // - `wake(record)` is called when a backed-off apply's wait is over (#67). The host
 //   decides what a wake does; a review switched off does nothing at all.
@@ -182,7 +192,15 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
   // They are the only things WAITING may look at. Checking the Bot's other work instead
   // would let one busy group chat stall a report made in another, which is the point of
   // keeping these lists per candidate.
-  async function enqueue({ botId, sessionId, roomId, project, cwd, callId, result, claims, notes, work, questions, groupWaits }) {
+  //
+  // `projectKind` is what the resolver answered at the moment of the report — ok, none,
+  // unresolved or off — and is kept beside `project`, so the four cases survive as four.
+  // Collapsing them into `project: null` lost the difference between "this folder is not a
+  // project" and "this folder's project cannot be told apart"; the second is a binding
+  // waiting to be made, never a licence to write the Bot's own memory (#70).
+  // `sessionChain` is the Sessions this candidate may read from and bind through: the one
+  // it was reported in, plus the earlier parts of the same chat.
+  async function enqueue({ botId, sessionId, roomId, project, projectKind, cwd, sessionChain, callId, result, claims, notes, work, questions, groupWaits }) {
     if (typeof sessionId !== 'string' || typeof callId !== 'string') throw new Error('A candidate needs the session and the tool call')
     const candidateId = candidateIdOf(sessionId, callId)
     // A replay finds the accepted candidate. An unreadable file is quarantined here —
@@ -205,9 +223,21 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
       sessionId,
       roomId: roomId ?? null,
       project: project ?? null,
+      // One of ok / none / unresolved / off, as the resolver answered when the report was
+      // made. A file written before this field existed reads as `none` with no `project`,
+      // which is what it meant then.
+      projectKind: ['ok', 'none', 'unresolved', 'off'].includes(String(projectKind))
+        ? String(projectKind)
+        : (project === null || project === undefined ? 'none' : 'ok'),
       // The folder the report was made in. A file claim is judged against this root for
-      // the rest of the candidate's life, even if the Session moves elsewhere.
+      // the rest of the candidate's life, even if the Session moves elsewhere; a candidate
+      // that was unresolved is bound from this folder only, never from wherever its
+      // Session happens to be at the next check.
       cwd: cwd ?? null,
+      // The Sessions of the same chat the report may read, oldest first, the reporting one
+      // last. A part switch moves the Bot on; the chain is what says the candidate still
+      // belongs to that conversation.
+      sessionChain: relatedIds(sessionChain).length > 0 ? relatedIds(sessionChain) : [sessionId],
       createdAt: now(),
       status: STATUS.pending,
       invalid: 0,
@@ -297,16 +327,22 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
   }
 
   // Applies one item, or explains why it could not be applied. Returns one of
-  // `done` / `deduplicated` / `conflict` / `retrying`, so the caller only decides status.
-  // Every read the decision needs — the scope's current entries, the pre-write
-  // hashes, the link state — happens inside the memory write queue, in the same
-  // critical section as the write itself, through the hook below: nothing can move
-  // under the decision, and no queue-outside snapshot goes stale (#64).
+  // `done` / `deduplicated` / `conflict` / `retrying` / `waiting` / `stale`, so the caller
+  // only decides status. Every read the decision needs — the scope's current entries, the
+  // pre-write hashes, the link state — happens inside the memory write queue, in the same
+  // critical section as the write itself, through the hook below: nothing can move under
+  // the decision, and no queue-outside snapshot goes stale (#64). `applyItem` is given the
+  // candidate as `hooks.record` beside that hook; it re-checks the Bot, the conversation,
+  // the group, the configuration and the project in that same queued job, because a
+  // candidate can wait hours between its freeze and its last item (#70). The hook itself
+  // stays exactly what #64 made it: fresh entries/hashes/hasLink, and the persisted
+  // pre-write state.
   async function applyOne(record, item) {
     if (isDone(record, item.reviewId)) return { kind: 'done', skipped: true }
     let result
     try {
       result = await applyItem(item, {
+        record,
         decide: async ({ hashes, entries, hasLink }) => {
           // The id says an entry is the one this plan made. Only the exact frozen line
           // counts: a user edit keeps the id but changes the line, and that must not
@@ -347,6 +383,9 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
       if (error?.code === 'memory/invalid') {
         record.progress.conflicts.push({ reviewId: item.reviewId, file: item.topic === '' ? 'MEMORY.md' : `${item.topic}.md`, expected: item.line, found: null, reason: 'invalid-at-apply', problem: String(error?.message ?? error) })
         return { kind: 'conflict', file: item.topic === '' ? 'MEMORY.md' : `${item.topic}.md` }
+      }
+      if (error?.code === STALE_CODE) {
+        return error.waiting === true ? { kind: 'waiting' } : { kind: 'stale', reason: String(error?.message ?? 'stale') }
       }
       record.retry += 1
       return { kind: 'retrying', error: String(error?.message ?? error) }
@@ -390,6 +429,20 @@ export function taskReview({ root, check, extract, applyItem, linkTopic, readSco
       if (outcome.kind === 'capacity') {
         record.status = STATUS.capacity
         record.capacityAt = now()
+        await write(record)
+        return outcome
+      }
+      // The conditions changed under the plan: waiting is not a failure, so the same
+      // frozen plan is looked at again; a refusal that can never come true is dropped
+      // with its reason, exactly as the first check would have.
+      if (outcome.kind === 'waiting') {
+        record.status = STATUS.waiting
+        await write(record)
+        return outcome
+      }
+      if (outcome.kind === 'stale') {
+        record.status = STATUS.dropped
+        record.droppedReason = outcome.reason
         await write(record)
         return outcome
       }

@@ -32,7 +32,7 @@ import { speakerOf } from '../shared/mentions.js'
 import { output } from './tools.js'
 import { memoryFiles } from './memory-files.js'
 import { memoryIndex } from './memory-index.js'
-import { STATUS as TASK_STATUS, taskReview as createTaskReview, metaForSecretCheck } from './task-review.js'
+import { STATUS as TASK_STATUS, STALE_CODE as TASK_STALE, taskReview as createTaskReview, metaForSecretCheck } from './task-review.js'
 import { within } from './folders.js'
 import { extractInput, verifyInput } from './task-review-input.js'
 
@@ -632,7 +632,20 @@ export function install(rt) {
   ].join('\n')
 
   const taskLabel = scope => labelOf(scope, scope.kind === 'bot' ? scope.botId : undefined)
-  const taskScopeOf = record => (record.project === null ? ownScope(record.botId) : { kind: 'project', hash: record.project.slice('project:'.length) })
+  // The scope the frozen plan will write to, and nothing else. Only a candidate that is
+  // really bound to a project has one; one that is really `none` writes the Bot's own
+  // memory. `unresolved` and `off` have no scope at all: `check` never lets them reach
+  // the freeze, and a record that claims one is refused here rather than quietly turned
+  // into an own write — `project: null` is not a licence for the global memory (#70).
+  const taskProjectKind = record => (record.projectKind ?? (record.project === null ? 'none' : 'ok'))
+  function taskScopeOf(record) {
+    const kind = taskProjectKind(record)
+    if (kind === 'ok' && typeof record.project === 'string' && record.project.startsWith('project:')) {
+      return { kind: 'project', hash: record.project.slice('project:'.length) }
+    }
+    if (kind === 'none' && (record.project === null || record.project === undefined)) return ownScope(record.botId)
+    return undefined
+  }
 
   // Who wrote the entry, for the scopes `metaFor` names the writer in: a project's memory
   // is shared by every Bot that works there, so a lesson kept by the review has to say
@@ -644,6 +657,19 @@ export function install(rt) {
   const taskCwdOf = (sessionId) => {
     const session = sessionRecord(sessionId)
     return session === undefined ? null : rt.sessionFolder(session) ?? null
+  }
+
+  // The Sessions of the chat a report is made in, oldest first and the reporting one
+  // last: the parts DSH moved this conversation through, plus the one it is in now. The
+  // chain is what a later pass compares against the live team — a candidate belongs to
+  // the Bot only while one of its own Sessions still speaks for that Bot (#70).
+  function taskChainOf(sessionId) {
+    const botId = rt.selfOf(sessionId)
+    const roomId = rt.groupOwners?.get(sessionId)?.roomId
+    const parts = (botId === undefined ? [] : rt.partsOf(botId, roomId))
+      .map(part => part?.sessionId)
+      .filter(id => typeof id === 'string' && id !== '')
+    return [...new Set([...parts, sessionId])]
   }
 
   // What the host may quote as evidence, from one Session and nothing else: what the user
@@ -778,17 +804,168 @@ export function install(rt) {
   // longer under the Session that asked it, and the candidate must still wait for it.
   const openQuestionIds = () => new Set(Object.values(state.questions ?? {}).map(question => question?.id).filter(id => typeof id === 'string'))
 
+  // Is this candidate still the same Bot, in the same conversation, in the same group?
+  // Nothing kept in the candidate is a credential: the Session and the group are
+  // re-checked against the live team on every pass, and the project is re-resolved from
+  // disk rather than trusted from `record.project` (#70). A candidate whose Bot is gone,
+  // whose Session now speaks for someone else, or whose reporting Bot left the group it
+  // was reported in is dropped rather than written.
+  function taskOwnerProblem(record) {
+    if (rt.botOf(record.botId) === undefined) return 'bot-gone'
+    if (rt.selfOf(record.sessionId) !== record.botId) return 'session-changed'
+    if (typeof record.roomId === 'string' && record.roomId !== '') {
+      const room = rt.roomOf?.(record.roomId)
+      if (room === undefined || !(room.members ?? []).includes(record.botId)) return 'member-gone'
+    }
+    return undefined
+  }
+
+  // The chat a candidate was reported in still leads to this Bot: its Session does, or a
+  // part of the same chat does. The chain is only a list of Session ids, so it is checked
+  // against the live team, never trusted as a permission of its own.
+  function taskChainHolds(record) {
+    const chain = Array.isArray(record.sessionChain) ? record.sessionChain : []
+    if (chain.length === 0) return rt.selfOf(record.sessionId) === record.botId
+    return chain.some(id => rt.selfOf(id) === record.botId)
+  }
+
+  // The session that speaks for this candidate's chat right now: the one it was reported
+  // in while that is still the chat's, otherwise the part the chat moved on to. Only ids
+  // from the candidate's own record are followed, and the owner of each is re-read from
+  // the live team, so this never reaches another Bot's conversation (#70).
+  function taskCurrentSession(record) {
+    const session = sessionRecord(record.sessionId)
+    if (session !== undefined) return session
+    const owner = typeof record.roomId === 'string' && record.roomId !== '' ? rt.roomOf?.(record.roomId) : undefined
+    const current = owner === undefined ? rt.chatOf?.(record.botId) : owner?.sessions?.[record.botId]
+    if (current === undefined || rt.selfOf?.(current) !== record.botId) return undefined
+    return sessionRecord(current)
+  }
+
+  // The conversation still works where the report was made. A binding is only ever made
+  // for the folder the report recorded: if the chat has moved since, the work that
+  // happened there is not this one, and the candidate must not inherit its project.
+  function taskStillInCwd(record) {
+    if (record.cwd === null || record.cwd === undefined) return true
+    const session = taskCurrentSession(record)
+    if (session === undefined) return false
+    const now = rt.sessionFolder?.(session) ?? null
+    if (now === null) return false
+    try {
+      return realpathSync(now) === realpathSync(record.cwd)
+    } catch {
+      return false
+    }
+  }
+
+  // Where the conversation works now. The same chat, as `taskCurrentSession` proves; after
+  // a part switch the archived Session is replaced by the part that took over.
+  function taskNowProject(record) {
+    const session = taskCurrentSession(record)
+    return session === undefined ? { status: 'none' } : projectOf(session)
+  }
+
+  // The project a candidate may write to, decided by what is on disk now. `projectMemory`
+  // off wins over everything: a candidate whose report was taken while the feature was on
+  // waits instead of being moved into the Bot's own memory.
+  //
+  //   ok         the conversation must still be in the same project (identity changed is
+  //              DROPPED, `project-changed`); a project that temporarily cannot be told
+  //              apart — the Session's folder or the recorded one — is WAITING, which is
+  //              the one case the design calls temporary.
+  //   unresolved re-resolve the folder the report was made in, and only that one; a real
+  //              project binds it once, and only while the conversation still works in
+  //              that very folder. It never falls back to the Bot's own memory: nothing
+  //              said the folder is not a project.
+  //   none       still none keeps the Bot's own memory; a folder that became a project is
+  //              bound once, on the same re-check, never written globally by default.
+  //   off        waiting while the configuration stays off; once it is on again the folder
+  //              is the only remaining fact and decides like `none`.
+  function taskProjectDecision(record) {
+    const kind = taskProjectKind(record)
+    if (rt.config?.projectMemory === false) return { waiting: true }
+    const cwd = record.cwd ?? null
+    // Where the conversation works now: an identity change here is what `ok` must catch.
+    const now = taskNowProject(record)
+    // The folder the report was made in, re-read through the same resolver. A `none` or an
+    // `unresolved` candidate may only be bound from this one, never from the Session's
+    // present folder in another conversation.
+    const there = cwd === null ? { status: 'none' } : (rt.projectScope?.resolveCwd?.(cwd) ?? now)
+    if (now.status === 'off' || there.status === 'off') return { waiting: true }
+    if (kind === 'ok') {
+      if (now.status === 'unresolved' || there.status === 'unresolved') return { waiting: true }
+      if (now.status !== 'ok' || there.status !== 'ok') return { dropped: 'project-changed' }
+      const bound = `project:${there.hash}`
+      const current = `project:${now.hash}`
+      if (record.project !== null && record.project !== undefined && record.project !== bound) return { dropped: 'project-changed' }
+      if (current !== bound) return { dropped: 'project-changed' }
+      return { bind: bound }
+    }
+    if (there.status === 'ok') {
+      // A binding is only made for a candidate that still belongs to the chat and the
+      // folder it was reported in; a Bot that moved on to another conversation or another
+      // working directory cannot inherit it.
+      if (!taskChainHolds(record) || !taskStillInCwd(record)) return { waiting: true }
+      return { bind: `project:${there.hash}` }
+    }
+    if (there.status === 'unresolved') return { waiting: true }
+    // The folder is a definite non-project now. Only a candidate that really was `none`
+    // (or was recorded while the feature was off) may write the Bot's own memory; an
+    // `unresolved` one still may not, because nothing here says what it used to be.
+    return kind === 'none' || kind === 'off' ? { own: true } : { waiting: true }
+  }
+
+  // The scopes a frozen plan names, and whether they are still this candidate's. A plan
+  // file is plain JSON a person can edit between the freeze and the write: an item moved
+  // into another project's scope would be a lesson written where its evidence never lived.
+  // The plan may only name the one scope the record itself resolves to now (#70).
+  const taskFrozenScope = (record) => {
+    const plan = record.plan
+    if (plan === null || plan === undefined || !Array.isArray(plan.items) || plan.items.length === 0) return undefined
+    return [...new Set(plan.items.map(item => item?.scope))]
+  }
+  const taskPlanScopeHolds = (record, scopes) => {
+    const scope = taskScopeOf(record)
+    if (scope === undefined) return false
+    const only = scopeKey(scope)
+    return scopes.every(value => value === only)
+  }
+
   async function taskReviewCheck(record) {
     // A guard for a caller that got here anyway: both ways a candidate is looked at
     // (`taskRecovery` after load, `runSessionTasks` after a turn) return before this while
     // the review is off, so the record keeps its bytes. This answer is "waiting" and not a
     // terminal reason, so such a candidate is looked at again once the review is on.
     if (!reviewOn) return { ok: false, waiting: true }
-    if (rt.botOf(record.botId) === undefined) return { ok: false, reason: 'bot-gone' }
-    if (rt.selfOf(record.sessionId) !== record.botId) return { ok: false, reason: 'session-changed' }
-    const project = projectOf(record.sessionId)
-    const current = project.status === 'ok' ? `project:${project.hash}` : null
-    if (record.project !== null && current !== record.project) return { ok: false, waiting: true }
+    const owner = taskOwnerProblem(record)
+    if (owner !== undefined) return { ok: false, reason: owner }
+    const decision = taskProjectDecision(record)
+    if (decision.dropped !== undefined) return { ok: false, reason: decision.dropped }
+    if (decision.waiting === true) return { ok: false, waiting: true }
+    const frozen = taskFrozenScope(record)
+    if (frozen !== undefined) {
+      // The plan is frozen once and its scope never moves. A later pass only decides
+      // whether that scope is still this candidate's to write: the record is not re-bound
+      // to a project the plan did not name, so an entry can never slide from the Bot's own
+      // memory into a project (or the other way) after the freeze (#70).
+      if (!taskPlanScopeHolds(record, frozen)) return { ok: false, reason: 'project-changed' }
+    } else if (decision.bind !== undefined && (record.project !== decision.bind || record.projectKind !== 'ok')) {
+      // The binding is made here, once, and saved with the rest of the record; every later
+      // pass re-resolves and only confirms it, which is what keeps the frozen scope from
+      // drifting between check, freeze and apply.
+      record.project = decision.bind
+      record.projectKind = 'ok'
+      record.boundAt = new Date().toISOString()
+      await taskReview.save(record)
+    }
+    // A report taken while project memory was off has no kind of its own. Now that the
+    // feature is on and the recorded folder is provably no project, it is `none` — the
+    // only value that may write the Bot's own memory.
+    if (decision.own === true && taskProjectKind(record) !== 'none' && record.plan === null) {
+      record.project = null
+      record.projectKind = 'none'
+      await taskReview.save(record)
+    }
     // Only the work and the questions this candidate recorded. Asking about anything the
     // Bot happens to be doing would let a busy group chat stall a report from another one.
     // `pendingWork` is "still in the book", which is what an unanswered request means —
@@ -802,7 +979,14 @@ export function install(rt) {
       const open = openQuestionIds()
       if (questions.some(id => open.has(id))) return { ok: false, waiting: true }
     }
-    return { ok: true, project: current }
+    const scope = taskScopeOf(record)
+    // A record whose project state has no scope (unresolved, off, or a hand-edited file
+    // that disagrees with itself) never reaches the freeze: asking the model first and
+    // choosing the scope afterwards is how a lesson ends up in the wrong memory. The
+    // four live states were decided above, so anything left here is a record that cannot
+    // prove where it belongs — dropped, and its own bytes kept for a person to look at.
+    if (scope === undefined) return { ok: false, reason: 'project-state-invalid' }
+    return { ok: true, project: record.project ?? null, scope: scopeKey(scope) }
   }
 
   // A claim about a file is checked against that file, and only inside the folder the
@@ -836,6 +1020,10 @@ export function install(rt) {
   async function taskReviewExtract(record) {
     const bot = rt.botOf(record.botId)
     if (bot === undefined) return { invalid: 'the Bot is gone' }
+    // The scope was decided by `check` and stored on the record, so extraction reads it
+    // rather than deciding again; a record with none cannot be extracted at all (#70).
+    const scope = taskScopeOf(record)
+    if (scope === undefined) return { invalid: 'the candidate has no memory scope it can prove' }
     const sources = await sessionSources(record.sessionId)
     const excerpt = sources.slice(-TASK_EXCERPT_LINES).map((line) => {
       const who = line.who === 'tool' ? `tool ${line.tool?.name || 'result'}${line.tool?.isError ? ' (failed)' : ''}` : line.who
@@ -847,7 +1035,6 @@ export function install(rt) {
     const reply = await botShot(bot, TASK_EXTRACT_SYSTEM, extractInput({ result: record.result, notes: record.notes, claims, lines: excerpt }), { sessionId: record.sessionId, kind: 'memory' })
     const parsed = parseTaskJson(reply)
     if (parsed === undefined || !Array.isArray(parsed.items)) return { invalid: 'the model did not answer with items' }
-    const scope = taskScopeOf(record)
     const candidates = []
     const dropped = []
     const drop = (reason, detail) => dropped.push({ reason, ...detail })
@@ -950,10 +1137,25 @@ export function install(rt) {
 
   // One item, written through the queue exactly as planned: the frozen line and its
   // metadata, never recomputed. Both checks are re-run here because the plan file can be
-  // edited by hand between the freeze and the write.
+  // edited by hand between the freeze and the write — and so is the candidate's standing:
+  // the write is the last moment at which the Bot, the conversation, the group, the
+  // configuration and the project can be seen to still be the ones the report was taken
+  // under. A plan is never a permission of its own (design §5, #70).
   function taskReviewApply(item, hooks = {}) {
     return queued(async () => {
-      const scope = scopeOfKey(item.scope)
+      const stale = (why, waiting) => Object.assign(new Error(why), { code: TASK_STALE, ...(waiting ? { waiting: true } : {}) })
+      const record = hooks.record
+      if (record === undefined) throw stale('no-candidate')
+      const owner = taskOwnerProblem(record)
+      if (owner !== undefined) throw stale(owner)
+      const decision = taskProjectDecision(record)
+      if (decision.waiting === true) throw stale('project-unresolved', true)
+      if (decision.dropped !== undefined) throw stale(decision.dropped)
+      const scope = taskScopeOf(record)
+      if (scope === undefined) throw stale('project-state-invalid')
+      // The frozen item must name exactly the scope the record resolves to now: a plan
+      // edited to point at another project, or at the Bot's own memory, is refused.
+      if (scopeKey(scope) !== item.scope) throw stale('project-changed')
       writable(scope, { id: 'user', name: 'user' })
       const problem = entryProblem(item.text)
       if (problem !== undefined) throw Object.assign(new Error(problem), { code: 'memory/invalid' })
@@ -1788,7 +1990,12 @@ export function install(rt) {
         sessionId: caller.sessionId,
         roomId: owner?.roomId ?? null,
         project: project.status === 'ok' ? `project:${project.hash}` : null,
+        // The resolver's answer as it was, one of the four: `none` and `unresolved` are
+        // not the same fact, and collapsing them into a null project is what let an
+        // unresolved report silently fall into the Bot's own memory (#70).
+        projectKind: project.status,
         cwd: taskCwdOf(caller.sessionId),
+        sessionChain: taskChainOf(caller.sessionId),
         callId: String(exec?.callId ?? `no-call-${Date.now()}`),
         result,
         claims,
@@ -2634,6 +2841,21 @@ export function install(rt) {
     }
     const retryable = (record.unverified ?? []).filter(entry => entry.reason === 'model-unsupported' && typeof entry.evidence === 'string' && entry.evidence !== '')
     if (retryable.length === 0) return { ok: true, status: record.status, rechecked: 0 }
+    // A re-verify ends in the same freeze, so it needs the same answer `check` would have
+    // given: a candidate with no scope (unresolved, off, or a state that disagrees with
+    // itself) is not re-frozen into one, and a changed project is refused here too (#70).
+    const owner = taskOwnerProblem(record)
+    if (owner !== undefined) return { ok: false, error: `The candidate was left untouched: ${owner}.` }
+    const decision = taskProjectDecision(record)
+    if (decision.waiting === true) return { ok: true, status: record.status, rechecked: 0 }
+    if (decision.dropped !== undefined) return { ok: false, error: `The candidate was left untouched: ${decision.dropped}.` }
+    if (decision.bind !== undefined) {
+      record.project = decision.bind
+      record.projectKind = 'ok'
+      record.boundAt = record.boundAt ?? new Date().toISOString()
+    }
+    const frozenScope = taskScopeOf(record)
+    if (frozenScope === undefined) return { ok: false, error: 'The candidate has no memory scope it can prove, so it was left untouched.' }
     const bot = rt.botOf(record.botId)
     if (bot === undefined) return { ok: false, error: 'The Bot is gone.' }
     // A plan holds at most eight entries, so one explicit re-check asks about at most eight:
@@ -2660,7 +2882,7 @@ export function install(rt) {
         // is taken here, once, and frozen with the plan; apply never recomputes it.
         const source = String(entry.source ?? record.claims?.[entry.claim]?.ref ?? 'the conversation')
         accepted.push({
-          scope: scopeKey(taskScopeOf(record)),
+          scope: scopeKey(frozenScope),
           claim: entry.claim,
           topic: entry.topic ?? '',
           text: entry.text,
@@ -2671,7 +2893,7 @@ export function install(rt) {
             claim: entry.claim,
             evidence: String(entry.evidence ?? '').slice(0, 200),
             source: source.slice(0, 200),
-            ...taskByOf(record, taskScopeOf(record)),
+            ...taskByOf(record, frozenScope),
             outcome,
             added: today(),
           },
