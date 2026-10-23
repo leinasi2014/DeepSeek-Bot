@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createHash } from 'node:crypto'
 import test from 'node:test'
 import { apply } from '../index.js'
 import { parseMemory } from '../src/host/memory.js'
@@ -333,6 +334,52 @@ test('a re-verify whose lesson the freeze refuses is held instead of marked done
   assert.equal(after.plan, null, 'no plan is stored')
   assert.equal(existsSync(s.memoryPathOf(after)), false, 'nothing was written to memory')
   assert.equal(after.unverified.at(-1).reason, 'invalid-at-freeze')
+})
+
+// #64: the pre-write state is bound to the write inside the memory write queue. A
+// plain commit that lands after an interrupted item's pre-write state is part of the
+// content the decision sees, because the decision itself runs in the queue's critical
+// section: stale state stops as a conflict with the person's line kept, and state
+// that matches what the queue now holds goes on to write.
+test('a plain commit landing after the pre-write state is decided inside the queue', async t => {
+  const sha = text => createHash('sha256').update(text).digest('hex')
+  const planPathOf = s => join(s.planDir(), `${s.plans()[0].candidateId}.json`)
+  const interrupt = async (callId, pendingFromCurrent) => {
+    const s = start({ items: [{ claim: 0, topic: '', text: `发布用脚本 ${callId}`, outcome: 'verified' }], support: ['yes'] })
+    t.after(() => s.stop())
+    assert.match(await s.tool('complete_task', report, 'b2', callId), /Recorded as a candidate/)
+    idle(s.ctx)
+    await until(() => existsSync(s.memoryFile()) && s.plans()[0]?.status === 'DONE')
+    const record = JSON.parse(readFileSync(planPathOf(s), 'utf8'))
+    writeFileSync(s.memoryFile(), '# Memory\n\n## Index\n')
+    await s.tool('remember', { text: `插队提交 ${callId}` }, 'b2', `rem-${callId}`)
+    const hash = sha(readFileSync(s.memoryFile(), 'utf8'))
+    record.status = 'APPLYING'
+    record.progress = { done: [], conflicts: [], pending: { reviewId: record.plan.items[0].reviewId, scope: record.plan.items[0].scope, files: { 'MEMORY.md': pendingFromCurrent ? hash : sha('# Memory\n\n## Index\n') } } }
+    writeFileSync(planPathOf(s), JSON.stringify(record, null, 2))
+    idle(s.ctx)
+    return s
+  }
+  // Stale pre-write state: the person's remembered line is the change, nothing above
+  // explains it, and the item stops without touching the file.
+  {
+    const s = await interrupt('x-1', false)
+    await until(() => s.plans()[0].status === 'CONFLICT')
+    assert.equal(s.plans()[0].progress.conflicts.at(-1).reason, 'pre-write content changed')
+    const text = readFileSync(s.memoryFile(), 'utf8')
+    assert.match(text, /插队提交 x-1/, "the person's line stays")
+    assert.ok(!text.includes('发布用脚本 x-1'), 'the item was not written over it')
+  }
+  // Matching pre-write state: the decision ran on the content the queue now holds,
+  // so the item goes on and both lines live side by side.
+  {
+    const s = await interrupt('x-2', true)
+    await until(() => s.plans()[0].status === 'DONE')
+    const text = readFileSync(s.memoryFile(), 'utf8')
+    assert.match(text, /插队提交 x-2/)
+    assert.match(text, /发布用脚本 x-2/)
+    assert.equal(s.plans()[0].progress.pending, undefined)
+  }
 })
 
 // A project's memory is shared by every Bot that works there, so an entry kept by the
