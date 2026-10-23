@@ -242,3 +242,57 @@ test('a members @all calls nobody and opens no call', async t => {
 // A member that already used its turns in this round is passed over. The line still named
 // it, so a call was opened; if it stayed, a report made in that turn would wait forever on
 // a member the round will never ask.
+
+test('a member the round passes over leaves no call behind, and the report does not wait', async t => {
+  const s = await start(t)
+  const stop = new AbortController()
+  t.after(() => stop.abort())
+  s.emit('desk', 'user/message', { content: [{ type: 'text', text: '@Chief 开始复核.' }], source: { kind: 'user' } })
+  void s.tool('group_relay', {}, 'desk', 'relay-cap', { signal: stop.signal }).catch(() => {})
+
+  // Chief (the admin, four turns each) calls Writer and Tester.
+  await called(s, 'desk-chief')
+  s.begin('desk-chief')
+  await s.say('desk-chief', '@Writer @Tester 一起看发布说明，测试 12/12 通过。')
+  s.finish('desk-chief', '@Writer @Tester 一起看发布说明，测试 12/12 通过。')
+
+  // Writer, first turn.
+  await called(s, 'desk-writer')
+  s.begin('desk-writer')
+  s.finish('desk-writer', '第一步做完了。')
+
+  // Tester, first turn: calls Writer (its second turn).
+  await called(s, 'desk-tester')
+  s.begin('desk-tester')
+  await s.say('desk-tester', '@Writer 请复核一下。')
+  s.finish('desk-tester', '@Writer 请复核一下。')
+
+  // Writer, second turn: calls Tester back (its second turn).
+  await called(s, 'desk-writer')
+  s.begin('desk-writer')
+  await s.say('desk-writer', '@Tester 结果如下，请确认。')
+  s.finish('desk-writer', '@Tester 结果如下，请确认。')
+
+  // Tester, second turn: it has used its two turns as a member's callee, so a further call
+  // to it is passed over by the round. The line opens the call first.
+  await called(s, 'desk-tester')
+  s.begin('desk-tester')
+  await s.say('desk-tester', '@Writer 再确认一下。')
+  // Both are open right now: the line just opened Tester's call to Writer, and Writer's
+  // earlier call to Tester is only closed when Tester's turn really ends.
+  assert.deepEqual(s.roomCalls(), ['room:desk:tester:writer', 'room:desk:writer:tester'])
+  const accepted = await s.tool('complete_task', report, 'desk-tester', 'report-cap')
+  assert.match(String(accepted), /Recorded as a candidate/)
+  assert.deepEqual(s.plans()[0].groupWaits, ['room:desk:tester:writer'])
+  s.finish('desk-tester', '@Writer 再确认一下。')
+
+  // The dispatcher passed Writer over (two turns used), so it drops the call it opened.
+  await until(() => s.roomCalls().length === 0, () => JSON.stringify(s.roomCalls()))
+  assert.equal(s.roomCalls().includes('room:desk:tester:writer'), false, 'the passed-over call is dropped, not left waiting')
+  s.idle('desk-tester')
+  await until(() => s.plans()[0]?.status === 'DONE', () => `status=${s.plans()[0]?.status} calls=${JSON.stringify(s.roomCalls())}`)
+  assert.match(s.memoryOf('tester'), /发布说明由 Writer 写/, 'the report goes on instead of waiting forever')
+})
+
+// Restart, member gone: the group no longer holds the Bot the call names, so no turn can
+// ever answer it. The call is settled from what is on disk, and the report goes on.

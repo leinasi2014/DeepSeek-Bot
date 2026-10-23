@@ -110,6 +110,14 @@ export function install(rt) {
     delete works()[id]
     save()
   }
+  // A call nobody will answer here: the round passed this member over (it had used its
+  // turns), or the member, its group or its Bot is gone for good. Same key as the call
+  // that was opened, so the pairing cannot drift.
+  function dropRoomCall(roomId, from, to) {
+    const id = roomCallKey(roomId, from, to)
+    if (works()[id] === undefined) return
+    dropWork(id)
+  }
   function hold(workId, text) {
     const work = works()[workId]
     if (work === undefined || text === '') return
@@ -223,5 +231,6 @@ export function install(rt) {
     return lines.join('; ')
   }
 
-  Object.assign(rt, { workOf, openWork, closeWork, dropWork, takenWork: taken, ownsWork: owns, waitsWork: waits, pendingWork: pending, spawnedBy, openRoomCall, closeRoomCall, holdWork: hold, workAsker: askedBy, answerText, upstreamOf, sameWork, forgetBotWork: forgetBot, statusOf, waitingView })
+  Object.assign(rt, { workOf, openWork, closeWork, dropWork, takenWork: taken, ownsWork: owns, waitsWork: waits, pendingWork: pending, spawnedBy, openRoomCall, closeRoomCall, dropRoomCall, holdWork: hold, workAsker: askedBy, answerText, upstreamOf, sameWork, forgetBotWork: forgetBot, statusOf, waitingView })
+
 }

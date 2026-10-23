@@ -377,7 +377,13 @@ export function install(rt) {
   function callMembers(round, turns, index, callees, note, cap, by) {
     let next = index + 1
     for (const peer of callees) {
-      if ((turns.get(peer.id) ?? 0) >= cap) continue
+      if ((turns.get(peer.id) ?? 0) >= cap) {
+        // Out of turns for this round: this member will not be called again, so the call
+        // the line opened has nobody left to answer it. Left in the book it would hold a
+        // report forever; drop it with the dispatcher's own key, not a second rule.
+        if (by !== undefined) rt.dropRoomCall?.(round.roomId, by, peer.id)
+        continue
+      }
       const waiting = round.slots.findIndex((other, at) => at > index && other.id === peer.id && other.status === 'waiting')
       const called = waiting === -1 ? { id: peer.id, name: peer.name, status: 'waiting' } : round.slots.splice(waiting, 1)[0]
       called.note = note
